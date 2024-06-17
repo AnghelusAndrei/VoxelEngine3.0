@@ -1,2 +1,0 @@
-C:\MinGW\bin\ar.exe qc C:\Users\Admin\Desktop\VoxelEngine3.0\bin\Debug\libglad.a CMakeFiles/glad.dir/__/__/src/glad.c.obj
-C:\MinGW\bin\ranlib.exe C:\Users\Admin\Desktop\VoxelEngine3.0\bin\Debug\libglad.a
