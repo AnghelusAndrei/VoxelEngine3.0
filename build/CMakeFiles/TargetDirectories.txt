@@ -1,0 +1,12 @@
+C:/Users/Admin/Desktop/VoxelEngine3.0/build/CMakeFiles/VoxelEngine3.0.dir
+C:/Users/Admin/Desktop/VoxelEngine3.0/build/CMakeFiles/edit_cache.dir
+C:/Users/Admin/Desktop/VoxelEngine3.0/build/CMakeFiles/rebuild_cache.dir
+C:/Users/Admin/Desktop/VoxelEngine3.0/build/_deps/glfw-build/CMakeFiles/edit_cache.dir
+C:/Users/Admin/Desktop/VoxelEngine3.0/build/_deps/glfw-build/CMakeFiles/rebuild_cache.dir
+C:/Users/Admin/Desktop/VoxelEngine3.0/build/_deps/glfw-build/src/CMakeFiles/glfw.dir
+C:/Users/Admin/Desktop/VoxelEngine3.0/build/_deps/glfw-build/src/CMakeFiles/edit_cache.dir
+C:/Users/Admin/Desktop/VoxelEngine3.0/build/_deps/glfw-build/src/CMakeFiles/rebuild_cache.dir
+C:/Users/Admin/Desktop/VoxelEngine3.0/build/_deps/glad-build/CMakeFiles/glad-generate-files.dir
+C:/Users/Admin/Desktop/VoxelEngine3.0/build/_deps/glad-build/CMakeFiles/glad.dir
+C:/Users/Admin/Desktop/VoxelEngine3.0/build/_deps/glad-build/CMakeFiles/edit_cache.dir
+C:/Users/Admin/Desktop/VoxelEngine3.0/build/_deps/glad-build/CMakeFiles/rebuild_cache.dir
