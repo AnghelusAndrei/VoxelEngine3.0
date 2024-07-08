@@ -99,5 +99,5 @@ file(
 
 # Handle shaders
 
-file(GLOB_RECURSE shaders "*.glsl" "*.hlsl")
+file(GLOB_RECURSE shaders "*.glsl" "*.hlsl" "*.frag" "*.vert" "*.comp")
 file(COPY ${shaders} DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/shd)

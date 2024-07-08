@@ -1,6 +1,6 @@
 #pragma once
 
-#include "renderer.hpp"
+#include "octree.hpp"
 
 class VoxelEngine{
     public:
@@ -8,7 +8,11 @@ class VoxelEngine{
     void run();
     ~VoxelEngine();
 
-    private:
-    Renderer *_renderer;
+    private:    
+    FPCamera *camera;
+    Octree *octree;
+    MaterialPool *pool;
+
+    Renderer *renderer;
     bool running;
 };

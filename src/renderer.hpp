@@ -1,5 +1,8 @@
 #pragma once
 #include <iostream>
+#include <fstream>
+#include <sstream>
+#include <vector>
 #include <glad/glad.h>
 #include "imgui.h"
 #include "./backends/imgui_impl_glfw.h"
@@ -20,9 +23,13 @@
 
 #include <chrono>
 
-#include <thread>
-
 #include "config.hpp"
+#include "uiconfig.hpp"
+
+#include "fpcamera.hpp"
+#include "materialpool.hpp"
+
+#include "Logger/logger.hpp"
 
 
 class Renderer{
@@ -31,9 +38,40 @@ class Renderer{
     void run();
     ~Renderer();
 
+    UIConfig* ui;
     GLFWwindow* window;
+    GLuint programID, vertex, fragment;
+
+    Log *log;
+
+    static void glfw_error_callback(int error, const char* description);
     private:
     
-    bool InitImGUI();
-    static void glfw_error_callback(int error, const char* description);
+    ImVec4 clear_color;
+    float aspect_ratio;
+    glm::ivec2 display_size;
+    void InitImGUI(const char* glsl_version);
+    void ImGUIpass();
+
+    void checkShaderCompileErrors(unsigned int shader, std::string type);
+
+    GLuint compileShader(const char* path, std::string type, GLuint gl_type);
+    GLuint VBO, VAO, EBO;
+    std::vector<GLuint> textureIDs;
+
+    public:
+    void addTexture(GLuint texID);
+
+    void setUniformi(int v, std::string name);
+    void setUniformui(unsigned int v, std::string name);
+    void setUniformf(float v, std::string name);
+
+    private:
+    std::vector<std::string> uniformiNames;
+    std::vector<std::string> uniformuiNames;
+    std::vector<std::string> uniformfNames;
+
+    std::vector<int> uniformiValues;
+    std::vector<unsigned int> uniformuiValues;
+    std::vector<float> uniformfValues;
 };
