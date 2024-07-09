@@ -11,8 +11,11 @@ class VoxelEngine{
     private:    
     FPCamera *camera;
     Octree *octree;
-    MaterialPool *pool;
+    MaterialPool *materialPool;
+    LightPool *lightPool;
 
     Renderer *renderer;
     bool running;
+
+    int staticFrames = 0;
 };

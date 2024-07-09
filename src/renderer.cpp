@@ -2,6 +2,8 @@
 
 
 Renderer::Renderer(const Config *config){
+    log = new Log();
+
     glfwSetErrorCallback(glfw_error_callback);
     if (!glfwInit())
         return;
@@ -50,6 +52,14 @@ Renderer::Renderer(const Config *config){
     glLinkProgram(programID);
     checkShaderCompileErrors(programID, "PROGRAM");
 
+    postVertex = compileShader("./shd/postVertex.glsl", "VERTEX", GL_VERTEX_SHADER);
+    postFragment = compileShader("./shd/postFragment.glsl", "FRAGMENT", GL_FRAGMENT_SHADER);
+    postProgramID = glCreateProgram();
+    glAttachShader(postProgramID, postVertex);
+    glAttachShader(postProgramID, postFragment);
+    glLinkProgram(postProgramID);
+    checkShaderCompileErrors(postProgramID, "PROGRAM");
+
     glfwGetFramebufferSize(window, &display_size.x, &display_size.y);
     glm::vec2 viewRatio = glm::vec2(
         aspect_ratio * (float)display_size.y / (float)display_size.x,
@@ -57,29 +67,72 @@ Renderer::Renderer(const Config *config){
     );
 
     float vertices[] = {
-        viewRatio.x,  viewRatio.y, 0.0f,  // top right
-        viewRatio.x, -viewRatio.y, 0.0f,  // bottom right
-        -viewRatio.x, -viewRatio.y, 0.0f,  // bottom left
-        -viewRatio.x,  viewRatio.y, 0.0f   // top left 
+        -viewRatio.x,  viewRatio.y,  0.0f, 1.0f,
+        -viewRatio.x, -viewRatio.y,  0.0f, 0.0f,
+         viewRatio.x, -viewRatio.y,  1.0f, 0.0f,
+
+        -viewRatio.x,  viewRatio.y,  0.0f, 1.0f,
+         viewRatio.x, -viewRatio.y,  1.0f, 0.0f,
+         viewRatio.x,  viewRatio.y,  1.0f, 1.0f
     };
-    unsigned int indices[] = {  
-        0, 1, 3,  // first Triangle
-        1, 2, 3   // second Triangle
+
+    float quadVertices[] = { // vertex attributes for a quad that fills the entire screen in Normalized Device Coordinates.
+        // positions   // texCoords
+        -1.0f,  1.0f,  0.0f, 1.0f,
+        -1.0f, -1.0f,  0.0f, 0.0f,
+         1.0f, -1.0f,  1.0f, 0.0f,
+
+        -1.0f,  1.0f,  0.0f, 1.0f,
+         1.0f, -1.0f,  1.0f, 0.0f,
+         1.0f,  1.0f,  1.0f, 1.0f
     };
+
     glGenVertexArrays(1, &VAO);
     glGenBuffers(1, &VBO);
-    glGenBuffers(1, &EBO);
     glBindVertexArray(VAO);
     glBindBuffer(GL_ARRAY_BUFFER, VBO);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, EBO);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), &vertices, GL_STATIC_DRAW);
     glEnableVertexAttribArray(0);
-    glBindBuffer(GL_ARRAY_BUFFER, 0); 
-    glBindVertexArray(0); 
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
 
-    log = new Log();
+
+    glGenVertexArrays(1, &quadVAO);
+    glGenBuffers(1, &quadVBO);
+    glBindVertexArray(quadVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, quadVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), &quadVertices, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+
+
+    glGenFramebuffers(1, &framebuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+
+    // Create a color attachment texture
+    glGenTextures(1, &textureColorbuffer);
+    glBindTexture(GL_TEXTURE_2D, textureColorbuffer);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, display_size.x, display_size.y, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, textureColorbuffer, 0);
+
+    // Create a renderbuffer object for depth and stencil attachment (we won't be sampling these)
+    glGenRenderbuffers(1, &rbo);
+    glBindRenderbuffer(GL_RENDERBUFFER, rbo);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, display_size.x, display_size.y); // depth and stencil buffer
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rbo); // attach it
+
+    // Check if framebuffer is complete
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        log->AddLog("ERROR::FRAMEBUFFER:: Framebuffer is not complete!");
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    setUniformi(1, "lightSamples");
+    setUniformi(1, "reflectionSamples");
 }
 
 uint32_t Renderer::compileShader(const char* path, std::string type, uint32_t gl_type){
@@ -135,11 +188,9 @@ void Renderer::run(){
     ImGUIpass();
     ImGui::Render();
     glm::ivec2 old_display = display_size;
+
     glfwGetFramebufferSize(window, &display_size.x, &display_size.y);
-    glViewport(0, 0, display_size.x, display_size.y);
-    glClearColor(clear_color.x * clear_color.w, clear_color.y * clear_color.w, clear_color.z * clear_color.w, clear_color.w);
-    glClear(GL_COLOR_BUFFER_BIT);
-    
+
     if(old_display != display_size){
         glm::vec2 viewRatio = glm::vec2(
             aspect_ratio * (float)display_size.y / (float)display_size.x,
@@ -147,16 +198,34 @@ void Renderer::run(){
         );
 
         float vertices[] = {
-            viewRatio.x,  viewRatio.y, 0.0f,  // top right
-            viewRatio.x, -viewRatio.y, 0.0f,  // bottom right
-            -viewRatio.x, -viewRatio.y, 0.0f,  // bottom left
-            -viewRatio.x,  viewRatio.y, 0.0f   // top left 
+            -viewRatio.x,  viewRatio.y,  0.0f, 1.0f,
+            -viewRatio.x, -viewRatio.y,  0.0f, 0.0f,
+            viewRatio.x, -viewRatio.y,  1.0f, 0.0f,
+
+            -viewRatio.x,  viewRatio.y,  0.0f, 1.0f,
+            viewRatio.x, -viewRatio.y,  1.0f, 0.0f,
+            viewRatio.x,  viewRatio.y,  1.0f, 1.0f
         };
 
         glBindBuffer(GL_ARRAY_BUFFER, VBO);
         glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
         glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+        glBindTexture(GL_TEXTURE_2D, textureColorbuffer);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, display_size.x, display_size.y, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glBindRenderbuffer(GL_RENDERBUFFER, rbo);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, display_size.x, display_size.y);
+        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
     }
+    
+    glViewport(0, 0, display_size.x, display_size.y);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+
+    // make sure we clear the framebuffer's content
+    glClearColor(clear_color.x * clear_color.w, clear_color.y * clear_color.w, clear_color.z * clear_color.w, clear_color.w);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    
 
     glUseProgram(programID);
 
@@ -167,20 +236,33 @@ void Renderer::run(){
 
     // Ensure the uniform is set to the correct texture unit
     for(int i = 0; i < uniformiNames.size(); i++){
-        GLuint texBufferLocation = glGetUniformLocation(programID, uniformiNames[i].c_str());
-        glUniform1i(texBufferLocation, uniformiValues[i]);
+        GLuint uniformLocation = glGetUniformLocation(programID, uniformiNames[i].c_str());
+        glUniform1i(uniformLocation, uniformiValues[i]);
     }
     for(int i = 0; i < uniformuiNames.size(); i++){
-        GLuint texBufferLocation = glGetUniformLocation(programID, uniformuiNames[i].c_str());
-        glUniform1ui(texBufferLocation, uniformuiValues[i]);
+        GLuint uniformLocation = glGetUniformLocation(programID, uniformuiNames[i].c_str());
+        glUniform1ui(uniformLocation, uniformuiValues[i]);
     }
     for(int i = 0; i < uniformfNames.size(); i++){
-        GLuint texBufferLocation = glGetUniformLocation(programID, uniformfNames[i].c_str());
-        glUniform1f(texBufferLocation, uniformfValues[i]);
+        GLuint uniformLocation = glGetUniformLocation(programID, uniformfNames[i].c_str());
+        glUniform1f(uniformLocation, uniformfValues[i]);
     }
 
-    glBindVertexArray(VAO); 
-    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+
+    glBindVertexArray(VAO);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+
+    // now bind back to default framebuffer and draw a quad plane with the attached framebuffer color texture
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDisable(GL_DEPTH_TEST); // disable depth test so screen-space quad isn't discarded due to depth test.
+
+    glClearColor(clear_color.x * clear_color.w, clear_color.y * clear_color.w, clear_color.z * clear_color.w, clear_color.w);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glUseProgram(postProgramID);
+    glBindVertexArray(quadVAO);
+    glBindTexture(GL_TEXTURE_2D, textureColorbuffer);	// use the color attachment texture as the texture of the quad plane
+    glDrawArrays(GL_TRIANGLES, 0, 6);
 
     // Unbind the textures after drawing
     glBindTexture(GL_TEXTURE_BUFFER, 0);
@@ -217,11 +299,19 @@ Renderer::~Renderer(){
     
     glDeleteVertexArrays(1, &VAO);
     glDeleteBuffers(1, &VBO);
-    glDeleteBuffers(1, &EBO);
+
+    glDeleteBuffers(1, &quadVAO);
+    glDeleteBuffers(1, &quadVBO);
+    glDeleteRenderbuffers(1, &rbo);
+    glDeleteFramebuffers(1, &framebuffer);
 
     glDeleteShader(vertex);
     glDeleteShader(fragment);
     glDeleteProgram(programID);
+
+    glDeleteShader(postVertex);
+    glDeleteShader(postFragment);
+    glDeleteProgram(postProgramID);
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();

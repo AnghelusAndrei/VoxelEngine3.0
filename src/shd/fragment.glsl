@@ -5,13 +5,23 @@ in vec4 vertexPosition;
 
 uniform usamplerBuffer octreeTexture;
 uniform uint octreeDepth;
+uniform int lightNum;
+uniform int lightSamples;
+uniform int reflectionSamples;
 
 layout (std140) uniform CameraUniform {
     vec4 position;
-    vec4 cameraPlane;
-    vec4 cameraPlaneRight;
-    vec4 cameraPlaneUp;
+    vec4 cameraPlane, cameraPlaneRight, cameraPlaneUp;
 } camera;
+
+struct Light{
+    vec4 position, color;
+    float radius, intensity, area;
+};
+
+layout (std140) uniform LightUniform {
+    Light lights[256];
+};
 
 struct Material {
     vec4 color;
@@ -31,35 +41,42 @@ struct Node {
     uint count, next, material, normal;
 };
 
-struct leaf_t {
-    uint size;
-    vec3 position;
-};
+struct leaf_t { uint size; vec3 position;};
+struct voxel_t { bool hit; uint id, material; uvec3 position;};
+struct ray_t { vec3 origin, direction, inverted_direction;};
 
-struct voxel_t {
-    bool hit;
-    uint id, material;
-    uvec3 position;
-};
+Node UnpackNode(uint raw) { return Node(bool(raw & type_mask), (raw & count_mask) >> 1, (raw & next_mask) >> 4, (raw & material_mask) >> 1, (raw >> 8u) & 0xFFFFFFu);}
+vec3 UnpackNormal(uint packedNormal) { return vec3(float(int(packedNormal >> 16u & 0xFFu) - 128) * inv_127, float(int(packedNormal >> 8u & 0xFFu) - 128) * inv_127, float(int(packedNormal & 0xFFu) - 128) * inv_127);}
+bool inBounds(vec3 v, float n) { return all(lessThanEqual(vec3(0), v) && lessThanEqual(v, vec3(n, n, n)));}
+uint locate(uvec3 pos, uint p2) { return (uint(bool(pos.x & p2)) << 2) | (uint(bool(pos.y & p2)) << 1) | uint(bool(pos.z & p2));}
 
-struct ray_t {
-    vec3 origin, direction, inverted_direction;
-};
+vec2 rand(vec2 co){return vec2(fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453), fract(cos(dot(co, vec2(87.9898, 13.233))) * 33398.5453));}
 
-Node UnpackNode(uint raw) {
-    return Node(bool(raw & type_mask), (raw & count_mask) >> 1, (raw & next_mask) >> 4, (raw & material_mask) >> 1, (raw >> 8u) & 0xFFFFFFu);
+vec3 randomVectorInConeTangentToSphere(vec3 coneApex, vec3 sphereCenter, float sphereRadius, vec2 rand) {
+    vec3 coneDir = normalize(sphereCenter - coneApex);
+    float coneAngle = asin(sphereRadius / length(sphereCenter - coneApex));
+
+    vec3 w = normalize(coneDir);
+    vec3 u = normalize(cross(w, abs(w.x) > 0.1 ? vec3(0, 1, 0) : vec3(1, 0, 0)));
+    vec3 v = cross(w, u);
+    
+    float cosTheta = mix(cos(coneAngle), 1.0, rand.x);
+    float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+    float phi = rand.y * 6.28318530718; // 2 * pi
+
+    return normalize(sinTheta * cos(phi) * u + sinTheta * sin(phi) * v + cosTheta * w);
 }
 
-vec3 UnpackNormal(uint packedNormal) {
-    return vec3(float(int(packedNormal >> 16u & 0xFFu) - 128) * inv_127, float(int(packedNormal >> 8u & 0xFFu) - 128) * inv_127, float(int(packedNormal & 0xFFu) - 128) * inv_127);
-}
+vec3 randomVectorInCone(vec3 coneDir, float coneAngle, vec2 rand) {
+    vec3 w = normalize(coneDir);
+    vec3 u = normalize(cross(w, abs(w.x) > 0.1 ? vec3(0, 1, 0) : vec3(1, 0, 0)));
+    vec3 v = cross(w, u);
+    
+    float cosTheta = mix(cos(coneAngle), 1.0, rand.x);
+    float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+    float phi = rand.y * 6.28318530718; // 2 * pi
 
-bool inBounds(vec3 v, float n) {
-    return all(lessThanEqual(vec3(0), v) && lessThanEqual(v, vec3(n, n, n)));
-}
-
-uint locate(uvec3 pos, uint p2) {
-    return (uint(bool(pos.x & p2)) << 2) | (uint(bool(pos.y & p2)) << 1) | uint(bool(pos.z & p2));
+    return normalize(sinTheta * cos(phi) * u + sinTheta * sin(phi) * v + cosTheta * w);
 }
 
 vec4 intersect(ray_t r, vec3 box_min, vec3 box_max) {
@@ -90,13 +107,10 @@ voxel_t Raycast(ray_t ray, float l) {
     uint offset = uint(0), depth = uint(0), q = uint(0);
     vec3 r_pos;
     
-    if (inBounds(ray.origin, float(octreeLength))) {
-        r_pos = ray.origin;
-    } else {
-        vec4 intersection = intersect(ray, vec3(0), vec3(float(octreeLength)));
-        r_pos = intersection.xyz; q++;
-        if (intersection.w < 0.0 || distance(ray.origin, r_pos) > l) return voxel;
-    }
+    if (inBounds(ray.origin, float(octreeLength))) r_pos = ray.origin;
+    else {  vec4 intersection = intersect(ray, vec3(0), vec3(float(octreeLength)));
+            r_pos = intersection.xyz; q++;
+            if (intersection.w < 0.0 || distance(ray.origin, r_pos) > l) return voxel;}
 
     leaf_t target;
 
@@ -130,8 +144,6 @@ voxel_t Raycast(ray_t ray, float l) {
     return voxel;
 }
 
-const vec3 light = vec3(100, 300, 100);
-
 void main() {
     vec3 direction = normalize(camera.cameraPlane.xyz + vertexPosition.x * camera.cameraPlaneRight.xyz - vertexPosition.y * camera.cameraPlaneUp.xyz);
     octreeLength = uint(1) << octreeDepth;
@@ -142,26 +154,50 @@ void main() {
     ray.inverted_direction = 1.0 / direction;
 
     voxel_t voxel = Raycast(ray, 1e9);
-    vec3 color = direction;
+    FragColor = vec4(direction, 0.0);
     if(voxel.hit){
         Node data = UnpackNode(texelFetch(octreeTexture, int(voxel.id)).r);
         vec3 normal = normalize(UnpackNormal(data.normal));
         Material mat = material[data.material];
-        color = mat.color.xyz * mat.ambient;
+        vec3 color = mat.color.xyz * mat.ambient;
 
-        vec3 light_vec = normalize(light - vec3(voxel.position));
-        vec3 inverse_vec = 1.0 / light_vec;
-        ray_t light_ray = ray_t(vec3(voxel.position) + vec3(0.5, 0.5, 0.5), light_vec, inverse_vec);
-        voxel_t light_detection = Raycast(light_ray, distance(vec3(voxel.position) + light_vec, light));
+        vec3 luminance = vec3(0,0,0); int affected = 0;
+        for(int i = 0; i < lightNum; i++){
+            float light_dist = distance(lights[i].position.xyz, vec3(voxel.position)) - lights[i].radius;
+            if(light_dist > lights[i].area) continue;
+            vec3 light_vec = normalize(lights[i].position.xyz - vec3(voxel.position));
+            int hits = Raycast(ray_t(vec3(voxel.position) + vec3(0.5, 0.5, 0.5), light_vec, 1.0/light_vec), light_dist).hit ? 1 : 0;
+            for(int i = 1; i < lightSamples; i++){
+                vec3 light_vec = normalize(randomVectorInConeTangentToSphere(vec3(voxel.position) + vec3(0.5, 0.5, 0.5), lights[i].position.xyz, lights[i].radius, rand(vec2(vertexPosition.x + i, vertexPosition.y-i))));
+                vec3 inverse_vec = 1.0/light_vec;
+                ray_t light_ray = ray_t(vec3(voxel.position) + vec3(0.5, 0.5, 0.5), light_vec, inverse_vec);
+                voxel_t light_detection = Raycast(light_ray, light_dist);
+                if(!light_detection.hit)hits++;
+            }
 
-        if(!light_detection.hit){
-            vec3 viewReflection = reflect(normalize(vec3(voxel.position) - ray.origin), normal);
-            float diffuse_dot = dot(light_vec, normal);
-            float specular_dot = dot(light_vec, viewReflection);
-            color += mat.color.xyz * diffuse_dot * int(diffuse_dot>=0) * mat.diffuse +
-                    pow(specular_dot * int(specular_dot>=0), mat.specular);
+            if(hits>0){
+                affected++;
+                vec3 viewReflection = reflect(normalize(vec3(voxel.position) - ray.origin), normal);
+                float diffuse_dot = dot(light_vec, normal);
+                float specular_dot = dot(light_vec, viewReflection);
+                luminance += (mat.color.xyz * diffuse_dot * int(diffuse_dot>=0) * mat.diffuse +
+                        pow(specular_dot * int(specular_dot>=0), mat.specular)) * 
+                        lights[i].area/light_dist * lights[i].intensity * lights[i].color.xyz * float(hits)/float(lightSamples);
+            }
         }
-    }
 
-    FragColor = vec4(color, 0);
+        vec3 absorbed = vec3(0,0,0);
+        vec3 reflection = normalize(reflect(vec3(voxel.position) + vec3(0.5, 0.5, 0.5) - ray.origin,normal));
+        for(int i = 0; i < reflectionSamples; i++){
+            vec3 vec = normalize(randomVectorInCone(reflection, radians(180.0 * mat.roughness), rand(vec2(vertexPosition.x + i, vertexPosition.y-i))));
+            vec3 inverse_vec = 1.0/vec;
+            ray_t reflection_ray = ray_t(vec3(voxel.position) + vec3(0.5, 0.5, 0.5), vec, inverse_vec);
+            voxel_t reflection_detection = Raycast(reflection_ray, 1e9);
+            absorbed += reflection_detection.hit ? material[reflection_detection.material].color.xyz : vec;
+        }
+        absorbed = absorbed / reflectionSamples;
+        color+=luminance/float(affected == 0 ? 1 : affected);
+        color = color * 1.0/mat.reflection + mat.reflection * absorbed;
+        FragColor = vec4(color.xyz, float(voxel.id % uint(256)) / 256.0);
+    }
 }

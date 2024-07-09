@@ -27,7 +27,7 @@
 #include "uiconfig.hpp"
 
 #include "fpcamera.hpp"
-#include "materialpool.hpp"
+#include "material.hpp"
 
 #include "Logger/logger.hpp"
 
@@ -41,10 +41,11 @@ class Renderer{
     UIConfig* ui;
     GLFWwindow* window;
     GLuint programID, vertex, fragment;
+    GLuint postProgramID, postVertex, postFragment;
 
     Log *log;
 
-    static void glfw_error_callback(int error, const char* description);
+    void static glfw_error_callback(int error, const char* description);
     private:
     
     ImVec4 clear_color;
@@ -56,7 +57,9 @@ class Renderer{
     void checkShaderCompileErrors(unsigned int shader, std::string type);
 
     GLuint compileShader(const char* path, std::string type, GLuint gl_type);
-    GLuint VBO, VAO, EBO;
+    GLuint VBO, VAO;
+    GLuint framebuffer, textureColorbuffer, rbo;
+    GLuint quadVAO, quadVBO;
     std::vector<GLuint> textureIDs;
 
     public:

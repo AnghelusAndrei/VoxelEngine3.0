@@ -24,7 +24,7 @@ class FPCamera : public Camera{
     explicit FPCamera();
     explicit FPCamera(Camera::Config *config_, ControllerConfig *controllerConfig);
     ~FPCamera();
-    void GLFWInput(GLFWwindow* window);
+    bool GLFWInput(GLFWwindow* window);
 
     void setKeyMap(FPCamera::KeyMap *newMap);
 

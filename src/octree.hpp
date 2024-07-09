@@ -4,7 +4,7 @@
 #include <functional>
 #include <cstdlib>
 
-#include "renderer.hpp"
+#include "light.hpp"
 
 
 #define maxDepth 16

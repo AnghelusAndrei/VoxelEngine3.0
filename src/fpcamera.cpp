@@ -31,8 +31,9 @@ void FPCamera::setKeyMap(FPCamera::KeyMap *newMap){
     keyMap = newMap;
 }
 
-void FPCamera::GLFWInput(GLFWwindow* window){
+bool FPCamera::GLFWInput(GLFWwindow* window){
     double deltaTime = glfwGetTime() - time;
+    glm::vec3 oldPos = position, oldDir = direction;
     time = glfwGetTime();
 
     glm::vec3 up = glm::vec3(0,1,0);
@@ -77,4 +78,8 @@ void FPCamera::GLFWInput(GLFWwindow* window){
     }
 
     UpdateUBO();
+
+    if(oldPos == position && oldDir == direction)
+        return false;
+    return true;
 }
