@@ -4,8 +4,8 @@
 VoxelEngine::VoxelEngine(const Config *config) : running(true){
     renderer = new Renderer(config);
 
-    renderer->setUniformi(6, "lightSamples");
-    renderer->setUniformi(6, "reflectionSamples");
+    renderer->setUniformi(1, "lightSamples");
+    renderer->setUniformi(1, "reflectionSamples");
 
     Camera::Config *cameraConfig = new Camera::Config{
         .position = glm::vec3(0.0f,0.0f,0.0f),
@@ -20,7 +20,7 @@ VoxelEngine::VoxelEngine(const Config *config) : running(true){
     };
 
     Octree::Config *octreeConfig = new Octree::Config{
-        .depth = 6,
+        .depth = 7,
         .renderer = renderer
     };
 
@@ -86,7 +86,7 @@ VoxelEngine::VoxelEngine(const Config *config) : running(true){
 	Perlin *noiseMaker = new Perlin();
 
     uint32_t octree_length = 1 << octree->depth;
-    uint32_t normal_samples = 3;
+    uint32_t normal_samples = 2;
     
     for(int i = 0; i < octree_length && !glfwWindowShouldClose(renderer->window); i++){
         for(int j = 0; j < octree_length; j++){

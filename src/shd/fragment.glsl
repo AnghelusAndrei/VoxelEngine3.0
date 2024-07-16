@@ -92,7 +92,7 @@ vec4 intersect(ray_t r, vec3 box_min, vec3 box_max) {
 vec3 intersect_inside(ray_t r, vec3 box_min, vec3 box_max) {
     vec3 t1 = (box_min - r.origin) * r.inverted_direction;
     vec3 t2 = (box_max - r.origin) * r.inverted_direction;
-    vec3 tmin = min(t1, t2), tmax = max(t1, t2);
+    vec3 tmax = max(t1, t2);
     float t_exit = min(min(tmax.x, tmax.y), tmax.z);
     return r.direction * (t_exit + 0.01) + r.origin;
 }
@@ -198,6 +198,6 @@ void main() {
         absorbed = absorbed / reflectionSamples;
         color+=luminance/float(affected == 0 ? 1 : affected);
         color = color * 1.0/mat.reflection + mat.reflection * absorbed;
-        FragColor = vec4(color.xyz, float(voxel.id % uint(256)) / 256.0);
+        FragColor = vec4(color.xyz, float(voxel.id % uint(255) + uint(1)) / 256.0);
     }
 }

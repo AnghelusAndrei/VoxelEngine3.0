@@ -130,9 +130,6 @@ Renderer::Renderer(const Config *config){
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
         log->AddLog("ERROR::FRAMEBUFFER:: Framebuffer is not complete!");
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-    setUniformi(1, "lightSamples");
-    setUniformi(1, "reflectionSamples");
 }
 
 uint32_t Renderer::compileShader(const char* path, std::string type, uint32_t gl_type){
@@ -260,6 +257,16 @@ void Renderer::run(){
     glClear(GL_COLOR_BUFFER_BIT);
 
     glUseProgram(postProgramID);
+
+    {
+        GLuint uniformLocation = glGetUniformLocation(postProgramID, "screenX");
+        glUniform1i(uniformLocation, display_size.x);
+    }
+    {
+        GLuint uniformLocation = glGetUniformLocation(postProgramID, "screenY");
+        glUniform1i(uniformLocation, display_size.y);
+    }
+
     glBindVertexArray(quadVAO);
     glBindTexture(GL_TEXTURE_2D, textureColorbuffer);	// use the color attachment texture as the texture of the quad plane
     glDrawArrays(GL_TRIANGLES, 0, 6);
