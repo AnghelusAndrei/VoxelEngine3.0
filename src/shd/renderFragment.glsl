@@ -1,4 +1,4 @@
-#version 330 core
+#version 430 core
 out vec4 FragColor;
 
 in vec4 vertexPosition;
@@ -29,6 +29,7 @@ layout (std140) uniform MaterialUniform {
 
 const uint type_mask = uint(1), count_mask = uint(14), next_mask = uint(4294967280), material_mask = uint(254);
 const float inv_127 = 1.0/127.0;
+const uint FLT32_MAX = uint(2139095030);
 uint octreeLength;
 
 struct Node {
@@ -214,21 +215,24 @@ void main() {
             reflective_brdf.reflective += sampleBRDF.reflective;
         }
 
-        diffuse_brdf.ambient /= diffuseSamples;
-        diffuse_brdf.diffuse /= diffuseSamples;
-        diffuse_brdf.specular /= diffuseSamples;
-        diffuse_brdf.reflective /= diffuseSamples;
+        float invDiffuseSamples = 1.0/float(diffuseSamples);
+        float invRelfectSamples = 1.0/float(reflectionSamples);
 
-        reflective_brdf.ambient /= reflectionSamples;
-        reflective_brdf.diffuse /= reflectionSamples;
-        reflective_brdf.specular /= reflectionSamples;
-        reflective_brdf.reflective /= reflectionSamples; 
+        diffuse_brdf.ambient *= invDiffuseSamples;
+        diffuse_brdf.diffuse *= invDiffuseSamples;
+        diffuse_brdf.specular *= invDiffuseSamples;
+        diffuse_brdf.reflective *= invDiffuseSamples;
+
+        reflective_brdf.ambient *= invRelfectSamples;
+        reflective_brdf.diffuse *= invRelfectSamples;
+        reflective_brdf.specular *= invRelfectSamples;
+        reflective_brdf.reflective *= invRelfectSamples; 
 
         vec3 color = (diffuse_brdf.ambient + reflective_brdf.ambient) * mat.ambient + 
                 (diffuse_brdf.diffuse + reflective_brdf.diffuse) * mat.diffuse +
                 (diffuse_brdf.reflective + reflective_brdf.reflective) * mat.reflection + 
                 (diffuse_brdf.specular + reflective_brdf.specular) * mat.specular;
 
-        FragColor = vec4(color.xyz, float(voxel.id % uint(256)) / 256.0);
+        FragColor = vec4(color.xyz, uintBitsToFloat(voxel.id % FLT32_MAX));
     }
 }

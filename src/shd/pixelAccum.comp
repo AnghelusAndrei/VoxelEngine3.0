@@ -1,0 +1,27 @@
+#version 430 core
+
+layout (local_size_x = 8, local_size_y = 8) in;
+
+layout (binding = 0, rgba32f) readonly uniform image2D inputColorBuffer;
+
+// Accumulated color and count per voxel
+layout (binding = 1, rgba32f) writeonly uniform image2D voxelColorAccumulationBuffer;
+
+uniform ivec2 screenResolution;
+
+void main() {
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    if (pixelCoord.x >= screenResolution.x || pixelCoord.y >= screenResolution.y) {
+        return;
+    }
+
+    // Use imageLoad instead of texelFetch for image2D
+    vec4 data = imageLoad(inputColorBuffer, pixelCoord);
+    uint voxelID = floatBitsToUint(data.w);
+
+    // Atomic add operations for accumulating color and count
+    imageAtomicAdd(voxelColorAccumulationBuffer, ivec2(voxelID, 0), floatBitsToUint(data.r));
+    imageAtomicAdd(voxelColorAccumulationBuffer, ivec2(voxelID, 1), floatBitsToUint(data.g));
+    imageAtomicAdd(voxelColorAccumulationBuffer, ivec2(voxelID, 2), floatBitsToUint(data.b));
+    imageAtomicAdd(voxelColorAccumulationBuffer, ivec2(voxelID, 3), 1);
+}

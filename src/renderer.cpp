@@ -11,20 +11,20 @@ Renderer::Renderer(const Config *config){
     // Decide GL+GLSL versions
 #if defined(IMGUI_IMPL_OPENGL_ES2)
     // GL ES 2.0 + GLSL 100
-    const char* glsl_version = "#version 100";
+    const char* glsl_version = "#version 430";
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
     glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_ES_API);
 #elif defined(__APPLE__)
     // GL 3.2 + GLSL 150
-    const char* glsl_version = "#version 150";
+    const char* glsl_version = "#version 430";
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);  // 3.2+ only
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);            // Required on Mac
 #else
     // GL 3.0 + GLSL 130
-    const char* glsl_version = "#version 130";
+    const char* glsl_version = "#version 430";
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
     //glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);  // 3.2+ only
@@ -51,6 +51,19 @@ Renderer::Renderer(const Config *config){
     glAttachShader(programID, fragment);
     glLinkProgram(programID);
     checkShaderCompileErrors(programID, "PROGRAM");
+
+    computeAccumShader = compileShader("./shd/pixelAccum.comp", "COMPUTE", GL_COMPUTE_SHADER);
+    computeAvgShader = compileShader("./shd/pixelAvg.comp", "COMPUTE", GL_COMPUTE_SHADER);
+
+    computeAccumProgramID = glCreateProgram();
+    glAttachShader(computeAccumProgramID, computeAccumShader);
+    glLinkProgram(computeAccumProgramID);
+    checkShaderCompileErrors(computeAccumProgramID, "PROGRAM");
+
+    computeAvgProgramID = glCreateProgram();
+    glAttachShader(computeAvgProgramID, computeAvgShader);
+    glLinkProgram(computeAvgProgramID);
+    checkShaderCompileErrors(computeAvgProgramID, "PROGRAM");
 
     postVertex = compileShader("./shd/postVertex.glsl", "VERTEX", GL_VERTEX_SHADER);
     postFragment = compileShader("./shd/postFragment.glsl", "FRAGMENT", GL_FRAGMENT_SHADER);
@@ -115,10 +128,24 @@ Renderer::Renderer(const Config *config){
     // Create a color attachment texture
     glGenTextures(1, &textureColorbuffer);
     glBindTexture(GL_TEXTURE_2D, textureColorbuffer);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, display_size.x, display_size.y, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, display_size.x, display_size.y, 0, GL_RGBA, GL_FLOAT, NULL);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, textureColorbuffer, 0);
+
+    // Texture for the voxelColorAccumulationBuffer
+    glGenTextures(1, &voxelColorAccumulationBuffer);
+    glBindTexture(GL_TEXTURE_2D, voxelColorAccumulationBuffer);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, numVoxels, 4, 0, GL_RGBA, GL_FLOAT, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    // Texture for the output color buffer
+    glGenTextures(1, &outputColorBuffer);
+    glBindTexture(GL_TEXTURE_2D, outputColorBuffer);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, display_size.x, display_size.y, 0, GL_RGBA, GL_FLOAT, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
     // Create a renderbuffer object for depth and stencil attachment (we won't be sampling these)
     glGenRenderbuffers(1, &rbo);
@@ -268,6 +295,27 @@ void Renderer::run(){
     glBindVertexArray(VAO);
     glDrawArrays(GL_TRIANGLES, 0, 6);
 
+
+    // Bind and dispatch the accumulation compute shader
+    glUseProgram(computeAccumProgramID);
+    glBindImageTexture(0, textureColorbuffer, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
+    glBindImageTexture(1, voxelColorAccumulationBuffer, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
+    glDispatchCompute((GLuint)ceil(display_size.x / 8.0f), (GLuint)ceil(display_size.y / 8.0f), 1);
+
+    // Ensure that writes to the image are complete before reading
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+    // Bind and dispatch the averaging compute shader
+    glUseProgram(computeAvgProgramID);
+    glBindImageTexture(0, voxelColorAccumulationBuffer, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
+    glBindImageTexture(1, textureColorbuffer, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
+    glBindImageTexture(2, outputColorBuffer, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
+    glDispatchCompute((GLuint)ceil(display_size.x / 8.0f), (GLuint)ceil(display_size.y / 8.0f), 1);
+
+    // Ensure that writes to the image are complete before using the output
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+
     // now bind back to default framebuffer and draw a quad plane with the attached framebuffer color texture
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glDisable(GL_DEPTH_TEST); // disable depth test so screen-space quad isn't discarded due to depth test.
@@ -287,7 +335,7 @@ void Renderer::run(){
     }
 
     glBindVertexArray(quadVAO);
-    glBindTexture(GL_TEXTURE_2D, textureColorbuffer);	// use the color attachment texture as the texture of the quad plane
+    glBindTexture(GL_TEXTURE_2D, outputColorBuffer);	// use the color attachment texture as the texture of the quad plane
     glDrawArrays(GL_TRIANGLES, 0, 6);
 
     // Unbind the textures after drawing
@@ -328,12 +376,20 @@ Renderer::~Renderer(){
 
     glDeleteBuffers(1, &quadVAO);
     glDeleteBuffers(1, &quadVBO);
+    glDeleteTextures(1, &textureColorbuffer);
+    glDeleteTextures(1, &voxelColorAccumulationBuffer);
+    glDeleteTextures(1, &outputColorBuffer);
     glDeleteRenderbuffers(1, &rbo);
     glDeleteFramebuffers(1, &framebuffer);
 
     glDeleteShader(vertex);
     glDeleteShader(fragment);
     glDeleteProgram(programID);
+
+    glDeleteShader(computeAccumShader);
+    glDeleteShader(computeAvgShader);
+    glDeleteProgram(computeAccumProgramID);
+    glDeleteProgram(computeAvgProgramID);
 
     glDeleteShader(postVertex);
     glDeleteShader(postFragment);

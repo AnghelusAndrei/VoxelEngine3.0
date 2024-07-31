@@ -42,6 +42,10 @@ class Renderer{
     GLFWwindow* window;
     GLuint programID, vertex, fragment;
     GLuint postProgramID, postVertex, postFragment;
+    GLuint computeAccumShader, computeAccumProgramID;
+    GLuint computeAvgShader, computeAvgProgramID;
+
+    uint32_t numVoxels = 2139095030;
 
     Log *log;
 
@@ -58,7 +62,7 @@ class Renderer{
 
     GLuint compileShader(const char* path, std::string type, GLuint gl_type);
     GLuint VBO, VAO;
-    GLuint framebuffer, textureColorbuffer, rbo;
+    GLuint framebuffer, textureColorbuffer, voxelColorAccumulationBuffer, outputColorBuffer, rbo;
     GLuint quadVAO, quadVBO;
     std::vector<GLuint> textureIDs;
 
