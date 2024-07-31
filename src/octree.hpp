@@ -1,11 +1,10 @@
 #pragma once
 
+#include "renderer.hpp"
+
 #include <stack>
 #include <functional>
 #include <cstdlib>
-
-#include "light.hpp"
-
 
 #define maxDepth 16
 

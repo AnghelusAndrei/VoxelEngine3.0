@@ -12,7 +12,6 @@ class VoxelEngine{
     FPCamera *camera;
     Octree *octree;
     MaterialPool *materialPool;
-    LightPool *lightPool;
 
     Renderer *renderer;
     bool running;

@@ -44,8 +44,8 @@ Renderer::Renderer(const Config *config){
     clear_color = ImVec4(0.0f, 0.0f, 0.0f, 1.00f);
     aspect_ratio = config->aspect_ratio;
 
-    vertex = compileShader("./shd/vertex.glsl", "VERTEX", GL_VERTEX_SHADER);
-    fragment = compileShader("./shd/fragment.glsl", "FRAGMENT", GL_FRAGMENT_SHADER);
+    vertex = compileShader("./shd/renderVertex.glsl", "VERTEX", GL_VERTEX_SHADER);
+    fragment = compileShader("./shd/renderFragment.glsl", "FRAGMENT", GL_FRAGMENT_SHADER);
     programID = glCreateProgram();
     glAttachShader(programID, vertex);
     glAttachShader(programID, fragment);
@@ -178,6 +178,25 @@ void Renderer::InitImGUI(const char* glsl_version){
 }
 
 void Renderer::run(){
+
+    if(glfwGetKey(window, GLFW_KEY_ENTER) == GLFW_PRESS)
+    {
+        vertex = compileShader("./shd/renderVertex.glsl", "VERTEX", GL_VERTEX_SHADER);
+        fragment = compileShader("./shd/renderFragment.glsl", "FRAGMENT", GL_FRAGMENT_SHADER);
+        programID = glCreateProgram();
+        glAttachShader(programID, vertex);
+        glAttachShader(programID, fragment);
+        glLinkProgram(programID);
+        checkShaderCompileErrors(programID, "PROGRAM");
+
+        postVertex = compileShader("./shd/postVertex.glsl", "VERTEX", GL_VERTEX_SHADER);
+        postFragment = compileShader("./shd/postFragment.glsl", "FRAGMENT", GL_FRAGMENT_SHADER);
+        postProgramID = glCreateProgram();
+        glAttachShader(postProgramID, postVertex);
+        glAttachShader(postProgramID, postFragment);
+        glLinkProgram(postProgramID);
+        checkShaderCompileErrors(postProgramID, "PROGRAM");
+    }
 
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();

@@ -1,7 +1,5 @@
 #pragma once
 
-#include "material.hpp"
-
 #include <stack>
 #include <functional>
 #include <cstdlib>
@@ -23,7 +21,9 @@ struct Material{
     float specular;             //4 
     float roughness;            //4 
     float reflection;           //4 
-    //padding                   //12
+    float shininess;            //4
+    bool emissive = false;      //4
+    float intensity;            //4
 };
 
 class MaterialPool{

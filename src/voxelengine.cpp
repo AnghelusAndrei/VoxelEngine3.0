@@ -4,8 +4,11 @@
 VoxelEngine::VoxelEngine(const Config *config) : running(true){
     renderer = new Renderer(config);
 
-    renderer->setUniformi(1, "lightSamples");
+    renderer->setUniformi(1, "diffuseSamples");
     renderer->setUniformi(1, "reflectionSamples");
+
+    renderer->setUniformf(0.4, "skyboxDiffuseIntensity");
+    renderer->setUniformf(0.2, "skyboxSpecularIntensity");
 
     Camera::Config *cameraConfig = new Camera::Config{
         .position = glm::vec3(0.0f,0.0f,0.0f),
@@ -20,68 +23,46 @@ VoxelEngine::VoxelEngine(const Config *config) : running(true){
     };
 
     Octree::Config *octreeConfig = new Octree::Config{
-        .depth = 7,
+        .depth = 8,
         .renderer = renderer
     };
 
     camera = new FPCamera(cameraConfig, controllerConfig);
     octree = new Octree(octreeConfig);
     materialPool = new MaterialPool(renderer->programID);
-    lightPool = new LightPool(renderer);
-
-    Light l1 = {
-        .position = glm::vec4(-10, 570, 480, 0),
-        .color = glm::vec4(1, 1, 1, 1),
-        .radius = 30.0f,
-        .intensity = 0.7f,
-        .area = 130
-    };
-
-    Light l2 = {
-        .position = glm::vec4(300, -30, 50, 0),
-        .color = glm::vec4(1, 1, 0.4f, 1),
-        .radius = 50.0f,
-        .intensity = 0.7f,
-        .area = 200
-    };
-
-    Light l3 = {
-        .position = glm::vec4(-10, 300, -100, 0),
-        .color = glm::vec4(1, 0.6f, 1, 1),
-        .radius = 40.0f,
-        .intensity = 0.7f,
-        .area = 200
-    };
-
-    Light l4 = {
-        .position = glm::vec4(570, 400, -100, 0),
-        .color = glm::vec4(1, 0.7f, 0.9f, 1),
-        .radius = 16.0f,
-        .intensity = 0.7f,
-        .area = 200
-    };
-
-    //lightPool->addLight(&l1);
-    lightPool->addLight(&l2);
-    lightPool->addLight(&l3);
-    //lightPool->addLight(&l4);
 
     uint32_t mats[11][11] = {0};
 
     for(int i = 0; i < 11; i++){
         for(int j = 0; j < 11; j++){
-            Material m = {
-                .color = glm::vec4((float)i/10, (float)j/10, 1.0f, 0.0f),
-                .ambient = 0.1f,
-                .diffuse = 0.8f,
-                .specular = 50.0f,
-                .roughness = 0.4f,
-                .reflection = 0.3f,
-            };
-            mats[i][j] = materialPool->addMaterial(&m);
+            if(i == 5 && j == 6){
+                Material emissive_m = {
+                    .color = glm::vec4(1.0f, 1.0f, 1.0f, 0.0f),
+                    .ambient = 0.1f,
+                    .diffuse = 0.8f,
+                    .specular = 50.0f,
+                    .roughness = 0.4f,
+                    .reflection = 0.3f,
+                    .shininess = 50.0f,
+                    .emissive = true,
+                    .intensity = 40.0f
+                };
+                mats[5][6] = materialPool->addMaterial(&emissive_m);
+            }else{
+                Material m = {
+                    .color = glm::vec4((float)i/10, (float)j/10, 1.0f, 0.0f),
+                    .ambient = 0.01f,
+                    .diffuse = 0.8f,
+                    .specular = 0.6f,
+                    .roughness = 0.4f,
+                    .reflection = 0.3f,
+                    .shininess = 50.0f,
+                    .emissive = false
+                };
+                mats[i][j] = materialPool->addMaterial(&m);
+            }
         }
     }
-
 
 	Perlin *noiseMaker = new Perlin();
 
@@ -100,16 +81,24 @@ VoxelEngine::VoxelEngine(const Config *config) : running(true){
 
                 glm::vec3 normal = glm::vec3(0,0,0);
 
-                for(int a = ((i-normal_samples) > 0 ? (i-normal_samples) : 0); a <= i+normal_samples && a < octree_length; a++) 
-                for(int b = ((j-normal_samples) > 0 ? (j-normal_samples) : 0); b <= j+normal_samples && b < octree_length; b++) 
-                for(int c = ((k-normal_samples) > 0 ? (k-normal_samples) : 0); c <= k+normal_samples && c < octree_length; c++){
+                if(noiseMaker->noise((float)(i + 1) * 0.03f,(float)j * 0.03f,(float)k * 0.03f) < 0.15 || 
+                    noiseMaker->noise((float)(i - 1) * 0.03f,(float)j * 0.03f,(float)k * 0.03f) < 0.15 || 
+                    noiseMaker->noise((float)(i) * 0.03f,(float)(j + 1) * 0.03f,(float)k * 0.03f) < 0.15 || 
+                    noiseMaker->noise((float)(i) * 0.03f,(float)(j - 1) * 0.03f,(float)k * 0.03f) < 0.15 || 
+                    noiseMaker->noise((float)(i) * 0.03f,(float)j * 0.03f,(float)(k + 1) * 0.03f) < 0.15 || 
+                    noiseMaker->noise((float)(i) * 0.03f,(float)j * 0.03f,(float)(k - 1) * 0.03f) < 0.15){
+                for(int a = i-normal_samples; a <= i+normal_samples; a++) 
+                for(int b = j-normal_samples; b <= j+normal_samples; b++) 
+                for(int c = k-normal_samples; c <= k+normal_samples; c++){
                             float local_criteria = noiseMaker->noise((float)a * 0.03f,(float)b * 0.03f,(float)c * 0.03f);
                             if(local_criteria < 0.15 && a > 0 && a < octree_length && b > 0 && b < octree_length && c > 0 && c < octree_length)
                                 normal += glm::vec3(a-i,b-j,c-k);     
-                }   
-                    
-                
+                }  
                 normal = glm::normalize(normal);
+                }
+                else 
+                    normal = glm::vec3(1,0,0); 
+                    
 
                 Octree::Node leaf;
                 leaf.leaf.material = mats[r][g];
@@ -148,7 +137,6 @@ void VoxelEngine::run(){
 VoxelEngine::~VoxelEngine(){
     delete camera;
     delete octree;
-    delete lightPool;
     delete materialPool;
     delete renderer;
 }
