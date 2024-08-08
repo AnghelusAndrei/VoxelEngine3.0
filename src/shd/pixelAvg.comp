@@ -2,9 +2,12 @@
 
 layout (local_size_x = 8, local_size_y = 8) in;
 
-layout (binding = 0, rgba32f) readonly uniform image2D voxelColorAccumulationBuffer;
+layout (binding = 0, r32ui) readonly uniform uimage2D voxelColorAccumulationBuffer;
 layout (binding = 1, rgba32f) readonly uniform image2D inputColorBuffer;
 layout (binding = 2, rgba32f) writeonly uniform image2D outputColorBuffer;
+
+uniform int slots;
+uniform int stride;
 
 uniform ivec2 screenResolution;
 
@@ -14,19 +17,39 @@ void main() {
         return;
     }
 
-    vec4 inputData = texelFetch(inputColorBuffer, pixelCoord, 0).xyzw;
-    uint voxelID = floatBitsToUint(data.w);
-    float count = texelFetch(voxelColorAccumulationBuffer, ivec2(voxelID, 3), 0).r;
-
-    if (count > 0) {
-        vec4 accumulatedColor;
-        accumulatedColor.r = texelFetch(voxelColorAccumulationBuffer, ivec2(voxelID, 0), 0).r;
-        accumulatedColor.g = texelFetch(voxelColorAccumulationBuffer, ivec2(voxelID, 1), 0).r;
-        accumulatedColor.b = texelFetch(voxelColorAccumulationBuffer, ivec2(voxelID, 2), 0).r;
-
-        vec4 averageColor = vec4(accumulatedColor.xyz / float(count), 1);
+    vec4 data = imageLoad(inputColorBuffer, pixelCoord).xyzw;
+    uint voxelID = uint(data.w);
+    if(voxelID == 0){
+        imageStore(outputColorBuffer, pixelCoord, vec4(data.xyz, 1));
+        return;
+    }
+    uint voxelHash = voxelID % uint(32768 - 1) + uint(1);
+    uvec3 accumulatedColor1, accumulatedColor2;
+    uint count1, count2, id;
+    int i = 0;
+    for(; i < stride * slots; i+=stride){
+        id = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i)).r;
+        if(id == voxelID)
+            break;
+    }
+    
+    if (id == voxelID) {
+        count1 = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i+1)).r;
+        count2 = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i+5)).r;
+        accumulatedColor1.x = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i+2)).r;
+        accumulatedColor1.y = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i+3)).r;
+        accumulatedColor1.z = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i+4)).r;
+        accumulatedColor2.x = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i+6)).r;
+        accumulatedColor2.y = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i+7)).r;
+        accumulatedColor2.z = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i+8)).r;
+        vec3 col = vec3(
+            float(accumulatedColor1.x + accumulatedColor2.x),
+            float(accumulatedColor1.y + accumulatedColor2.y),
+            float(accumulatedColor1.z + accumulatedColor2.z)
+        );
+        vec4 averageColor = vec4((col.xyz / float(count1 + count2)) / 255.0, 1);
         imageStore(outputColorBuffer, pixelCoord, averageColor);
     } else {
-        imageStore(outputColorBuffer, pixelCoord, texelFetch(inputColorBuffer, pixelCoord, 0));
+        imageStore(outputColorBuffer, pixelCoord, vec4(data.xyz, 1));
     }
 }

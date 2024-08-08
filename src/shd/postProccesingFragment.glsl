@@ -5,6 +5,8 @@ in vec2 TexCoords;
 
 uniform sampler2D screenTexture;
 
+uniform ivec2 screenResolution;
+
 void main()
 {
     vec4 col = texture(screenTexture, TexCoords).rgba;

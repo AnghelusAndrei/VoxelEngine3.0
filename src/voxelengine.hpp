@@ -16,5 +16,5 @@ class VoxelEngine{
     Renderer *renderer;
     bool running;
 
-    int staticFrames = 0;
+    bool ui = false;
 };

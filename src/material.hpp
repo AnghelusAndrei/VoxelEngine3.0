@@ -16,14 +16,12 @@
 
 struct Material{
     glm::vec4 color;            //16 
-    float ambient;              //4 
+    glm::vec4 specularColor;    //16
     float diffuse;              //4 
     float specular;             //4 
-    float roughness;            //4 
-    float reflection;           //4 
-    float shininess;            //4
+    float metallic;             //4 
     bool emissive = false;      //4
-    float intensity;            //4
+    float emissiveIntensity;    //4
 };
 
 class MaterialPool{

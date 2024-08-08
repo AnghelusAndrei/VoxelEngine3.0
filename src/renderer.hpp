@@ -45,7 +45,17 @@ class Renderer{
     GLuint computeAccumShader, computeAccumProgramID;
     GLuint computeAvgShader, computeAvgProgramID;
 
-    uint32_t numVoxels = 2139095030;
+    void clearVoxelTexture();
+
+    glm::ivec2 voxelBufferSize;
+    uint32_t voxelBufferInstruction = 1;
+    double voxelBufferAccumTime = 0;
+    float voxelBufferSwapTime = 0.05;
+    bool stationary = false;
+    bool TAA = false;
+
+    int spp = 1;
+    int lightBounces = 2;
 
     Log *log;
 
@@ -72,13 +82,16 @@ class Renderer{
     void setUniformi(int v, std::string name);
     void setUniformui(unsigned int v, std::string name);
     void setUniformf(float v, std::string name);
+    void setUniformf3(glm::vec3 v, std::string name);
 
     private:
     std::vector<std::string> uniformiNames;
     std::vector<std::string> uniformuiNames;
     std::vector<std::string> uniformfNames;
+    std::vector<std::string> uniformf3Names;
 
     std::vector<int> uniformiValues;
     std::vector<unsigned int> uniformuiValues;
     std::vector<float> uniformfValues;
+    std::vector<glm::vec3> uniformf3Values;
 };

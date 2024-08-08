@@ -1,5 +1,6 @@
 #include "renderer.hpp"
-
+#define voxelBufferStride 10
+#define voxelBufferSlots 7
 
 Renderer::Renderer(const Config *config){
     log = new Log();
@@ -65,8 +66,8 @@ Renderer::Renderer(const Config *config){
     glLinkProgram(computeAvgProgramID);
     checkShaderCompileErrors(computeAvgProgramID, "PROGRAM");
 
-    postVertex = compileShader("./shd/postVertex.glsl", "VERTEX", GL_VERTEX_SHADER);
-    postFragment = compileShader("./shd/postFragment.glsl", "FRAGMENT", GL_FRAGMENT_SHADER);
+    postVertex = compileShader("./shd/postProccesingVertex.glsl", "VERTEX", GL_VERTEX_SHADER);
+    postFragment = compileShader("./shd/postProccesingFragment.glsl", "FRAGMENT", GL_FRAGMENT_SHADER);
     postProgramID = glCreateProgram();
     glAttachShader(postProgramID, postVertex);
     glAttachShader(postProgramID, postFragment);
@@ -78,6 +79,7 @@ Renderer::Renderer(const Config *config){
         aspect_ratio * (float)display_size.y / (float)display_size.x,
         ((float)display_size.x / (float)display_size.y) / aspect_ratio
     );
+
 
     float vertices[] = {
         -viewRatio.x,  viewRatio.y,  0.0f, 1.0f,
@@ -100,6 +102,7 @@ Renderer::Renderer(const Config *config){
          1.0f,  1.0f,  1.0f, 1.0f
     };
 
+
     glGenVertexArrays(1, &VAO);
     glGenBuffers(1, &VBO);
     glBindVertexArray(VAO);
@@ -110,7 +113,7 @@ Renderer::Renderer(const Config *config){
     glEnableVertexAttribArray(1);
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
 
-
+    
     glGenVertexArrays(1, &quadVAO);
     glGenBuffers(1, &quadVBO);
     glBindVertexArray(quadVAO);
@@ -121,9 +124,29 @@ Renderer::Renderer(const Config *config){
     glEnableVertexAttribArray(1);
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
 
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &voxelBufferSize.x);
+    voxelBufferSize.y = voxelBufferStride * voxelBufferSlots;
+
+    // Texture for the voxelColorAccumulationBuffer
+    glGenTextures(1, &voxelColorAccumulationBuffer);
+    glBindTexture(GL_TEXTURE_2D, voxelColorAccumulationBuffer);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, voxelBufferSize.x, voxelBufferSize.y, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    clearVoxelTexture();
+
+    // Texture for the output color buffer
+    glGenTextures(1, &outputColorBuffer);
+    glBindTexture(GL_TEXTURE_2D, outputColorBuffer);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, display_size.x, display_size.y, 0, GL_RGBA, GL_FLOAT, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
 
     glGenFramebuffers(1, &framebuffer);
     glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+
 
     // Create a color attachment texture
     glGenTextures(1, &textureColorbuffer);
@@ -133,25 +156,13 @@ Renderer::Renderer(const Config *config){
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, textureColorbuffer, 0);
 
-    // Texture for the voxelColorAccumulationBuffer
-    glGenTextures(1, &voxelColorAccumulationBuffer);
-    glBindTexture(GL_TEXTURE_2D, voxelColorAccumulationBuffer);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, numVoxels, 4, 0, GL_RGBA, GL_FLOAT, NULL);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-
-    // Texture for the output color buffer
-    glGenTextures(1, &outputColorBuffer);
-    glBindTexture(GL_TEXTURE_2D, outputColorBuffer);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, display_size.x, display_size.y, 0, GL_RGBA, GL_FLOAT, NULL);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
     // Create a renderbuffer object for depth and stencil attachment (we won't be sampling these)
     glGenRenderbuffers(1, &rbo);
     glBindRenderbuffer(GL_RENDERBUFFER, rbo);
     glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, display_size.x, display_size.y); // depth and stencil buffer
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rbo); // attach it
+
 
     // Check if framebuffer is complete
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
@@ -205,6 +216,7 @@ void Renderer::InitImGUI(const char* glsl_version){
 }
 
 void Renderer::run(){
+    GLenum err;
 
     if(glfwGetKey(window, GLFW_KEY_ENTER) == GLFW_PRESS)
     {
@@ -216,8 +228,21 @@ void Renderer::run(){
         glLinkProgram(programID);
         checkShaderCompileErrors(programID, "PROGRAM");
 
-        postVertex = compileShader("./shd/postVertex.glsl", "VERTEX", GL_VERTEX_SHADER);
-        postFragment = compileShader("./shd/postFragment.glsl", "FRAGMENT", GL_FRAGMENT_SHADER);
+        computeAccumShader = compileShader("./shd/pixelAccum.comp", "COMPUTE", GL_COMPUTE_SHADER);
+        computeAvgShader = compileShader("./shd/pixelAvg.comp", "COMPUTE", GL_COMPUTE_SHADER);
+
+        computeAccumProgramID = glCreateProgram();
+        glAttachShader(computeAccumProgramID, computeAccumShader);
+        glLinkProgram(computeAccumProgramID);
+        checkShaderCompileErrors(computeAccumProgramID, "PROGRAM");
+
+        computeAvgProgramID = glCreateProgram();
+        glAttachShader(computeAvgProgramID, computeAvgShader);
+        glLinkProgram(computeAvgProgramID);
+        checkShaderCompileErrors(computeAvgProgramID, "PROGRAM");
+
+        postVertex = compileShader("./shd/postProccesingVertex.glsl", "VERTEX", GL_VERTEX_SHADER);
+        postFragment = compileShader("./shd/postProccesingFragment.glsl", "FRAGMENT", GL_FRAGMENT_SHADER);
         postProgramID = glCreateProgram();
         glAttachShader(postProgramID, postVertex);
         glAttachShader(postProgramID, postFragment);
@@ -254,11 +279,23 @@ void Renderer::run(){
         glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
         glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-        glBindTexture(GL_TEXTURE_2D, textureColorbuffer);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, display_size.x, display_size.y, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-        glBindRenderbuffer(GL_RENDERBUFFER, rbo);
-        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, display_size.x, display_size.y);
         glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+        glBindTexture(GL_TEXTURE_2D, textureColorbuffer);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, display_size.x, display_size.y, 0, GL_RGBA, GL_FLOAT, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, textureColorbuffer, 0);
+
+        glBindRenderbuffer(GL_RENDERBUFFER, rbo);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, display_size.x, display_size.y); // depth and stencil buffer
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rbo); // attach it
+
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+        glBindTexture(GL_TEXTURE_2D, outputColorBuffer);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, display_size.x, display_size.y, 0, GL_RGBA, GL_FLOAT, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     }
     
     glViewport(0, 0, display_size.x, display_size.y);
@@ -269,7 +306,6 @@ void Renderer::run(){
     glClearColor(clear_color.x * clear_color.w, clear_color.y * clear_color.w, clear_color.z * clear_color.w, clear_color.w);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     
-
     glUseProgram(programID);
 
     for(int i = 0; i < textureIDs.size(); i++){
@@ -279,27 +315,72 @@ void Renderer::run(){
 
     // Ensure the uniform is set to the correct texture unit
     for(int i = 0; i < uniformiNames.size(); i++){
-        GLuint uniformLocation = glGetUniformLocation(programID, uniformiNames[i].c_str());
+        GLint uniformLocation = glGetUniformLocation(programID, uniformiNames[i].c_str());
         glUniform1i(uniformLocation, uniformiValues[i]);
     }
     for(int i = 0; i < uniformuiNames.size(); i++){
-        GLuint uniformLocation = glGetUniformLocation(programID, uniformuiNames[i].c_str());
+        GLint uniformLocation = glGetUniformLocation(programID, uniformuiNames[i].c_str());
         glUniform1ui(uniformLocation, uniformuiValues[i]);
     }
     for(int i = 0; i < uniformfNames.size(); i++){
-        GLuint uniformLocation = glGetUniformLocation(programID, uniformfNames[i].c_str());
+        GLint uniformLocation = glGetUniformLocation(programID, uniformfNames[i].c_str());
         glUniform1f(uniformLocation, uniformfValues[i]);
+    }
+
+    for(int i = 0; i < uniformf3Names.size(); i++){
+        GLint uniformLocation = glGetUniformLocation(programID, uniformf3Names[i].c_str());
+        glUniform3f(uniformLocation, uniformf3Values[i].x, uniformf3Values[i].y, uniformf3Values[i].z);
+    }
+
+    {
+        GLint uniformResolutionLocation = glGetUniformLocation(programID, "screenResolution");
+        glUniform2i(uniformResolutionLocation, display_size.x, display_size.y);
+        GLint uniformLocation = glGetUniformLocation(programID, "time");
+        glUniform1i(uniformLocation, (int)(glfwGetTime()*10000));
+        uniformLocation = glGetUniformLocation(programID, "spp");
+        glUniform1i(uniformLocation, spp);
+        uniformLocation = glGetUniformLocation(programID, "lightBounces");
+        glUniform1i(uniformLocation, lightBounces);
     }
 
 
     glBindVertexArray(VAO);
     glDrawArrays(GL_TRIANGLES, 0, 6);
 
+    // Ensure that writes to the image are complete before reading
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
     // Bind and dispatch the accumulation compute shader
     glUseProgram(computeAccumProgramID);
     glBindImageTexture(0, textureColorbuffer, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
-    glBindImageTexture(1, voxelColorAccumulationBuffer, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
+    glBindImageTexture(1, voxelColorAccumulationBuffer, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+    {
+        GLint uniformLocation = glGetUniformLocation(computeAccumProgramID, "screenResolution");
+        glUniform2i(uniformLocation, display_size.x, display_size.y);
+        uniformLocation = glGetUniformLocation(computeAccumProgramID, "slots");
+        glUniform1i(uniformLocation, voxelBufferSlots);
+        uniformLocation = glGetUniformLocation(computeAccumProgramID, "stride");
+        glUniform1i(uniformLocation, voxelBufferStride);
+        uniformLocation = glGetUniformLocation(computeAccumProgramID, "time");
+        glUniform1ui(uniformLocation, (uint32_t)(glfwGetTime()*100));
+
+        uniformLocation = glGetUniformLocation(computeAccumProgramID, "instruction");
+        if(glfwGetTime() - voxelBufferAccumTime > voxelBufferSwapTime && !(stationary && TAA)){
+            voxelBufferAccumTime = glfwGetTime();
+            switch(voxelBufferInstruction){
+                case 2:
+                    glUniform1i(uniformLocation, 3);
+                    voxelBufferInstruction = 1;
+                    break;
+                case 1:
+                    glUniform1i(uniformLocation, 4);
+                    voxelBufferInstruction = 2;
+                    break;
+            }
+        }else{
+            glUniform1i(uniformLocation, voxelBufferInstruction);
+        }
+    }
     glDispatchCompute((GLuint)ceil(display_size.x / 8.0f), (GLuint)ceil(display_size.y / 8.0f), 1);
 
     // Ensure that writes to the image are complete before reading
@@ -307,13 +388,21 @@ void Renderer::run(){
 
     // Bind and dispatch the averaging compute shader
     glUseProgram(computeAvgProgramID);
-    glBindImageTexture(0, voxelColorAccumulationBuffer, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
+    glBindImageTexture(0, voxelColorAccumulationBuffer, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32UI);
     glBindImageTexture(1, textureColorbuffer, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
     glBindImageTexture(2, outputColorBuffer, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
+    {
+        GLint uniformLocation = glGetUniformLocation(computeAvgProgramID, "screenResolution");
+        glUniform2i(uniformLocation, display_size.x, display_size.y);
+        uniformLocation = glGetUniformLocation(computeAvgProgramID, "slots");
+        glUniform1i(uniformLocation, voxelBufferSlots);
+        uniformLocation = glGetUniformLocation(computeAvgProgramID, "stride");
+        glUniform1i(uniformLocation, voxelBufferStride);
+    }
     glDispatchCompute((GLuint)ceil(display_size.x / 8.0f), (GLuint)ceil(display_size.y / 8.0f), 1);
-
     // Ensure that writes to the image are complete before using the output
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
 
 
     // now bind back to default framebuffer and draw a quad plane with the attached framebuffer color texture
@@ -326,24 +415,36 @@ void Renderer::run(){
     glUseProgram(postProgramID);
 
     {
-        GLuint uniformLocation = glGetUniformLocation(postProgramID, "screenX");
-        glUniform1i(uniformLocation, display_size.x);
-    }
-    {
-        GLuint uniformLocation = glGetUniformLocation(postProgramID, "screenY");
-        glUniform1i(uniformLocation, display_size.y);
+        GLuint uniformResolutionLocation = glGetUniformLocation(postProgramID, "screenResolution");
+        glUniform2i(uniformResolutionLocation, display_size.x, display_size.y);
     }
 
     glBindVertexArray(quadVAO);
-    glBindTexture(GL_TEXTURE_2D, outputColorBuffer);	// use the color attachment texture as the texture of the quad plane
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, outputColorBuffer);    // use the color attachment texture as the texture of the quad plane
+    glUniform1i(glGetUniformLocation(postProgramID, "screenTexture"), 0);
     glDrawArrays(GL_TRIANGLES, 0, 6);
 
     // Unbind the textures after drawing
     glBindTexture(GL_TEXTURE_BUFFER, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
 
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
     glfwSwapBuffers(window);
+
+    /*while((err = glGetError()) != GL_NO_ERROR)
+    {
+        std::cout<<err<<"\n";
+    }*/
+}
+
+void Renderer::clearVoxelTexture(){
+    std::vector<GLuint> clearData(voxelBufferSize.x * voxelBufferSize.y, 0);
+    glBindTexture(GL_TEXTURE_2D, voxelColorAccumulationBuffer);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, voxelBufferSize.x, voxelBufferSize.y, GL_RED_INTEGER, GL_UNSIGNED_INT, clearData.data());
+    glBindTexture(GL_TEXTURE_2D, 0);
+    //log->AddLog("[%d] cleared voxel texture \n", glfwGetTime());
 }
 
 void Renderer::ImGUIpass(){
@@ -352,14 +453,17 @@ void Renderer::ImGUIpass(){
         static int counter = 0;
 
         ImGui::Begin("Debug"); 
-        ImGui::Text("io.WantCaptureMouse %d, io.WantCaptureKeyboard %d", ui->io.WantCaptureMouse, ui->io.WantCaptureKeyboard);
         ImGui::Spacing();
         ImGui::SliderFloat("speed", ui->speed, 0.0f, 500.0f);
         ImGui::SliderFloat("sensitivity", ui->sensitivity, 0.0f, 2.0f);
         ImGui::Spacing();
         ImGui::Text("Position %.3f x %.3f y %.3f z", ui->position.x, ui->position.y, ui->position.z);
         ImGui::Text("Direction %.3f x %.3f y %.3f z", ui->direction.x, ui->direction.y, ui->direction.z);
-        ImGui::Text("Cursor %d x %d y", ui->cursor.x, ui->cursor.y);
+        ImGui::Spacing();
+        ImGui::SliderFloat("Accumulation Time", &voxelBufferSwapTime, 0.0f, 0.5f);
+        ImGui::Checkbox("Temporal Anti-Ailiasing", &TAA);
+        ImGui::SliderInt("samples per pixel", &spp, 1, 30);
+        ImGui::SliderInt("light bounces per ray", &lightBounces, 1, 30);
         ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / ui->io.Framerate, ui->io.Framerate);
         ImGui::End();
     }
@@ -420,6 +524,11 @@ void Renderer::setUniformui(unsigned int v, std::string name){
 void Renderer::setUniformf(float v, std::string name){
     uniformfValues.push_back(v);
     uniformfNames.push_back(name);
+}
+
+void Renderer::setUniformf3(glm::vec3 v, std::string name){
+    uniformf3Values.push_back(v);
+    uniformf3Names.push_back(name);
 }
 
 void Renderer::checkShaderCompileErrors(unsigned int shader, std::string type)

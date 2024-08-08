@@ -5,11 +5,14 @@ in vec4 vertexPosition;
 
 uniform usamplerBuffer octreeTexture;
 uniform uint octreeDepth;
-uniform int lightNum;
-uniform int diffuseSamples;
-uniform int reflectionSamples;
-uniform float skyboxDiffuseIntensity;
-uniform float skyboxSpecularIntensity;
+uniform int spp;
+uniform int lightBounces;
+uniform ivec2 screenResolution;
+uniform int time;
+
+#ifndef FLT_MAX
+#define FLT_MAX 3.402823466e+38
+#endif
 
 layout (std140) uniform CameraUniform {
     vec4 position;
@@ -17,10 +20,10 @@ layout (std140) uniform CameraUniform {
 } camera;
 
 struct Material {
-    vec4 color;
-    float ambient, diffuse, specular, roughness, reflection, shininess;
+    vec4 color, specularColor;
+    float diffuse, specular, metallic;
     bool emissive;
-    float intensity;
+    float emissiveIntensity;
 };
 
 layout (std140) uniform MaterialUniform {
@@ -29,7 +32,6 @@ layout (std140) uniform MaterialUniform {
 
 const uint type_mask = uint(1), count_mask = uint(14), next_mask = uint(4294967280), material_mask = uint(254);
 const float inv_127 = 1.0/127.0;
-const uint FLT32_MAX = uint(2139095030);
 uint octreeLength;
 
 struct Node {
@@ -38,26 +40,34 @@ struct Node {
 };
 
 struct leaf_t { uint size; vec3 position;};
-struct voxel_t { bool hit; uint id, material; uvec3 position;};
+struct hit_t { bool hit; uint id, material; uvec3 position;};
 struct ray_t { vec3 origin, direction, inverted_direction;};
 
 Node UnpackNode(uint raw) { return Node(bool(raw & type_mask), (raw & count_mask) >> 1, (raw & next_mask) >> 4, (raw & material_mask) >> 1, (raw >> 8u) & 0xFFFFFFu);}
 vec3 UnpackNormal(uint packedNormal) { return vec3(float(int(packedNormal >> 16u & 0xFFu) - 128) * inv_127, float(int(packedNormal >> 8u & 0xFFu) - 128) * inv_127, float(int(packedNormal & 0xFFu) - 128) * inv_127);}
 bool inBounds(vec3 v, float n) { return all(lessThanEqual(vec3(0), v) && lessThanEqual(v, vec3(n, n, n)));}
 uint locate(uvec3 pos, uint p2) { return (uint(bool(pos.x & p2)) << 2) | (uint(bool(pos.y & p2)) << 1) | uint(bool(pos.z & p2));}
+float lerp(float a, float b, float t){ return a + t * (b - a);}
+vec3 lerp(vec3 a, vec3 b, float t){ return vec3(lerp(a.x,b.x,t), lerp(a.y,b.y,t), lerp(a.z,b.z,t));}
 
-vec2 rand(vec2 co){return vec2(fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453), fract(cos(dot(co, vec2(87.9898, 13.233))) * 33398.5453));}
+float rand(inout uint state){
+    state = state * uint(747796405) + uint(2891336453);
+    uint word = ((state >> ((state >> uint(28)) + uint(4))) ^ state) * uint(277803737);
+    word = (word >> uint(22)) ^ word;
+    return float(word) / 4294967295.0;
+}
 
-vec3 randomVectorInCone(vec3 coneDir, float coneAngle, vec2 rand) {
-    vec3 w = normalize(coneDir);
-    vec3 u = normalize(cross(w, abs(w.x) > 0.1 ? vec3(0, 1, 0) : vec3(1, 0, 0)));
-    vec3 v = cross(w, u);
-    
-    float cosTheta = mix(cos(coneAngle), 1.0, rand.x);
-    float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
-    float phi = rand.y * 6.28318530718; // 2 * pi
+float randInNormalDistribution(inout uint state){
+    float theta = 2 * 3.1415926 * rand(state);
+    float rho = sqrt(-2 * log(rand(state)));
+    return rho * cos(theta);
+}
 
-    return normalize(sinTheta * cos(phi) * u + sinTheta * sin(phi) * v + cosTheta * w);
+vec3 RandomDirection(inout uint state){
+    float x = randInNormalDistribution(state);
+    float y = randInNormalDistribution(state);
+    float z = randInNormalDistribution(state);
+    return normalize(vec3(x, y, z));
 }
 
 vec3 sampleSkybox(vec3 dir){
@@ -65,34 +75,34 @@ vec3 sampleSkybox(vec3 dir){
 }
 
 vec4 intersect(ray_t r, vec3 box_min, vec3 box_max) {
-    vec3 t1 = (box_min - r.origin) * r.inverted_direction;
-    vec3 t2 = (box_max - r.origin) * r.inverted_direction;
+    vec3 t1 = (box_min - r.origin + 0.001) * r.inverted_direction;
+    vec3 t2 = (box_max - r.origin - 0.001) * r.inverted_direction;
     vec3 tmin = min(t1, t2), tmax = max(t1, t2);
     float t_enter = max(max(tmin.x, tmin.y), tmin.z);
     float t_exit = min(min(tmax.x, tmax.y), tmax.z);
     if (t_exit < t_enter || t_exit < 0) return vec4(0.0, 0.0, 0.0, -1.0);
-    return vec4(r.direction * (t_enter + 0.01) + r.origin, 1.0);
+    return vec4(r.direction * (t_enter) + r.origin, 1.0);
 }
 
 vec3 intersect_inside(ray_t r, vec3 box_min, vec3 box_max) {
-    vec3 t1 = (box_min - r.origin) * r.inverted_direction;
-    vec3 t2 = (box_max - r.origin) * r.inverted_direction;
+    vec3 t1 = (box_min - r.origin - 0.001) * r.inverted_direction;
+    vec3 t2 = (box_max - r.origin + 0.001) * r.inverted_direction;
     vec3 tmin = min(t1, t2), tmax = max(t1, t2);
     float t_exit = min(min(tmax.x, tmax.y), tmax.z);
-    return r.direction * (t_exit + 0.01) + r.origin;
+    return r.direction * (t_exit) + r.origin;
 }
 
-voxel_t Raycast(ray_t ray) {
+hit_t Raycast(ray_t ray) {
     uint p2c[16];
     for (int i = 0; i <= int(octreeDepth); i++) {
         p2c[i] = uint(octreeLength >> uint(i));
     }
 
-    voxel_t voxel = voxel_t(false, uint(0), uint(0), uvec3(0,0,0));
+    hit_t voxel = hit_t(false, uint(0), uint(0), uvec3(0,0,0));
     uint offset = uint(0), depth = uint(0), q = uint(0);
     vec3 r_pos;
 
-    ray.origin += ray.direction * 3;
+    ray.origin += ray.direction * 4;
     
     if (inBounds(ray.origin, float(octreeLength))) r_pos = ray.origin;
     else {  vec4 intersection = intersect(ray, vec3(0), vec3(float(octreeLength)));
@@ -123,7 +133,7 @@ voxel_t Raycast(ray_t ray) {
             Node leaf = UnpackNode(texelFetch(octreeTexture, int(offset)).r);
             target.size = p2c[depth];
             target.position = vec3(uvec3(ur_pos) & ~uvec3(target.size - uint(1)));
-            if (leaf.material != uint(0)) return voxel_t(true, offset, leaf.material, uvec3(target.position));
+            if (leaf.material != uint(0)) return hit_t(true, offset, leaf.material, uvec3(target.position));
         }
 
         r_pos = intersect_inside(ray, target.position, target.position + vec3(target.size));
@@ -131,37 +141,35 @@ voxel_t Raycast(ray_t ray) {
     return voxel;
 }
 
-struct BRDF_t{
-    vec3 ambient, diffuse, specular, reflective;
-};
+vec3 Trace(ray_t ray, hit_t voxel, inout uint randomState){
+    vec3 incomingLight = vec3(0,0,0);
+    vec3 rayColor = vec3(1,1,1);
+    for(int i = 0; i <= lightBounces; i++){
+        Node data = UnpackNode(texelFetch(octreeTexture, int(voxel.id)).r);
+        vec3 normal = normalize(UnpackNormal(data.normal));
+        Material mat = material[data.material];
 
-BRDF_t computeBRDF(ray_t sampleRay, voxel_t sampleCast, Material mat, vec3 origin, vec3 normal, vec3 reflection){
-    BRDF_t brdf = BRDF_t(vec3(0,0,0), vec3(0,0,0), vec3(0,0,0), vec3(0,0,0));
+        ray.origin = vec3(voxel.position) + vec3(0.5, 0.5, 0.5) + normal;
+        vec3 diffuseDir = normalize(normal + RandomDirection(randomState));
+        vec3 specularDir = reflect(ray.direction, normal);
+        bool isSpecular = mat.specular >= rand(randomState);
+        ray.direction = lerp(diffuseDir, specularDir, mat.metallic * float(isSpecular));
+        ray.inverted_direction = 1.0 / ray.direction;
 
-    float diffuse_dot = dot(sampleRay.direction, normal);
-    float specular_dot = dot(sampleRay.direction, reflection);
-    if(sampleCast.hit)
-    {
-        Node sampleData = UnpackNode(texelFetch(octreeTexture, int(sampleCast.id)).r);
-        vec3 sampleNormal = normalize(UnpackNormal(sampleData.normal));
-        Material sampleMat = material[sampleData.material];
-
-        if(sampleMat.emissive){
-            float dist = distance(origin, sampleCast.position);
-            brdf.diffuse += sampleMat.color.rgb * diffuse_dot * int(diffuse_dot>=0) * sampleMat.intensity / dist;
-            brdf.specular += pow(specular_dot * int(specular_dot>=0), mat.shininess) * sampleMat.intensity / dist;
+        if(mat.emissive){
+            incomingLight += mat.color.xyz * mat.emissiveIntensity * rayColor;
         }
-        else{
-            brdf.reflective += material[sampleCast.material].color.xyz;
-            //TODO: multiple bounces
+        rayColor *= lerp(mat.color.xyz, mat.specularColor.xyz, float(isSpecular));
+
+        if(i < lightBounces){
+            voxel = Raycast(ray);
+            if(!voxel.hit){
+                incomingLight += sampleSkybox(ray.direction) * rayColor;
+                break;
+            }
         }
-    }else{
-        brdf.diffuse += sampleSkybox(sampleRay.direction) * diffuse_dot * int(diffuse_dot>=0) * skyboxDiffuseIntensity;
-        brdf.specular += sampleSkybox(sampleRay.direction) * pow(specular_dot * int(specular_dot>=0), mat.shininess) * skyboxSpecularIntensity;
-        brdf.reflective += sampleSkybox(sampleRay.direction);
     }
-
-    return brdf;
+    return incomingLight;
 }
 
 void main() {
@@ -173,66 +181,17 @@ void main() {
     ray.direction = direction;
     ray.inverted_direction = 1.0 / direction;
 
-    voxel_t voxel = Raycast(ray);
-    FragColor = vec4(sampleSkybox(ray.direction), 0.0);
-    vec3 v_pos = vec3(voxel.position) + vec3(0.5, 0.5, 0.5);
+    hit_t voxel = Raycast(ray);
+
     if(voxel.hit){
-        Node data = UnpackNode(texelFetch(octreeTexture, int(voxel.id)).r);
-        vec3 normal = normalize(UnpackNormal(data.normal));
-        Material mat = material[data.material];
-
-        if(mat.emissive){
-            FragColor = vec4(mat.color.xyz, float(voxel.id % uint(256)) / 256.0);
-            return;
+        vec3 incomingLight = vec3(0,0,0);
+        uint randomState = uint(float((vertexPosition.x + 1.0)/2 * float(screenResolution.x * screenResolution.y) + (vertexPosition.y + 1.0)/2 * float(screenResolution.y))) * uint(time * time);
+        for(int i = 0; i < spp; i++){
+            incomingLight += Trace(ray, voxel, randomState);
         }
-
-
-        BRDF_t diffuse_brdf = BRDF_t(mat.color.xyz, vec3(0,0,0), vec3(0,0,0), vec3(0,0,0));
-        BRDF_t reflective_brdf = BRDF_t(mat.color.xyz, vec3(0,0,0), vec3(0,0,0), vec3(0,0,0));
-        vec3 reflection = normalize(reflect(v_pos - ray.origin,normal));
-
-        //diffuse BRDF
-        for(int i = 0; i < diffuseSamples; i++){
-            ray_t sampleRay = ray_t(v_pos, normalize(randomVectorInCone(normal, radians(90.0), rand(vec2(vertexPosition.x + i, vertexPosition.y-i)))), vec3(0,0,0));
-            sampleRay.inverted_direction = 1.0/sampleRay.direction;
-            voxel_t sampleCast = Raycast(sampleRay);
-            BRDF_t sampleBRDF = computeBRDF(sampleRay, sampleCast, mat, v_pos, normal, reflection);
-            diffuse_brdf.ambient += sampleBRDF.ambient;
-            diffuse_brdf.diffuse += sampleBRDF.diffuse;
-            diffuse_brdf.specular += sampleBRDF.specular;
-            diffuse_brdf.reflective += sampleBRDF.reflective;
-        }
-
-        //reflection BRDF
-        for(int i = 0; i < reflectionSamples; i++){
-            ray_t sampleRay = ray_t(v_pos, normalize(randomVectorInCone(reflection, radians(min(90.0 * mat.roughness, degrees(90 - acos(dot(normal, reflection))))), rand(vec2(vertexPosition.x + i, vertexPosition.y-i)))), vec3(0,0,0));
-            sampleRay.inverted_direction = 1.0/sampleRay.direction;
-            voxel_t sampleCast = Raycast(sampleRay);
-            BRDF_t sampleBRDF = computeBRDF(sampleRay, sampleCast, mat, v_pos, normal, reflection);
-            reflective_brdf.ambient += sampleBRDF.ambient;
-            reflective_brdf.diffuse += sampleBRDF.diffuse;
-            reflective_brdf.specular += sampleBRDF.specular;
-            reflective_brdf.reflective += sampleBRDF.reflective;
-        }
-
-        float invDiffuseSamples = 1.0/float(diffuseSamples);
-        float invRelfectSamples = 1.0/float(reflectionSamples);
-
-        diffuse_brdf.ambient *= invDiffuseSamples;
-        diffuse_brdf.diffuse *= invDiffuseSamples;
-        diffuse_brdf.specular *= invDiffuseSamples;
-        diffuse_brdf.reflective *= invDiffuseSamples;
-
-        reflective_brdf.ambient *= invRelfectSamples;
-        reflective_brdf.diffuse *= invRelfectSamples;
-        reflective_brdf.specular *= invRelfectSamples;
-        reflective_brdf.reflective *= invRelfectSamples; 
-
-        vec3 color = (diffuse_brdf.ambient + reflective_brdf.ambient) * mat.ambient + 
-                (diffuse_brdf.diffuse + reflective_brdf.diffuse) * mat.diffuse +
-                (diffuse_brdf.reflective + reflective_brdf.reflective) * mat.reflection + 
-                (diffuse_brdf.specular + reflective_brdf.specular) * mat.specular;
-
-        FragColor = vec4(color.xyz, uintBitsToFloat(voxel.id % FLT32_MAX));
+        incomingLight /= float(spp);
+        FragColor = vec4(incomingLight.xyz, float(voxel.id+1));
+    }else{
+        FragColor = vec4(sampleSkybox(ray.direction), 0);
     }
 }
