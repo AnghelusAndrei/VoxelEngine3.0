@@ -54,6 +54,7 @@
         "shared_mutex": "cpp",
         "cerrno": "cpp",
         "strstream": "cpp",
-        "*.yml": "cpp"
+        "*.yml": "cpp",
+        "stack": "cpp"
     }
 }

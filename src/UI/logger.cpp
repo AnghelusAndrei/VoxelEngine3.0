@@ -1,22 +1,31 @@
 #include "logger.hpp"
 
-Log::Log()
+Logger::Logger(const char* name_) : Widget(name_)
 {
     AutoScroll = true;
     Clear();
 }
 
-void Log::Clear()
+void Logger::Clear()
 {
     Buf.clear();
     LineOffsets.clear();
     LineOffsets.push_back(0);
 }
 
-void Log::AddLog(const char* fmt, ...)
+void Logger::vAddLog(const char* fmt, va_list args)
 {
     int old_size = Buf.size();
+    Buf.appendfv(fmt, args);
+    for (int new_size = Buf.size(); old_size < new_size; old_size++)
+        if (Buf[old_size] == '\n')
+            LineOffsets.push_back(old_size + 1);
+}
+
+void Logger::AddLog(const char* fmt, ...)
+{
     va_list args;
+    int old_size = Buf.size();
     va_start(args, fmt);
     Buf.appendfv(fmt, args);
     va_end(args);
@@ -25,9 +34,9 @@ void Log::AddLog(const char* fmt, ...)
             LineOffsets.push_back(old_size + 1);
 }
 
-void Log::Draw(const char* title, bool* p_open)
+void Logger::Draw()
 {
-    if (!ImGui::Begin(title, p_open))
+    if (!ImGui::Begin(name))
     {
         ImGui::End();
         return;

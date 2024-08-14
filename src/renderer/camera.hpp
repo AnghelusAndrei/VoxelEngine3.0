@@ -2,10 +2,6 @@
 
 #include <glad/glad.h>
 
-#define GL_SILENCE_DEPRECATION
-#if defined(IMGUI_IMPL_OPENGL_ES2)
-#include <GLES2/gl2.h>
-#endif
 #include <GLFW/glfw3.h> // Will drag system OpenGL headers
 
 #include <glm/vec4.hpp>
@@ -15,13 +11,14 @@
 #include <glm/gtx/euler_angles.hpp>
 #include <glm/gtx/rotate_vector.hpp>
 
+
 class Camera{
     public:
     struct Config{
         glm::vec3 position; 
         glm::vec3 direction; 
         float aspect_ratio;
-        uint32_t shaderID;
+        float FOV;
     };
 
     struct UBO{
@@ -38,13 +35,19 @@ class Camera{
 
     glm::vec3 position;
     glm::vec3 direction;
+    float *FOV;
+
+    friend class Renderer;
 
     protected:
+    void setProgram(GLuint program_);
     void UpdateUBO();
     float aspect_ratio;
 
     private:
+    void GenUBO(GLuint program_);
+    void freeVRAM();
 
     GLuint gl_ID;   
-    GLuint shaderID;
+    GLuint program;
 };

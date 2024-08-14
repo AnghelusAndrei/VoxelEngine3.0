@@ -3,7 +3,6 @@
 
 Octree::Octree(Config *config){
     depth = config->depth > maxDepth ? maxDepth : config->depth;
-    renderer = config->renderer;
 
     delete config;
 
@@ -17,7 +16,14 @@ Octree::Octree(Config *config){
     }
 
     data.reserve(capacity);
+}
 
+void Octree::setProgram(GLuint program_){
+    program = program_;
+}
+
+void Octree::GenUBO(GLuint program_){
+    program = program_;
     glGenBuffers(1, &gl_ID);
     glBindBuffer(GL_TEXTURE_BUFFER, gl_ID);
     glBufferData(GL_TEXTURE_BUFFER, capacity * 4, NULL, GL_DYNAMIC_DRAW);
@@ -30,15 +36,27 @@ Octree::Octree(Config *config){
     // Unbind the buffer and texture
     glBindBuffer(GL_TEXTURE_BUFFER, 0);
     glBindTexture(GL_TEXTURE_BUFFER, 0);
+}
 
-    renderer->addTexture(texBufferID);
-    renderer->setUniformi(0, "octreeTexture");
-    renderer->setUniformui(depth, "octreeDepth");
+void Octree::freeVRAM(){
+    glDeleteBuffers(1, &gl_ID);
+    glDeleteTextures(1, &texBufferID);
+}
+
+void Octree::BindUniforms(uint8_t &texturesBound){
+    glActiveTexture(GL_TEXTURE0 + texturesBound);
+    glBindTexture(GL_TEXTURE_BUFFER, texBufferID);
+
+    GLint texLoc = glGetUniformLocation(program, "octreeTexture");
+    GLint depthLoc = glGetUniformLocation(program, "octreeDepth");
+
+    glUniform1i(texLoc, (int)texturesBound);
+    glUniform1ui(depthLoc, (int)depth);
+    texturesBound++;
 }
 
 Octree::~Octree(){
-    glDeleteBuffers(1, &gl_ID);
-    glDeleteTextures(1, &texBufferID);
+    freeVRAM();
 }
 
 void Octree::Update(){
@@ -65,18 +83,6 @@ uint32_t  Octree::lookup(glm::uvec3 position){
     }
 }
 
-void Octree::Debug(Log *log){
-    for(int i = 0; i < newNode; i++){
-        Node current = data[i];
-        if(current.base.isNode){
-            log->AddLog("base: %u, count: %u, next: %u \n", current.base.isNode, current.node.count, current.node.next);
-        }else{
-            log->AddLog("base: %u, material: %u, raw normal: %u \n", current.base.isNode, current.leaf.material, current.leaf.normal);
-        }
-    }
-
-    log->AddLog("num of nodes: %i \n", newNode);
-}
 
 void Octree::insert(glm::uvec3 position, Node leaf){
     if(position.x > (2 << depth) || position.y > (2 << depth) || position.z > (2 << depth))

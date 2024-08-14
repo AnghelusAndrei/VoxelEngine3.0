@@ -1,9 +1,8 @@
 #pragma once
-#include "imgui.h"
-#include "./backends/imgui_impl_glfw.h"
-#include "./backends/imgui_impl_opengl3.h"
 
-class Log
+#include "widget.hpp"
+
+class Logger : public Widget
 {
 public:
 
@@ -12,9 +11,10 @@ public:
     ImVector<int>       LineOffsets; // Index to lines offset. We maintain this with AddLog() calls.
     bool                AutoScroll;  // Keep scrolling if already at the bottom.
 
-    Log();
+    Logger(const char* name_);
 
     void Clear();
+    void vAddLog(const char* fmt, va_list args) ;
     void AddLog(const char* fmt, ...) ;
-    void Draw(const char* title, bool* p_open = NULL);
+    void Draw() override;
 };

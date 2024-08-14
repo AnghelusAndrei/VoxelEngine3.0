@@ -8,6 +8,11 @@ FPCamera::FPCamera() : Camera(){
 FPCamera::FPCamera(Camera::Config *config_, ControllerConfig *controllerConfig) : Camera(config_){
     defaultKeyMap();
     config = controllerConfig;
+    rotation = config->rotation;
+
+    direction.x = cosf(glm::radians(rotation.x))*cosf(glm::radians(rotation.y));
+    direction.y = sinf(glm::radians(rotation.y));
+    direction.z = sinf(glm::radians(rotation.x))*cosf(glm::radians(rotation.y));
 }
 
 FPCamera::~FPCamera(){
@@ -65,7 +70,6 @@ bool FPCamera::GLFWInput(GLFWwindow* window){
     if(firstFrame){
         firstFrame = false;
         start_angle = glm::dvec2(mouse);
-        rotation = glm::vec2(0,0);
     }else{
         rotation.x = fmod(rotation.x - (mouse.x - start_angle.x)*config->sensitivity, 360);
         rotation.y = glm::clamp(rotation.y - (mouse.y - start_angle.y)*config->sensitivity, -89.0, 89.0);

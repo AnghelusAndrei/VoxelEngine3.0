@@ -1,6 +1,6 @@
 #pragma once
 
-#include "renderer.hpp"
+#include "core.hpp"
 
 #include <stack>
 #include <functional>
@@ -8,6 +8,7 @@
 
 #define maxDepth 16
 
+class Renderer;
 class Octree{
     public:
         struct NodeBase {
@@ -37,31 +38,35 @@ class Octree{
     public:
         struct Config{
             uint8_t depth;
-            Renderer *renderer;
         };
 
         Octree(Config *config);
         ~Octree();
         void Update();
-        void Debug(Log *log);
 
         uint32_t lookup(glm::uvec3 position);
         void insert(glm::uvec3 position, Node leaf);
         void remove(glm::uvec3 position);
 
         static uint32_t packedNormal(glm::vec3& normal);
-        GLuint gl_ID;
-        GLuint texBufferID;
-        GLuint depthUniformLocation;
 
         uint8_t depth;
         uint32_t capacity;
+
+        friend class Renderer;
     private:
-        Renderer *renderer;
+        GLuint gl_ID;
+        GLuint program;
+        GLuint texBufferID;
+        GLuint depthUniformLocation;
+
         uint32_t newNode = 8;
         std::stack<uint32_t> freeNodes;
         
-
+        void setProgram(GLuint program_);
+        void GenUBO(GLuint program_);
+        void freeVRAM();
+        void BindUniforms(uint8_t &texturesBound);
         void UpdateNode(uint32_t index);
 
         uint32_t utils_p2r[maxDepth];

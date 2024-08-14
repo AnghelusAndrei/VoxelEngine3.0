@@ -26,15 +26,20 @@ struct Material{
 
 class MaterialPool{
     public:
-        MaterialPool(GLuint shaderID_);
+        MaterialPool();
         ~MaterialPool();
         uint32_t addMaterial(Material *material);
         bool setMaterial(Material *material, uint32_t index);
 
         uint32_t length;
         uint32_t capacity;
+
+        friend class Renderer;
     private:
+        void setProgram(GLuint program_);
+        void GenUBO(GLuint program_);
+        void freeVRAM();
 
         GLuint gl_ID;
-        GLuint shaderID;
+        GLuint program;
 };

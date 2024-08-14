@@ -16,6 +16,7 @@ uniform int instruction;
 #define ADDCLEARRIGHT 4
 
 uniform uint time;
+uniform uint updateTime;
 
 uniform ivec2 screenResolution;
 
@@ -43,11 +44,23 @@ void main() {
             memoryBarrierImage();
             barrier();
             uint id = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i)).r;
+            uint voxelAccesTime = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i+9)).r;
             if(id != voxelID){
-                uint voxelAccesTime = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i+9)).r;
                 if(voxelAccesTime < candidate.x && voxelAccesTime > 0)
                     candidate = uvec3(voxelAccesTime, id, uint(i));
                 continue;
+            }
+            if(voxelAccesTime < time - updateTime){
+                imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+1), uint(1));
+                imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+2), udata.x);
+                imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+3), udata.y);
+                imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+4), udata.z);
+                imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+5), uint(1));
+                imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+6), udata.x);
+                imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+7), udata.y);
+                imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+8), udata.z);
+                imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+9), time);
+                return;
             }
             // Atomic add operations for accumulating color and count
             switch(instruction){
