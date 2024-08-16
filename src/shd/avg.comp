@@ -8,6 +8,7 @@ layout (binding = 2, rgba32f) writeonly uniform image2D outputColorBuffer;
 
 uniform int slots;
 uniform int stride;
+uniform int size;
 
 uniform ivec2 screenResolution;
 
@@ -23,7 +24,7 @@ void main() {
         imageStore(outputColorBuffer, pixelCoord, vec4(data.xyz, 1));
         return;
     }
-    uint voxelHash = voxelID % uint(32768 - 1) + uint(1);
+    uint voxelHash = voxelID % uint(size - 1) + uint(1);
     uvec3 accumulatedColor1, accumulatedColor2;
     uint count1, count2, id;
     int i = 0;

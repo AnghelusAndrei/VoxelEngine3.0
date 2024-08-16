@@ -23,7 +23,7 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
         .log = logMessage,
         .framebufferSize = fbSize,
         .aspectRatio = windowConfig->viewportAspectRatio,
-        .debuggingEnabled = true
+        .debuggingEnabled = false
     };
 
     Octree::Config octreeConfig = {
@@ -49,6 +49,7 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
         .TAA = false,
         .spp = 1,
         .bounces = 2,
+        .controlchecks = 300,
         .shaderRecompilation = false,
         .renderToTexture = false
     };
@@ -74,7 +75,7 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
             .specular = 0.4f,
             .metallic = 0.3f,
             .emissive = true,
-            .emissiveIntensity = 3.0f
+            .emissiveIntensity = 4.0f
         };
 
         Material red_m = {

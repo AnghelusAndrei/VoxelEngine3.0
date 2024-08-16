@@ -29,6 +29,8 @@ namespace core{
         float aspectRatio; 
         bool debuggingEnabled;
 
+        glm::ivec2 lBufferSize = glm::ivec2(-1, -1);
+
         void logMessage(const char* format, ...) const {
             va_list args;
             va_start(args, format);
@@ -79,6 +81,7 @@ namespace core{
         //raytracing
         int spp = 1;
         int bounces = 2;
+        int controlchecks = 160;
 
         bool shaderRecompilation = false;
         bool renderToTexture = false;
@@ -87,8 +90,8 @@ namespace core{
 
     struct DebugInfo{
         //profiling
-        double start_ms;
-        double end_ms;
+        double start_ms = 0;
+        double end_ms = 0;
 
         //gpu
         double gpu_start_ms;
@@ -100,8 +103,18 @@ namespace core{
         double gpu_end_ms;
 
         //cpu
-        double cpu_start_ms;
-        double cpu_end_ms;
+        double cpu_start_ms = 0;
+        double cpu_end_ms = 0;
+
+        //mem
+        uint32_t scene_capacity = 0;
+        uint32_t scene_mem = 0;
+        uint32_t lBuffer_mem = 0;
+
+        //scene
+        uint32_t voxels_num = 0;
+        glm::vec3 cam_position;
+        glm::vec3 cam_direction;
     };
 
     struct runtimeRendererMem{
@@ -111,4 +124,4 @@ namespace core{
         float aspectRatio;
         uint8_t texturesBound;
     };
-}
+};

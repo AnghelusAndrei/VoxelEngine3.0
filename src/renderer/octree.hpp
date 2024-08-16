@@ -52,6 +52,8 @@ class Octree{
 
         uint8_t depth;
         uint32_t capacity;
+        uint32_t size = 8;
+        uint32_t numVoxels = 0;
 
         friend class Renderer;
     private:
@@ -60,7 +62,6 @@ class Octree{
         GLuint texBufferID;
         GLuint depthUniformLocation;
 
-        uint32_t newNode = 8;
         std::stack<uint32_t> freeNodes;
         
         void setProgram(GLuint program_);
@@ -68,6 +69,7 @@ class Octree{
         void freeVRAM();
         void BindUniforms(uint8_t &texturesBound);
         void UpdateNode(uint32_t index);
+        void resizeDataIfNeeded(uint32_t requiredCapacity);
 
         uint32_t utils_p2r[maxDepth];
         uint32_t locate(glm::uvec3 position, uint32_t depth_);

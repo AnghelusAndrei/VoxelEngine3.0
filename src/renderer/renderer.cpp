@@ -6,8 +6,15 @@
 Renderer::Renderer(core::RendererConfig *config_, Octree *volume_, Camera *camera_, MaterialPool *materialPool_) : config(config_), volume(volume_), camera(camera_), materialPool(materialPool_){
 
     lBuffer.stride = 10;//fixed size, determines the slot layout used in the pipeline
-    lBuffer.slots = 10; //variable size, determines the number of voxel slots in the lighting buffer
     lBuffer.instruction = 1;
+    if(config->lBufferSize.x == -1)
+        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &config->lBufferSize.x);
+    if(config->lBufferSize.y == -1)
+        config->lBufferSize.y = 1<<((volume->depth-4) <= 1 ? 1 : (volume->depth-4));
+
+    lBuffer.size.x = config->lBufferSize.x;
+    lBuffer.slots = config->lBufferSize.y; //variable size, determines the number of voxel slots in the lighting buffer
+    lBuffer.size.y = lBuffer.stride * lBuffer.slots;
 
     if(config->debuggingEnabled)config->logMessage("[%f] initializing the renderer \n", glfwGetTime());
     checkGLError(&success);
@@ -66,9 +73,6 @@ Renderer::Renderer(core::RendererConfig *config_, Octree *volume_, Camera *camer
     if(config->debuggingEnabled)config->logMessage("[%f] building lighting buffer \n", glfwGetTime());
     checkGLError(&success);
 
-    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &lBuffer.size.x);
-    lBuffer.size.y = lBuffer.stride * lBuffer.slots;
-
     glGenTextures(1, &lBuffer.texture);
     glBindTexture(GL_TEXTURE_2D, lBuffer.texture);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, lBuffer.size.x, lBuffer.size.y, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, NULL);
@@ -89,6 +93,14 @@ bool Renderer::run(core::FrameConfig *frameConfig){
     debug.gpu_start_ms = glfwGetTime() * 1000.0;
     debug.start_ms = debug.end_ms;
     debug.end_ms = glfwGetTime() * 1000.0;
+
+    debug.scene_capacity = volume->capacity * sizeof(Octree::Node);
+    debug.scene_mem = volume->size * sizeof(Octree::Node);
+    debug.lBuffer_mem = lBuffer.size.x * lBuffer.size.y * sizeof(GLuint);
+
+    debug.voxels_num = volume->numVoxels;
+    debug.cam_position = camera->position;
+    debug.cam_direction = camera->direction;
 
     handleShaderRecompilation(frameConfig);
 
@@ -124,11 +136,13 @@ bool Renderer::run(core::FrameConfig *frameConfig){
         GLint timeLoc = glGetUniformLocation(rayPass.program, "time");
         GLint sppLoc = glGetUniformLocation(rayPass.program, "spp");
         GLint bouncesLoc = glGetUniformLocation(rayPass.program, "lightBounces");
+        GLint checksLoc = glGetUniformLocation(rayPass.program, "controlchecks");
 
         glUniform2i(resLoc, rrm.framebufferSize.x, rrm.framebufferSize.y);
         glUniform1i(timeLoc, (int)(glfwGetTime()*10000));
         glUniform1i(sppLoc, frameConfig->spp);
         glUniform1i(bouncesLoc, frameConfig->bounces);
+        glUniform1ui(checksLoc, (GLuint)frameConfig->controlchecks);
     }
 
     glBindVertexArray(rayPass.VAO);
@@ -155,10 +169,12 @@ bool Renderer::run(core::FrameConfig *frameConfig){
         GLint strideLoc = glGetUniformLocation(accumPass.program, "stride");
         GLint timeLoc = glGetUniformLocation(accumPass.program, "time");
         GLint updateLoc = glGetUniformLocation(accumPass.program, "updateTime");
+        GLint sizeLoc = glGetUniformLocation(accumPass.program, "size");
 
         glUniform2i(resLoc, rrm.framebufferSize.x, rrm.framebufferSize.y);
         glUniform1i(slotsLoc, lBuffer.slots);
         glUniform1i(strideLoc, lBuffer.stride);
+        glUniform1i(sizeLoc, lBuffer.size.x);
         glUniform1ui(timeLoc, (GLuint)(glfwGetTime()*100));
         glUniform1ui(updateLoc, (GLuint)(2.0 * (debug.end_ms - debug.start_ms)));
 
@@ -196,10 +212,12 @@ bool Renderer::run(core::FrameConfig *frameConfig){
         GLint resLoc = glGetUniformLocation(avgPass.program, "screenResolution");
         GLint slotsLoc = glGetUniformLocation(avgPass.program, "slots");
         GLint strideLoc = glGetUniformLocation(avgPass.program, "stride");
+        GLint sizeLoc = glGetUniformLocation(avgPass.program, "size");
 
         glUniform2i(resLoc, rrm.framebufferSize.x, rrm.framebufferSize.y);
         glUniform1i(slotsLoc, lBuffer.slots);
         glUniform1i(strideLoc, lBuffer.stride);
+        glUniform1i(sizeLoc, lBuffer.size.x);
     }
     glDispatchCompute((GLuint)ceil((float)avgPass.globalSize.x / (float)avgPass.groupSize.x), (GLuint)ceil((float)avgPass.globalSize.y / (float)avgPass.groupSize.y), 1);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
@@ -213,7 +231,6 @@ bool Renderer::run(core::FrameConfig *frameConfig){
     // Set the viewport
     glViewport(rrm.framebufferPos.x, rrm.framebufferPos.y, rrm.framebufferSize.x, rrm.framebufferSize.y);
 
-    // now bind back to default framebuffer and draw a quad plane with the attached framebuffer color texture
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     if(frameConfig->renderToTexture)
         glBindFramebuffer(GL_FRAMEBUFFER, finalPass.framebuffer);

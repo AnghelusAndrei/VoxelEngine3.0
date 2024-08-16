@@ -8,6 +8,7 @@ layout (binding = 0, rgba32f) readonly uniform image2D inputColorBuffer;
 layout (binding = 1, r32ui) coherent uniform uimage2D voxelColorAccumulationBuffer;
 
 uniform int slots;
+uniform int size;
 uniform int stride;
 uniform int instruction;
 #define ADDLEFT 1
@@ -29,7 +30,7 @@ void main() {
     // Use imageLoad instead of texelFetch for image2D
     vec4 data = imageLoad(inputColorBuffer, pixelCoord).xyzw;
     uint voxelID = uint(data.w);
-    uint voxelHash = voxelID % uint(32768 - 1) + uint(1);
+    uint voxelHash = voxelID % uint(size - 1) + uint(1);
 
     if(voxelHash > 0){
         uvec3 udata = uvec3(

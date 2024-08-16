@@ -6,6 +6,7 @@ in vec4 vertexPosition;
 uniform usamplerBuffer octreeTexture;
 uniform uint octreeDepth;
 uniform int spp;
+uniform uint controlchecks;
 uniform int lightBounces;
 uniform ivec2 screenResolution;
 uniform int time;
@@ -111,7 +112,7 @@ hit_t Raycast(ray_t ray) {
 
     leaf_t target;
 
-    while (inBounds(r_pos, float(octreeLength)) && q++ <= uint(65)) {
+    while (inBounds(r_pos, float(octreeLength)) && q++ <= controlchecks) {
         uvec3 ur_pos = uvec3(uint(r_pos.x), uint(r_pos.y), uint(r_pos.z));
         depth = offset = uint(0);
         bool foundLeaf = false;

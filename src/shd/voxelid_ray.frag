@@ -6,6 +6,7 @@ in vec4 vertexPosition;
 uniform usamplerBuffer octreeTexture;
 uniform uint octreeDepth;
 uniform int spp;
+uniform uint controlchecks;
 uniform int lightBounces;
 uniform ivec2 screenResolution;
 uniform int time;
@@ -111,7 +112,7 @@ hit_t Raycast(ray_t ray) {
 
     leaf_t target;
 
-    while (inBounds(r_pos, float(octreeLength)) && q++ <= uint(65)) {
+    while (inBounds(r_pos, float(octreeLength)) && q++ <= controlchecks) {
         uvec3 ur_pos = uvec3(uint(r_pos.x), uint(r_pos.y), uint(r_pos.z));
         depth = offset = uint(0);
         bool foundLeaf = false;
@@ -141,36 +142,6 @@ hit_t Raycast(ray_t ray) {
     return voxel;
 }
 
-vec3 Trace(ray_t ray, hit_t voxel, inout uint randomState){
-    vec3 incomingLight = vec3(0,0,0);
-    vec3 rayColor = vec3(1,1,1);
-    for(int i = 0; i <= lightBounces; i++){
-        Node data = UnpackNode(texelFetch(octreeTexture, int(voxel.id)).r);
-        vec3 normal = normalize(UnpackNormal(data.normal));
-        Material mat = material[data.material];
-
-        ray.origin = vec3(voxel.position) + vec3(0.5, 0.5, 0.5) + normal;
-        vec3 diffuseDir = normalize(normal + RandomDirection(randomState));
-        vec3 specularDir = reflect(ray.direction, normal);
-        bool isSpecular = mat.specular >= rand(randomState);
-        ray.direction = lerp(diffuseDir, specularDir, mat.metallic * float(isSpecular));
-        ray.inverted_direction = 1.0 / ray.direction;
-
-        if(mat.emissive){
-            incomingLight += mat.color.xyz * mat.emissiveIntensity * rayColor;
-        }
-        rayColor *= lerp(mat.color.xyz, mat.specularColor.xyz, float(isSpecular));
-
-        if(i < lightBounces){
-            voxel = Raycast(ray);
-            if(!voxel.hit){
-                incomingLight += sampleSkybox(ray.direction) * rayColor;
-                break;
-            }
-        }
-    }
-    return incomingLight;
-}
 
 void main() {
     vec3 direction = normalize(camera.cameraPlane.xyz + vertexPosition.x * camera.cameraPlaneRight.xyz - vertexPosition.y * camera.cameraPlaneUp.xyz);

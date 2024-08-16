@@ -6,7 +6,7 @@ Octree::Octree(Config *config){
 
     delete config;
 
-    capacity = (1 << (3 * depth));
+    capacity = 8;
 
     uint32_t p2r = 1;
     for (int i = depth; i >= 1; i--)
@@ -15,7 +15,7 @@ Octree::Octree(Config *config){
         p2r <<= 1;
     }
 
-    data.reserve(capacity);
+    data.resize(capacity);
 }
 
 void Octree::setProgram(GLuint program_){
@@ -61,7 +61,7 @@ Octree::~Octree(){
 
 void Octree::Update(){
     glBindBuffer(GL_TEXTURE_BUFFER, gl_ID);
-    glBufferData(GL_TEXTURE_BUFFER, newNode * 4, data.data(), GL_DYNAMIC_DRAW);
+    glBufferData(GL_TEXTURE_BUFFER, size * 4, data.data(), GL_DYNAMIC_DRAW);
     glBindBuffer(GL_TEXTURE_BUFFER, 0);
 }
 
@@ -83,6 +83,24 @@ uint32_t  Octree::lookup(glm::uvec3 position){
     }
 }
 
+void Octree::resizeDataIfNeeded(uint32_t requiredCapacity) {
+    if (requiredCapacity > capacity) {
+        // Double the capacity until it is larger than the required capacity
+        while (capacity < requiredCapacity) {
+            capacity *= 2;
+        }
+
+        Octree::Node newNode;
+        newNode.raw = 0;
+
+        data.resize(capacity, newNode);
+    
+        // Update UBO to reflect new capacity
+        glBindBuffer(GL_TEXTURE_BUFFER, gl_ID);
+        glBufferData(GL_TEXTURE_BUFFER, capacity * 4, data.data(), GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_TEXTURE_BUFFER, 0);
+    }
+}
 
 void Octree::insert(glm::uvec3 position, Node leaf){
     if(position.x > (2 << depth) || position.y > (2 << depth) || position.z > (2 << depth))
@@ -98,8 +116,9 @@ void Octree::insert(glm::uvec3 position, Node leaf){
         if(!node.base.isNode){
             uint32_t nextOffset;
             if(freeNodes.empty()){
-                nextOffset = newNode;
-                newNode+=8;
+                resizeDataIfNeeded(size+16);
+                nextOffset = size;
+                size+=8;
             }else{
                 nextOffset = freeNodes.top();
                 freeNodes.pop();
@@ -123,6 +142,7 @@ void Octree::insert(glm::uvec3 position, Node leaf){
     int i = offset + locate(position, depth);
     if(data[i].leaf.material == 0)data[lastNode].node.count++;
     data[i] = leaf;
+    numVoxels++;
     UpdateNode(lastNode);
     UpdateNode(i);
 }

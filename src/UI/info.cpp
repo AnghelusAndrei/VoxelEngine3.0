@@ -200,11 +200,15 @@ void Info::DrawProfiler(){
 }
 
 void Info::DrawMemUsage(){
-
+    ImGui::Text("volume memory: %f mb", (double)data->scene_mem / (1000.0*1000.0));
+    ImGui::Text("volume capacity: %f mb", (double)data->scene_capacity / (1000.0*1000.0));
+    ImGui::Text("lBuffer memory: %f mb", (double)data->lBuffer_mem / (1000.0*1000.0));
 }
 
 void Info::DrawSceneData(){
-
+    ImGui::Text("num voxels: %u", data->voxels_num);
+    ImGui::Text("cam position:  \n     x:%f \n     y:%f \n     z:%f", data->cam_position.x, data->cam_position.y, data->cam_position.z);
+    ImGui::Text("cam direction: \n     x:%f \n     y:%f \n     z:%f", data->cam_direction.x, data->cam_direction.y, data->cam_direction.z);
 }
 
 void Info::Draw()

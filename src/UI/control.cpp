@@ -12,7 +12,8 @@ void Control::SetConfigs(core::RendererConfig *rendererConfig_, core::FrameConfi
 }
 
 void Control::DrawSceneControl(){
-
+    ImGui::SliderFloat("fpcam speed", &(fpconfig->speed), 0.0f, 500.0f);
+    ImGui::SliderFloat("fpcam sensitivity", &(fpconfig->sensitivity), 0.0f, 3.0f);
 }
 
 void Control::DrawShaderControl(){
@@ -73,6 +74,7 @@ void Control::DrawLightingControl(){
     ImGui::Text("raytracing:");
     ImGui::SliderInt("spp", &(frameConfig->spp), 1, 10);
     ImGui::SliderInt("bounces", &(frameConfig->bounces), 1, 10);
+    ImGui::SliderInt("max checks", &(frameConfig->controlchecks), 1, 300);
 }
 
 void Control::Draw(){

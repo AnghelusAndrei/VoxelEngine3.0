@@ -83,7 +83,7 @@ bool FPCamera::GLFWInput(GLFWwindow* window){
 
     UpdateUBO();
 
-    if(oldPos == position && oldDir == direction)
+    if(oldPos == position)
         return false;
     return true;
 }
