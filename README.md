@@ -1,4 +1,5 @@
-![image](https://github.com/user-attachments/assets/a9490327-ebea-4086-9ff0-3b72658fab3a)# VoxelEngine3.0
+# VoxelEngine3.0
+
 ```
 This is my 3rd voxel engine, this one is made using OpenGL and GLFW and highly optimised for the GPU.
 Succesfully implements:
