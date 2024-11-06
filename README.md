@@ -14,4 +14,5 @@ cd VoxelEngine3.0
 mkdir build
 cd build
 cmake -G "MinGW Makefiles" ..
+cmake --build .
 ```
