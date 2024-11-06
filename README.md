@@ -34,7 +34,7 @@ Succesfully implements:
 ```
 
 # Images
-### Normal
+### Raytracing
 ![image](https://github.com/user-attachments/assets/0b2da2ea-1eb6-4dfd-adfb-e517fd563a5d)
 ### Structure
 ![image](https://github.com/user-attachments/assets/7f2b0241-a7a2-4d2b-bf52-8a2d17f07a6e)
