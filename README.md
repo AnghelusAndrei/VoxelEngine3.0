@@ -1,4 +1,4 @@
-# VoxelEngine3.0
+![image](https://github.com/user-attachments/assets/a9490327-ebea-4086-9ff0-3b72658fab3a)# VoxelEngine3.0
 ```
 This is my 3rd voxel engine, this one is made using OpenGL and GLFW and highly optimised for the GPU.
 Succesfully implements:
@@ -44,6 +44,11 @@ Succesfully implements:
 ![image](https://github.com/user-attachments/assets/1dd7b0a3-8eee-45f0-8f7c-d90cc333fca4)
 ### Voxel ID
 ![image](https://github.com/user-attachments/assets/3e0087e9-dcb2-4297-9dd4-77006ab3bf4e)
+
+
+### Extreme example (10.452.410 voxels in a scene)
+![image](https://github.com/user-attachments/assets/b2aafa31-d550-44fe-9f88-e9fee321ce05)
+![image](https://github.com/user-attachments/assets/a403150c-f39b-499a-b884-dd5a2aab2afd)
 
 
 # Build:
