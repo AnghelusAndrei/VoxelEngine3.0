@@ -1,4 +1,5 @@
 # VoxelEngine3.0
+```
 This is my 3rd voxel engine, this one is made using OpenGL and GLFW and highly optimised for the GPU.
 Succesfully implements:
 -Sparse Voxel Octrees
@@ -18,19 +19,24 @@ Succesfully implements:
     -renders the final image to the scene
 -per voxel normals
 -simple material system
+```
 
 ## To do:
+```
 -update structure to a more complex double tree mip-mapping cache system capable of LOD and loading huge amounts of voxels into RAM at runtime  
 -Integrate ReSTIR with the current spatio-temporal Atomic buffer approach
 -Object system(import, move and rotate voxel structures, textures and more)
+```
 
 # Build:
 
 ## Windows:
 
 ### Requires:
+```
 -MinGW C++ compiler
 -Cmake 3.11
+```
 
 ```
 git clone https://github.com/AnghelusAndrei/VoxelEngine3.0.git
