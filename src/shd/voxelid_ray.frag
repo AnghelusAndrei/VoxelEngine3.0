@@ -104,7 +104,7 @@ hit_t Raycast(ray_t ray) {
     vec3 r_pos;
 
     ray.origin += ray.direction * 4;
-    
+
     if (inBounds(ray.origin, float(octreeLength))) r_pos = ray.origin;
     else {  vec4 intersection = intersect(ray, vec3(0), vec3(float(octreeLength)));
             r_pos = intersection.xyz; q++;

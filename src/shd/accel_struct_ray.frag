@@ -51,13 +51,6 @@ uint locate(uvec3 pos, uint p2) { return (uint(bool(pos.x & p2)) << 2) | (uint(b
 float lerp(float a, float b, float t){ return a + t * (b - a);}
 vec3 lerp(vec3 a, vec3 b, float t){ return vec3(lerp(a.x,b.x,t), lerp(a.y,b.y,t), lerp(a.z,b.z,t));}
 
-float rand(inout uint state){
-    state = state * uint(747796405) + uint(2891336453);
-    uint word = ((state >> ((state >> uint(28)) + uint(4))) ^ state) * uint(277803737);
-    word = (word >> uint(22)) ^ word;
-    return float(word) / 4294967295.0;
-}
-
 vec3 sampleSkybox(vec3 dir){
     return dir;
 }
@@ -91,7 +84,7 @@ hit_t Raycast(ray_t ray) {
     vec3 r_pos;
 
     ray.origin += ray.direction * 4;
-    
+
     if (inBounds(ray.origin, float(octreeLength))) r_pos = ray.origin;
     else {  vec4 intersection = intersect(ray, vec3(0), vec3(float(octreeLength)));
             r_pos = intersection.xyz; q++;

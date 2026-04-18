@@ -279,7 +279,7 @@ Renderer::~Renderer(){
 
     glDeleteProgram(rayPass.program);
     glDeleteProgram(accumPass.program);
-    glDeleteProgram(accumPass.program);
+    glDeleteProgram(avgPass.program);
     glDeleteProgram(finalPass.program);
 }
 
@@ -441,7 +441,7 @@ GLuint Renderer::compileShader(const char* path, std::string type, GLuint gl_typ
     std::string shaderCodeRaw;
     std::ifstream shaderFile;
     shaderFile.exceptions (std::ifstream::failbit | std::ifstream::badbit);
-    try 
+    try
     {
         shaderFile.open(path);
         std::stringstream shaderStream;
@@ -453,6 +453,40 @@ GLuint Renderer::compileShader(const char* path, std::string type, GLuint gl_typ
     {
         if(config->debuggingEnabled)config->logMessage("[%f] RENDERER::ERROR::SHADER::FILE_NOT_SUCCESSFULLY_READ: %s \n", glfwGetTime(), e.what());
     }
+
+    // Resolve #include "filename" directives — one level deep, relative to
+    // the directory of the shader file being compiled.
+    {
+        std::string shaderDir = std::string(path);
+        size_t slash = shaderDir.rfind('/');
+        shaderDir = (slash != std::string::npos) ? shaderDir.substr(0, slash + 1) : "./";
+
+        const std::string tag = "#include \"";
+        size_t pos = 0;
+        while ((pos = shaderCodeRaw.find(tag, pos)) != std::string::npos) {
+            size_t nameStart = pos + tag.size();
+            size_t nameEnd   = shaderCodeRaw.find('"', nameStart);
+            if (nameEnd == std::string::npos) break;
+
+            std::string includeName = shaderCodeRaw.substr(nameStart, nameEnd - nameStart);
+            std::string includePath = shaderDir + includeName;
+
+            std::string includeContent;
+            std::ifstream incFile(includePath);
+            if (incFile.good()) {
+                std::stringstream ss;
+                ss << incFile.rdbuf();
+                includeContent = ss.str();
+            } else {
+                if(config->debuggingEnabled)
+                    config->logMessage("[%f] RENDERER::ERROR::SHADER::INCLUDE_NOT_FOUND: %s \n",
+                                       glfwGetTime(), includePath.c_str());
+            }
+            shaderCodeRaw.replace(pos, nameEnd + 1 - pos, includeContent);
+            pos += includeContent.size();   // skip past the inserted content
+        }
+    }
+
     const char* shaderCode = shaderCodeRaw.c_str();
 
     //compile shader

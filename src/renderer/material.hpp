@@ -20,7 +20,7 @@ struct Material{
     float diffuse;              //4 
     float specular;             //4 
     float metallic;             //4 
-    bool emissive = false;      //4
+    GLint emissive = 0;         //4  (GLint = 4 bytes, matches std140 bool layout)
     float emissiveIntensity;    //4
 };
 

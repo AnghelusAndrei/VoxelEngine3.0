@@ -1,8 +1,10 @@
 #pragma once
 
 #include "core.hpp"
+#include "../octree_cpu.hpp"
 
 #include <stack>
+#include <tuple>
 #include <functional>
 #include <cstdlib>
 
@@ -46,6 +48,7 @@ class Octree{
 
         uint32_t lookup(glm::uvec3 position);
         void insert(glm::uvec3 position, Node leaf);
+        void set(OctreeCPU *cpuOctree);
         void remove(glm::uvec3 position);
 
         static uint32_t packedNormal(glm::vec3& normal);
@@ -70,6 +73,10 @@ class Octree{
         void BindUniforms(uint8_t &texturesBound);
         void UpdateNode(uint32_t index);
         void resizeDataIfNeeded(uint32_t requiredCapacity);
+
+        // Used by set() to convert the CPU pointer tree into the flat GPU layout.
+        void linearizeNode(OctreeCPU* cpu, OctreeCPU::Node* cpuNode,
+                           uint32_t gpuOffset, uint8_t level);
 
         uint32_t utils_p2r[maxDepth];
         uint32_t locate(glm::uvec3 position, uint32_t depth_);

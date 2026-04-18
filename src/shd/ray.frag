@@ -104,7 +104,7 @@ hit_t Raycast(ray_t ray) {
     vec3 r_pos;
 
     ray.origin += ray.direction * 4;
-    
+
     if (inBounds(ray.origin, float(octreeLength))) r_pos = ray.origin;
     else {  vec4 intersection = intersect(ray, vec3(0), vec3(float(octreeLength)));
             r_pos = intersection.xyz; q++;
@@ -186,7 +186,9 @@ void main() {
 
     if(voxel.hit){
         vec3 incomingLight = vec3(0,0,0);
-        uint randomState = uint(float((vertexPosition.x + 1.0)/2 * float(screenResolution.x * screenResolution.y) + (vertexPosition.y + 1.0)/2 * float(screenResolution.y))) * uint(time * time);
+        uint px = uint((vertexPosition.x + 1.0) * 0.5 * float(screenResolution.x));
+        uint py = uint((vertexPosition.y + 1.0) * 0.5 * float(screenResolution.y));
+        uint randomState = (px * 1973u + py * 9277u + uint(time) * 26699u) | 1u;
         for(int i = 0; i < spp; i++){
             incomingLight += Trace(ray, voxel, randomState);
         }

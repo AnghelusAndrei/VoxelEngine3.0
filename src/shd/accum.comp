@@ -43,7 +43,6 @@ void main() {
         for(int i = 0; i < stride * slots; i+=stride){
             imageAtomicCompSwap(voxelColorAccumulationBuffer, ivec2(voxelHash, i), 0, voxelID);
             memoryBarrierImage();
-            barrier();
             uint id = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i)).r;
             uint voxelAccesTime = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i+9)).r;
             if(id != voxelID){
