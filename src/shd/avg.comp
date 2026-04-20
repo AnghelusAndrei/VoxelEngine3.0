@@ -6,9 +6,9 @@ layout (binding = 0, r32ui) readonly uniform uimage2D voxelColorAccumulationBuff
 layout (binding = 1, rgba32f) readonly uniform image2D inputColorBuffer;
 layout (binding = 2, rgba32f) writeonly uniform image2D outputColorBuffer;
 
-uniform int slots;
-uniform int stride;
-uniform int size;
+uniform int lBufferSlots;
+#define lBufferStride 10
+uniform int lBufferWidth;
 
 uniform ivec2 screenResolution;
 
@@ -24,11 +24,11 @@ void main() {
         imageStore(outputColorBuffer, pixelCoord, vec4(data.xyz, 1));
         return;
     }
-    uint voxelHash = voxelID % uint(size - 1) + uint(1);
+    uint voxelHash = voxelID % uint(lBufferWidth - 1) + uint(1);
     uvec3 accumulatedColor1, accumulatedColor2;
     uint count1, count2, id;
     int i = 0;
-    for(; i < stride * slots; i+=stride){
+    for(; i < lBufferStride * lBufferSlots; i+=lBufferStride){
         id = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i)).r;
         if(id == voxelID)
             break;

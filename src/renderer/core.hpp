@@ -53,13 +53,11 @@ namespace core{
         GLuint texture;
     };
 
-    struct lightingBuffer{
+    struct hashBuffer{
         GLuint texture;
         glm::ivec2 size;
         uint8_t stride;
         uint8_t slots;
-        GLuint instruction;
-        double accumulationTime;
     };
 
     enum RenderType{
@@ -75,7 +73,7 @@ namespace core{
         RenderType renderType = DEFAULT;
 
         //lighting buffer updates
-        float lBufferSwapSeconds = 0.08;
+        float lBufferSwapSeconds = 0.14;
         bool TAA = false;
 
         //raytracing
@@ -123,5 +121,9 @@ namespace core{
         glm::ivec2 framebufferPos;
         float aspectRatio;
         uint8_t texturesBound;
+
+        //lbuffer internal update scheduling
+        GLuint LBOinstruction;
+        double LBOaccumulationTime;
     };
 };

@@ -47,11 +47,21 @@ class Octree{
         void Update();
 
         uint32_t lookup(glm::uvec3 position);
-        void insert(glm::uvec3 position, Node leaf);
         void set(OctreeCPU *cpuOctree);
-        void remove(glm::uvec3 position);
 
-        static uint32_t packedNormal(glm::vec3& normal);
+        // Incremental GPU sync — only uploads nodes that changed since the last
+        // set() or applyEdits() call.  Call once after any batch of CPU edits.
+        // O(changed_nodes) instead of O(total_nodes) like set().
+        void applyEdits(OctreeCPU *cpu);
+
+        // Returns the GPU buffer slot of the leaf at `pos`, or UINT32_MAX if empty.
+        // Used to build the voxelID list for targeted nBuffer invalidation.
+        uint32_t findGpuSlot(OctreeCPU *cpu, glm::uvec3 pos);
+
+        // Bind the octree TBO for the accum compute pass so it can traverse
+        // the tree for neighbourhood occupancy lookups during normal computation.
+        // Must be called after glUseProgram(accumPassProgram).
+        void BindForAccumPass(GLuint accumProgram);
 
         uint8_t depth;
         uint32_t capacity;
@@ -65,8 +75,11 @@ class Octree{
         GLuint texBufferID;
         GLuint depthUniformLocation;
 
-        std::stack<uint32_t> freeNodes;
-        
+        std::stack<uint32_t> freeBlocks;  // stack of recyclable 8-slot GPU blocks
+
+        void applyEditsNode(OctreeCPU* cpu, OctreeCPU::Node* node,
+                            uint32_t gpuSlot, uint8_t level);
+
         void setProgram(GLuint program_);
         void GenUBO(GLuint program_);
         void freeVRAM();
@@ -74,7 +87,6 @@ class Octree{
         void UpdateNode(uint32_t index);
         void resizeDataIfNeeded(uint32_t requiredCapacity);
 
-        // Used by set() to convert the CPU pointer tree into the flat GPU layout.
         void linearizeNode(OctreeCPU* cpu, OctreeCPU::Node* cpuNode,
                            uint32_t gpuOffset, uint8_t level);
 

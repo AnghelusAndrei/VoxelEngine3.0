@@ -7,9 +7,24 @@ layout (binding = 0, rgba32f) readonly uniform image2D inputColorBuffer;
 // Accumulated color and count per voxel
 layout (binding = 1, r32ui) coherent uniform uimage2D voxelColorAccumulationBuffer;
 
-uniform int slots;
-uniform int size;
-uniform int stride;
+// Second MRT attachment from the ray pass.
+// Stores the pckd voxel half-coords for neighbourhood occupancy lookups.
+// Encoding: (x>>1) | ((y>>1)<<bits) | ((z>>1)<<(2*bits)), bits=octreeDepth-1.
+// Works for octreeDepth <= 11 (3*(depth-1) <= 30 bits < 32).
+layout(binding = 2, r32ui) readonly uniform uimage2D pckdPosBuffer;
+layout(binding = 3, r32ui) coherent uniform uimage2D nBuffer;
+
+uniform int nBufferWidth;
+uniform int nBufferSlots;
+
+// Octree TBO for neighbourhood occupancy lookups during normal computation.
+uniform usamplerBuffer octreeTexture;
+uniform uint octreeDepth;
+
+#define lBufferStride 10 // voxelID, count, r, g, b * 2 for double buffering
+#define nBufferStride 3  // nBuffer slot layout: [owner, normal, timestamp]. Owner=0 means empty slot; owner=voxelID+1 means claimed by that voxel.
+uniform int lBufferSlots;
+uniform int lBufferWidth;
 uniform int instruction;
 #define ADDLEFT 1
 #define ADDRIGHT 2
@@ -21,16 +36,97 @@ uniform uint updateTime;
 
 uniform ivec2 screenResolution;
 
+// ---------------------------------------------------------------------------
+// Normal computation helpers
+// ---------------------------------------------------------------------------
+
+uint accumLocate(uvec3 pos, uint p2) {
+    return (uint(bool(pos.x & p2)) << 2u) | (uint(bool(pos.y & p2)) << 1u) | uint(bool(pos.z & p2));
+}
+
+// Returns true if the voxel at `pos` is occupied (non-zero material).
+bool lookupOccupied(uvec3 pos, uint octreeLength) {
+    if (any(greaterThanEqual(pos, uvec3(octreeLength)))) return false;
+    uint offset = 0u;
+    uint raw;
+    for (uint d = 0u; d < octreeDepth; d++) {
+        uint p2 = octreeLength >> d;
+        offset += accumLocate(pos, p2);
+        raw = texelFetch(octreeTexture, int(offset)).r;
+        bool isNode = bool(raw & 1u);
+        if (!isNode) return bool((raw >> 1u) & 0x7Fu); // material != 0
+        offset = (raw >> 4u) & 0x0FFFFFFFu;            // node.next
+    }
+    offset += accumLocate(pos, octreeLength >> octreeDepth);
+    raw = texelFetch(octreeTexture, int(offset)).r;
+    return bool((raw >> 1u) & 0x7Fu);
+}
+
+// Radius-7 neighbourhood normal: accumulate offsets of empty neighbours.
+vec3 computeRefinedNormal(uvec3 hitPos, uint octreeLength) {
+    vec3 accum = vec3(0.0);
+    for (int dx = -7; dx <= 7; dx++)
+    for (int dy = -7; dy <= 7; dy++)
+    for (int dz = -7; dz <= 7; dz++) {
+        if (dx == 0 && dy == 0 && dz == 0) continue;
+        if (dx*2+dy*2+dz*2 > 49) continue; // skip corners to reduce noise
+        ivec3 np = ivec3(hitPos) + ivec3(dx, dy, dz);
+        bool outOfBounds = any(lessThan(np, ivec3(0))) ||
+                           any(greaterThanEqual(np, ivec3(int(octreeLength))));
+        bool empty = outOfBounds || !lookupOccupied(uvec3(np), octreeLength);
+        if (empty) accum += vec3(float(dx), float(dy), float(dz));
+    }
+    return length(accum) > 0.001 ? normalize(accum) : vec3(0.0, 1.0, 0.0);
+}
+
+// 10-10-10 encoding matching ray.frag's UnpackNormal().
+uint packNormalAccum(vec3 n) {
+    uint x = uint(clamp(int(round((n.x + 1.0) * 511.0)), 0, 1022));
+    uint y = uint(clamp(int(round((n.y + 1.0) * 511.0)), 0, 1022));
+    uint z = uint(clamp(int(round((n.z + 1.0) * 511.0)), 0, 1022));
+    return (x << 22u) | (y << 12u) | (z << 2u);
+}
+
 void main() {
     ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
     if (pixelCoord.x >= screenResolution.x || pixelCoord.y >= screenResolution.y) {
         return;
     }
 
-    // Use imageLoad instead of texelFetch for image2D
-    vec4 data = imageLoad(inputColorBuffer, pixelCoord).xyzw;
-    uint voxelID = uint(data.w);
-    uint voxelHash = voxelID % uint(size - 1) + uint(1);
+    vec4 data    = imageLoad(inputColorBuffer, pixelCoord).xyzw;
+    uint voxelID = uint(data.w);   // = voxel.id + 1 for hits, 0 for misses
+
+    // Compute and cache the radius-3 normal in the nBuffer if not yet done.
+    // Stride=2 per slot: [owner, normal]. Walk slots with atomicCompSwap to claim;
+    // if bucket is full, give up (use face normal this frame, retry next frame).
+    if (voxelID > 0u) {
+        uint octreeLength = 1u << octreeDepth;
+        // Recover voxel position from the packed half-coordinate encoding.
+        uint pckd = imageLoad(pckdPosBuffer, pixelCoord).r;
+        uint bits = octreeDepth - 1u;
+        uint mask = (1u << bits) - 1u;
+        uvec3 pos;
+        pos.x = ( pckd                & mask) * 2u;
+        pos.y = ((pckd >> bits)        & mask) * 2u;
+        pos.z = ((pckd >> (2u * bits)) & mask) * 2u;
+
+        uint nHash = voxelID % uint(nBufferWidth - 1) + 1u;
+        for (int s = 0; s < nBufferSlots; s++) {
+            uint prev = imageAtomicCompSwap(nBuffer, ivec2(int(nHash), s * nBufferStride), 0u, voxelID);
+            if (prev == 0u || prev == voxelID) {
+                // We own this slot. Compute and store the normal if not yet cached.
+                uint existing = imageLoad(nBuffer, ivec2(int(nHash), s * nBufferStride + 1)).r;
+                if (existing == 0u) {
+                    vec3 n = computeRefinedNormal(pos, octreeLength);
+                    imageAtomicCompSwap(nBuffer, ivec2(int(nHash), s * nBufferStride + 1), 0u, packNormalAccum(n));
+                }
+                break;
+            }
+            // Slot owned by a different voxel — try next slot.
+        }
+    }
+
+    uint voxelHash = voxelID % uint(lBufferWidth - 1) + uint(1);
 
     if(voxelHash > 0){
         uvec3 udata = uvec3(
@@ -40,7 +136,7 @@ void main() {
         );
 
         uvec3 candidate = uvec3(time, uint(0), uint(0));
-        for(int i = 0; i < stride * slots; i+=stride){
+        for(int i = 0; i < lBufferStride * lBufferSlots; i+=lBufferStride){
             imageAtomicCompSwap(voxelColorAccumulationBuffer, ivec2(voxelHash, i), 0, voxelID);
             memoryBarrierImage();
             uint id = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i)).r;
@@ -62,7 +158,6 @@ void main() {
                 imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+9), time);
                 return;
             }
-            // Atomic add operations for accumulating color and count
             switch(instruction){
                 case ADDLEFT:
                     imageAtomicAdd(voxelColorAccumulationBuffer, ivec2(voxelHash, i+1), uint(1));
@@ -94,7 +189,7 @@ void main() {
         }
         uint id = candidate.y;
         int i = int(candidate.z);
-        imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i), voxelID);
+        imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i),   voxelID);
         imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+1), uint(1));
         imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+2), udata.x);
         imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+3), udata.y);

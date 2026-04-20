@@ -1,0 +1,94 @@
+#version 430 core
+
+// One invocation per voxel in the batch.
+// Recomputes the radius-7 refined normal for each voxel and force-writes it
+// into the nBuffer, overwriting any stale cached value.
+// Dispatched each frame with up to NORMAL_BATCH_SIZE voxels from the pending queue.
+layout(local_size_x = 70) in;
+
+
+layout(binding = 3, r32ui) coherent uniform uimage2D nBuffer;
+uniform int nBufferWidth;
+uniform int nBufferSlots;
+#define nBufferStride 3 // nBuffer slot layout: [owner, normal, timestamp]. Owner=0 means empty slot; owner=voxelID+1 means claimed by that voxel.
+
+uniform usamplerBuffer octreeTexture;
+uniform uint octreeDepth;
+
+uniform uvec3 batchPositions[NORMAL_BATCH_SIZE];
+uniform uint  batchVoxelIds[NORMAL_BATCH_SIZE];
+uniform int   batchSize;
+
+// ---------------------------------------------------------------------------
+// Octree occupancy lookup (mirrors accum.comp's lookupOccupied).
+// ---------------------------------------------------------------------------
+
+uint accumLocate(uvec3 pos, uint p2) {
+    return (uint(bool(pos.x & p2)) << 2u) | (uint(bool(pos.y & p2)) << 1u) | uint(bool(pos.z & p2));
+}
+
+bool lookupOccupied(uvec3 pos, uint octreeLength) {
+    if (any(greaterThanEqual(pos, uvec3(octreeLength)))) return false;
+    uint offset = 0u;
+    uint raw;
+    for (uint d = 0u; d < octreeDepth; d++) {
+        uint p2 = octreeLength >> d;
+        offset += accumLocate(pos, p2);
+        raw = texelFetch(octreeTexture, int(offset)).r;
+        if (!bool(raw & 1u)) return bool((raw >> 1u) & 0x7Fu);
+        offset = (raw >> 4u) & 0x0FFFFFFFu;
+    }
+    offset += accumLocate(pos, octreeLength >> octreeDepth);
+    raw = texelFetch(octreeTexture, int(offset)).r;
+    return bool((raw >> 1u) & 0x7Fu);
+}
+
+// Radius-7 neighbourhood normal — identical kernel to accum.comp.
+vec3 computeRefinedNormal(uvec3 hitPos, uint octreeLength) {
+    vec3 accum = vec3(0.0);
+    for (int dx = -7; dx <= 7; dx++)
+    for (int dy = -7; dy <= 7; dy++)
+    for (int dz = -7; dz <= 7; dz++) {
+        if (dx == 0 && dy == 0 && dz == 0) continue;
+        ivec3 np = ivec3(hitPos) + ivec3(dx, dy, dz);
+        bool outOfBounds = any(lessThan(np, ivec3(0))) ||
+                           any(greaterThanEqual(np, ivec3(int(octreeLength))));
+        bool empty = outOfBounds || !lookupOccupied(uvec3(np), octreeLength);
+        if (empty) accum += vec3(float(dx), float(dy), float(dz));
+    }
+    return length(accum) > 0.001 ? normalize(accum) : vec3(0.0, 1.0, 0.0);
+}
+
+// 10-10-10 encoding matching accum.comp and ray.frag.
+uint packNormalAccum(vec3 n) {
+    uint x = uint(clamp(int(round((n.x + 1.0) * 511.0)), 0, 1022));
+    uint y = uint(clamp(int(round((n.y + 1.0) * 511.0)), 0, 1022));
+    uint z = uint(clamp(int(round((n.z + 1.0) * 511.0)), 0, 1022));
+    return (x << 22u) | (y << 12u) | (z << 2u);
+}
+
+// ---------------------------------------------------------------------------
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (int(idx) >= batchSize) return;
+
+    uvec3 pos = batchPositions[idx];
+    uint  vid = batchVoxelIds[idx];   // voxel.id + 1
+
+    uint octreeLength = 1u << octreeDepth;
+    vec3 n      = computeRefinedNormal(pos, octreeLength);
+    uint packed = packNormalAccum(n);
+
+    uint nHash = vid % uint(nBufferWidth - 1) + 1u;
+
+    // Find existing slot for this voxel or claim an empty one, then
+    // force-overwrite the normal so stale pre-edit values are replaced.
+    for (int s = 0; s < nBufferSlots; s++) {
+        uint prev = imageAtomicCompSwap(nBuffer, ivec2(int(nHash), s * nBufferStride), 0u, vid);
+        if (prev == 0u || prev == vid) {
+            // Unconditionally write — this is an explicit refresh, not a lazy init.
+            imageStore(nBuffer, ivec2(int(nHash), s * nBufferStride + 1), uvec4(packed, 0u, 0u, 0u));
+            break;
+        }
+    }
+}

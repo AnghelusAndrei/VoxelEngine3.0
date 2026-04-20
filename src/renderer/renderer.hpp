@@ -17,16 +17,22 @@ class Renderer{
     core::RasterPass finalPass;
 
     const char* glsl_version = "#version 430";
+
     private:
     bool success = true;
     core::runtimeRendererMem rrm;
 
-    core::lightingBuffer lBuffer;
- 
+    core::hashBuffer lBuffer;
+    core::hashBuffer nBuffer;
+    
+
     core::ComputePass accumPass;
     core::ComputePass avgPass;
 
     core::RenderType currentRenderType = core::RenderType::DEFAULT;
+
+
+    GLuint positionTexture;
 
     Octree *volume;
     Camera *camera;

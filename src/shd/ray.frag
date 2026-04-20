@@ -1,15 +1,26 @@
 #version 430 core
-out vec4 FragColor;
+layout(location = 0) out vec4 FragColor;    // RGB = lighting, A = voxel.id+1 (lBuffer key)
+layout(location = 1) out uint NormalIdx;    // pckd half-coords for accum neighbourhood lookup
 
 in vec4 vertexPosition;
 
 uniform usamplerBuffer octreeTexture;
 uniform uint octreeDepth;
+
+// nBuffer — normal hash map, read-only in the ray pass (sampler for texture cache benefit).
+// Stride=2 per slot: s*2=voxelID owner, s*2+1=packed 10-10-10 normal.
+// Written by the accum pass (imageAtomicCompSwap); read here via texelFetch.
+// GL_TEXTURE_FETCH_BARRIER_BIT after accum ensures coherency between domains.
+uniform usampler2D nBuffer;
+uniform int nBufferWidth;
+uniform int nBufferSlots;
 uniform int spp;
 uniform uint controlchecks;
 uniform int lightBounces;
 uniform ivec2 screenResolution;
 uniform int time;
+
+#define nBufferStride 3
 
 #ifndef FLT_MAX
 #define FLT_MAX 3.402823466e+38
@@ -31,123 +42,43 @@ layout (std140) uniform MaterialUniform {
     Material material[127];
 };
 
-const uint type_mask = uint(1), count_mask = uint(14), next_mask = uint(4294967280), material_mask = uint(254);
-const float inv_127 = 1.0/127.0;
-uint octreeLength;
-
-struct Node {
-    bool type;
-    uint count, next, material, normal;
-};
-
-struct leaf_t { uint size; vec3 position;};
-struct hit_t { bool hit; uint id, material; uvec3 position;};
-struct ray_t { vec3 origin, direction, inverted_direction;};
-
-Node UnpackNode(uint raw) { return Node(bool(raw & type_mask), (raw & count_mask) >> 1, (raw & next_mask) >> 4, (raw & material_mask) >> 1, (raw >> 8u) & 0xFFFFFFu);}
-vec3 UnpackNormal(uint packedNormal) { return vec3(float(int(packedNormal >> 16u & 0xFFu) - 128) * inv_127, float(int(packedNormal >> 8u & 0xFFu) - 128) * inv_127, float(int(packedNormal & 0xFFu) - 128) * inv_127);}
-bool inBounds(vec3 v, float n) { return all(lessThanEqual(vec3(0), v) && lessThanEqual(v, vec3(n, n, n)));}
-uint locate(uvec3 pos, uint p2) { return (uint(bool(pos.x & p2)) << 2) | (uint(bool(pos.y & p2)) << 1) | uint(bool(pos.z & p2));}
-float lerp(float a, float b, float t){ return a + t * (b - a);}
-vec3 lerp(vec3 a, vec3 b, float t){ return vec3(lerp(a.x,b.x,t), lerp(a.y,b.y,t), lerp(a.z,b.z,t));}
-
-float rand(inout uint state){
-    state = state * uint(747796405) + uint(2891336453);
-    uint word = ((state >> ((state >> uint(28)) + uint(4))) ^ state) * uint(277803737);
-    word = (word >> uint(22)) ^ word;
-    return float(word) / 4294967295.0;
-}
-
-float randInNormalDistribution(inout uint state){
-    float theta = 2 * 3.1415926 * rand(state);
-    float rho = sqrt(-2 * log(rand(state)));
-    return rho * cos(theta);
-}
-
-vec3 RandomDirection(inout uint state){
-    float x = randInNormalDistribution(state);
-    float y = randInNormalDistribution(state);
-    float z = randInNormalDistribution(state);
-    return normalize(vec3(x, y, z));
-}
-
-vec3 sampleSkybox(vec3 dir){
-    return dir;
-}
-
-vec4 intersect(ray_t r, vec3 box_min, vec3 box_max) {
-    vec3 t1 = (box_min - r.origin + 0.001) * r.inverted_direction;
-    vec3 t2 = (box_max - r.origin - 0.001) * r.inverted_direction;
-    vec3 tmin = min(t1, t2), tmax = max(t1, t2);
-    float t_enter = max(max(tmin.x, tmin.y), tmin.z);
-    float t_exit = min(min(tmax.x, tmax.y), tmax.z);
-    if (t_exit < t_enter || t_exit < 0) return vec4(0.0, 0.0, 0.0, -1.0);
-    return vec4(r.direction * (t_enter) + r.origin, 1.0);
-}
-
-vec3 intersect_inside(ray_t r, vec3 box_min, vec3 box_max) {
-    vec3 t1 = (box_min - r.origin - 0.001) * r.inverted_direction;
-    vec3 t2 = (box_max - r.origin + 0.001) * r.inverted_direction;
-    vec3 tmin = min(t1, t2), tmax = max(t1, t2);
-    float t_exit = min(min(tmax.x, tmax.y), tmax.z);
-    return r.direction * (t_exit) + r.origin;
-}
-
-hit_t Raycast(ray_t ray) {
-    uint p2c[16];
-    for (int i = 0; i <= int(octreeDepth); i++) {
-        p2c[i] = uint(octreeLength >> uint(i));
-    }
-
-    hit_t voxel = hit_t(false, uint(0), uint(0), uvec3(0,0,0));
-    uint offset = uint(0), depth = uint(0), q = uint(0);
-    vec3 r_pos;
-
-    ray.origin += ray.direction * 4;
-
-    if (inBounds(ray.origin, float(octreeLength))) r_pos = ray.origin;
-    else {  vec4 intersection = intersect(ray, vec3(0), vec3(float(octreeLength)));
-            r_pos = intersection.xyz; q++;
-            if (intersection.w < 0.0) return voxel;}
-
-    leaf_t target;
-
-    while (inBounds(r_pos, float(octreeLength)) && q++ <= controlchecks) {
-        uvec3 ur_pos = uvec3(uint(r_pos.x), uint(r_pos.y), uint(r_pos.z));
-        depth = offset = uint(0);
-        bool foundLeaf = false;
-
-        for (; depth < octreeDepth - uint(1); depth++) {
-            offset += locate(ur_pos, p2c[depth]);
-            Node leaf = UnpackNode(texelFetch(octreeTexture, int(offset)).r);
-            if (!leaf.type) {
-                target.size = p2c[depth];
-                target.position = vec3(uvec3(ur_pos) & ~uvec3(target.size - uint(1)));
-                foundLeaf = true;
-                break;
-            }
-            offset = leaf.next;
-        }
-
-        if (!foundLeaf) {
-            offset += locate(ur_pos, p2c[depth]);
-            Node leaf = UnpackNode(texelFetch(octreeTexture, int(offset)).r);
-            target.size = p2c[depth];
-            target.position = vec3(uvec3(ur_pos) & ~uvec3(target.size - uint(1)));
-            if (leaf.material != uint(0)) return hit_t(true, offset, leaf.material, uvec3(target.position));
-        }
-
-        r_pos = intersect_inside(ray, target.position, target.position + vec3(target.size));
-    }
-    return voxel;
-}
+#include "internal.glsl"
 
 vec3 Trace(ray_t ray, hit_t voxel, inout uint randomState){
     vec3 incomingLight = vec3(0,0,0);
     vec3 rayColor = vec3(1,1,1);
     for(int i = 0; i <= lightBounces; i++){
-        Node data = UnpackNode(texelFetch(octreeTexture, int(voxel.id)).r);
-        vec3 normal = normalize(UnpackNormal(data.normal));
+        uint raw = texelFetch(octreeTexture, int(voxel.id)).r;
+        Node data = UnpackNode(raw);
+
+        // nBuffer lookup: find cached refined normal for this voxel.
+        // Key = voxel.id+1 (0 reserved for miss). Stride=3: [owner, normal, timestamp].
+        uint nKey  = voxel.id + 1u;
+        uint nHash = nKey % uint(nBufferWidth - 1) + 1u;
+        uint normalField = 0u;
+        for (int s = 0; s < nBufferSlots; s++) {
+            uint owner = texelFetch(nBuffer, ivec2(int(nHash), s * nBufferStride), 0).r;
+            if (owner == nKey) {
+                normalField = texelFetch(nBuffer, ivec2(int(nHash), s * nBufferStride + 1), 0).r;
+                break;
+            }
+        }
+
+        vec3 normal;
+        if (normalField != 0u) {
+            // Cached refined normal from the accum pass.
+            normal = normalize(UnpackNormal(normalField));
+        } else {
+            // Not yet cached: face normal from dominant ray axis as placeholder.
+            vec3 adir = abs(ray.direction);
+            if (adir.x > adir.y && adir.x > adir.z)
+                normal = vec3(-sign(ray.direction.x), 0.0, 0.0);
+            else if (adir.y > adir.z)
+                normal = vec3(0.0, -sign(ray.direction.y), 0.0);
+            else
+                normal = vec3(0.0, 0.0, -sign(ray.direction.z));
+        }
+
         Material mat = material[data.material];
 
         ray.origin = vec3(voxel.position) + vec3(0.5, 0.5, 0.5) + normal;
@@ -193,8 +124,17 @@ void main() {
             incomingLight += Trace(ray, voxel, randomState);
         }
         incomingLight /= float(spp);
-        FragColor = vec4(incomingLight.xyz, float(voxel.id+1));
+        // Alpha = voxel.id+1 — unique per leaf, used as the lBuffer hash key.
+        FragColor = vec4(incomingLight.xyz, float(voxel.id + 1u));
+        // Second attachment: pckd half-coords for accum neighbourhood lookup.
+        // Encoding: (x>>1) | ((y>>1)<<bits) | ((z>>1)<<(2*bits)), bits=octreeDepth-1.
+        // Scales up to depth=11 (each half-coord needs depth-1 bits, 3*(depth-1)<=30).
+        uint bits = octreeDepth - 1u;
+        NormalIdx = (voxel.position.x >> 1u)
+                  | ((voxel.position.y >> 1u) << bits)
+                  | ((voxel.position.z >> 1u) << (2u * bits));
     }else{
         FragColor = vec4(sampleSkybox(ray.direction), 0);
+        NormalIdx = 0u;
     }
 }

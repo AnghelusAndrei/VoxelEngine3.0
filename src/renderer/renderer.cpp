@@ -6,7 +6,8 @@
 Renderer::Renderer(core::RendererConfig *config_, Octree *volume_, Camera *camera_, MaterialPool *materialPool_) : config(config_), volume(volume_), camera(camera_), materialPool(materialPool_){
 
     lBuffer.stride = 10;//fixed size, determines the slot layout used in the pipeline
-    lBuffer.instruction = 1;
+    rrm.LBOinstruction = 1;
+
     if(config->lBufferSize.x == -1)
         glGetIntegerv(GL_MAX_TEXTURE_SIZE, &config->lBufferSize.x);
     if(config->lBufferSize.y == -1)
@@ -15,6 +16,11 @@ Renderer::Renderer(core::RendererConfig *config_, Octree *volume_, Camera *camer
     lBuffer.size.x = config->lBufferSize.x;
     lBuffer.slots = config->lBufferSize.y; //variable size, determines the number of voxel slots in the lighting buffer
     lBuffer.size.y = lBuffer.stride * lBuffer.slots;
+
+    nBuffer.stride = 3; //fixed size, determines the slot layout used in the pipeline
+    nBuffer.slots = 10; //variable size, determines the number of voxel slots in the normal buffer
+    nBuffer.size.x = lBuffer.size.x;
+    nBuffer.size.y = nBuffer.stride * nBuffer.slots;
 
     if(config->debuggingEnabled)config->logMessage("[%f] initializing the renderer \n", glfwGetTime());
     checkGLError(&success);
@@ -61,7 +67,9 @@ Renderer::Renderer(core::RendererConfig *config_, Octree *volume_, Camera *camer
     checkGLError(&success);
 
     glGenTextures(1, &avgPass.texture);
-    
+    glGenTextures(1, &positionTexture);   // second MRT attachment for rayPass
+
+
     glGenFramebuffers(1, &rayPass.framebuffer);
     glGenTextures(1, &rayPass.texture);
     glGenRenderbuffers(1, &rayPass.rbo);
@@ -69,6 +77,17 @@ Renderer::Renderer(core::RendererConfig *config_, Octree *volume_, Camera *camer
     glGenFramebuffers(1, &finalPass.framebuffer);
     glGenTextures(1, &finalPass.texture);
     glGenRenderbuffers(1, &finalPass.rbo);
+
+
+    if(config->debuggingEnabled)config->logMessage("[%f] building normal buffer \n", glfwGetTime());
+    checkGLError(&success);
+
+    glGenTextures(1, &nBuffer.texture);
+    glBindTexture(GL_TEXTURE_2D, nBuffer.texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, nBuffer.size.x, nBuffer.size.y, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glBindTexture(GL_TEXTURE_2D, 0);
 
     if(config->debuggingEnabled)config->logMessage("[%f] building lighting buffer \n", glfwGetTime());
     checkGLError(&success);
@@ -78,6 +97,7 @@ Renderer::Renderer(core::RendererConfig *config_, Octree *volume_, Camera *camer
     glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, lBuffer.size.x, lBuffer.size.y, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, NULL);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glBindTexture(GL_TEXTURE_2D, 0);
 
     if(config->debuggingEnabled)config->logMessage("[%f] built lighting buffer \n", glfwGetTime());
     checkGLError(&success);
@@ -125,13 +145,23 @@ bool Renderer::run(core::FrameConfig *frameConfig){
     glBindFramebuffer(GL_FRAMEBUFFER, rayPass.framebuffer);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    // glClear doesn't clear integer attachments — do it explicitly.
+    const GLuint clearZero = 0u;
+    glClearBufferuiv(GL_COLOR, 1, &clearZero);
     
     glUseProgram(rayPass.program);
 
     {
         rrm.texturesBound = 0;
-        volume->BindUniforms(rrm.texturesBound);
-        
+        volume->BindUniforms(rrm.texturesBound);  // octreeTexture at unit 0, increments to 1
+
+        glActiveTexture(GL_TEXTURE0 + rrm.texturesBound);
+        glBindTexture(GL_TEXTURE_2D, nBuffer.texture);
+        glUniform1i(glGetUniformLocation(rayPass.program, "nBuffer"), (int)rrm.texturesBound);
+        glUniform1i(glGetUniformLocation(rayPass.program, "nBufferWidth"), nBuffer.size.x);
+        glUniform1i(glGetUniformLocation(rayPass.program, "nBufferSlots"), nBuffer.slots);
+        rrm.texturesBound++;
+
         GLint resLoc = glGetUniformLocation(rayPass.program, "screenResolution");
         GLint timeLoc = glGetUniformLocation(rayPass.program, "time");
         GLint sppLoc = glGetUniformLocation(rayPass.program, "spp");
@@ -147,6 +177,8 @@ bool Renderer::run(core::FrameConfig *frameConfig){
 
     glBindVertexArray(rayPass.VAO);
     glDrawArrays(GL_TRIANGLES, 0, 6);
+    // Only an image barrier needed here — ray pass no longer writes the SSBO.
+    // SSBO writes happen in accum; that barrier is placed after accum below.
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
     debug.gpu_pass1_ms = glfwGetTime() * 1000.0;
@@ -160,43 +192,54 @@ bool Renderer::run(core::FrameConfig *frameConfig){
     #define ADDCLEARLEFT 3
     #define ADDCLEARRIGHT 4
 
+    // TODO: Update normal buffer and octree here
+
     glUseProgram(accumPass.program);
-    glBindImageTexture(0, rayPass.texture, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
-    glBindImageTexture(1, lBuffer.texture, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+    glBindImageTexture(0, rayPass.texture,  0, GL_FALSE, 0, GL_READ_ONLY,  GL_RGBA32F);
+    glBindImageTexture(1, lBuffer.texture,  0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+    glBindImageTexture(2, positionTexture,  0, GL_FALSE, 0, GL_READ_ONLY,  GL_R32UI);
+    glBindImageTexture(3, nBuffer.texture,  0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+
+    // Give the accum pass read access to the octree TBO for neighbourhood lookups.
+    volume->BindForAccumPass(accumPass.program);
+    glUniform1i(glGetUniformLocation(accumPass.program, "nBufferWidth"), nBuffer.size.x);
+    glUniform1i(glGetUniformLocation(accumPass.program, "nBufferSlots"), nBuffer.slots);
     {
         GLint resLoc = glGetUniformLocation(accumPass.program, "screenResolution");
-        GLint slotsLoc = glGetUniformLocation(accumPass.program, "slots");
-        GLint strideLoc = glGetUniformLocation(accumPass.program, "stride");
+        GLint slotsLoc = glGetUniformLocation(accumPass.program, "lBufferSlots");
         GLint timeLoc = glGetUniformLocation(accumPass.program, "time");
         GLint updateLoc = glGetUniformLocation(accumPass.program, "updateTime");
-        GLint sizeLoc = glGetUniformLocation(accumPass.program, "size");
+        GLint sizeLoc = glGetUniformLocation(accumPass.program, "lBufferWidth");
 
         glUniform2i(resLoc, rrm.framebufferSize.x, rrm.framebufferSize.y);
         glUniform1i(slotsLoc, lBuffer.slots);
-        glUniform1i(strideLoc, lBuffer.stride);
         glUniform1i(sizeLoc, lBuffer.size.x);
         glUniform1ui(timeLoc, (GLuint)(glfwGetTime()*100));
         glUniform1ui(updateLoc, (GLuint)(2.0 * (debug.end_ms - debug.start_ms)));
 
         GLint instructionLoc = glGetUniformLocation(accumPass.program, "instruction");
-        if(glfwGetTime() - lBuffer.accumulationTime > frameConfig->lBufferSwapSeconds && !(frameConfig->TAA)){
-            lBuffer.accumulationTime = glfwGetTime();
-            switch(lBuffer.instruction){
+        if(glfwGetTime() - rrm.LBOaccumulationTime > frameConfig->lBufferSwapSeconds && !(frameConfig->TAA)){
+            rrm.LBOaccumulationTime = glfwGetTime();
+            switch(rrm.LBOinstruction){
                 case ADDRIGHT:
                     glUniform1i(instructionLoc, ADDCLEARLEFT);
-                    lBuffer.instruction = ADDLEFT;
+                    rrm.LBOinstruction = ADDLEFT;
                     break;
                 case ADDLEFT:
                     glUniform1i(instructionLoc, ADDCLEARRIGHT);
-                    lBuffer.instruction = ADDRIGHT;
+                    rrm.LBOinstruction = ADDRIGHT;
                     break;
             }
         }else{
-            glUniform1i(instructionLoc, lBuffer.instruction);
+            glUniform1i(instructionLoc, rrm.LBOinstruction);
         }
     }
     glDispatchCompute((GLuint)ceil((float)accumPass.globalSize.x / (float)accumPass.groupSize.x), (GLuint)ceil((float)accumPass.globalSize.y / (float)accumPass.groupSize.y), 1);
-    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+    // SHADER_IMAGE_ACCESS_BARRIER_BIT: makes lBuffer image writes visible to the avg pass.
+    // TEXTURE_FETCH_BARRIER_BIT: makes nBuffer image writes (imageAtomicCompSwap) visible
+    // to the next frame's ray pass which reads via texelFetch (sampler, different cache domain).
+    // Without this second bit, stale nBuffer reads cause scattered wrong normals every frame.
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
     debug.gpu_pass2_ms = glfwGetTime() * 1000.0;
     if(config->debuggingEnabled)config->logMessage("[%f] pass 2 \n", glfwGetTime());
@@ -210,13 +253,11 @@ bool Renderer::run(core::FrameConfig *frameConfig){
     glBindImageTexture(2, avgPass.texture, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
     {
         GLint resLoc = glGetUniformLocation(avgPass.program, "screenResolution");
-        GLint slotsLoc = glGetUniformLocation(avgPass.program, "slots");
-        GLint strideLoc = glGetUniformLocation(avgPass.program, "stride");
-        GLint sizeLoc = glGetUniformLocation(avgPass.program, "size");
+        GLint slotsLoc = glGetUniformLocation(avgPass.program, "lBufferSlots");
+        GLint sizeLoc = glGetUniformLocation(avgPass.program, "lBufferWidth");
 
         glUniform2i(resLoc, rrm.framebufferSize.x, rrm.framebufferSize.y);
         glUniform1i(slotsLoc, lBuffer.slots);
-        glUniform1i(strideLoc, lBuffer.stride);
         glUniform1i(sizeLoc, lBuffer.size.x);
     }
     glDispatchCompute((GLuint)ceil((float)avgPass.globalSize.x / (float)avgPass.groupSize.x), (GLuint)ceil((float)avgPass.globalSize.y / (float)avgPass.groupSize.y), 1);
@@ -272,6 +313,7 @@ Renderer::~Renderer(){
     glDeleteVertexArrays(1, &rayPass.VAO);
     glDeleteBuffers(1, &rayPass.VBO);
     glDeleteTextures(1, &rayPass.texture);
+    glDeleteTextures(1, &positionTexture);
     glDeleteTextures(1, &lBuffer.texture);
     glDeleteTextures(1, &avgPass.texture);
     glDeleteRenderbuffers(1, &rayPass.rbo);
@@ -321,11 +363,24 @@ void Renderer::framebufferEvent(){
     avgPass.groupSize = glm::ivec2(8, 8);
 
     glBindFramebuffer(GL_FRAMEBUFFER, rayPass.framebuffer);
+
+    // Attachment 0 — RGBA32F colour + voxel.id in alpha (lBuffer key).
     glBindTexture(GL_TEXTURE_2D, rayPass.texture);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, rrm.framebufferSize.x, rrm.framebufferSize.y, 0, GL_RGBA, GL_FLOAT, NULL);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rayPass.texture, 0);
+
+    // Attachment 1 — R32UI position-based normalIdx (accum SSBO key).
+    glBindTexture(GL_TEXTURE_2D, positionTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, rrm.framebufferSize.x, rrm.framebufferSize.y, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, positionTexture, 0);
+
+    // Tell the driver both attachments are active draw targets.
+    const GLenum drawBufs[2] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
+    glDrawBuffers(2, drawBufs);
 
     glBindRenderbuffer(GL_RENDERBUFFER, rayPass.rbo);
     glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, rrm.framebufferSize.x, rrm.framebufferSize.y); // depth and stencil buffer

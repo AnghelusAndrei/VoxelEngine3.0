@@ -83,7 +83,7 @@ endif()
 
 find_package(OpenGL REQUIRED)
 if (OpenGL_FOUND)
-    target_include_directories(${PROJECT_NAME} PRIVATE ${OPENGL_INCLDUE_DIRS})
+    target_include_directories(${PROJECT_NAME} PRIVATE ${OPENGL_INCLUDE_DIRS})
     target_link_libraries(${PROJECT_NAME} PRIVATE ${OPENGL_LIBRARIES})
 else()
     message(FATAL_ERROR "OpenGL was not found on the system")

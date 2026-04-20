@@ -36,6 +36,7 @@ void Octree::GenUBO(GLuint program_){
     // Unbind the buffer and texture
     glBindBuffer(GL_TEXTURE_BUFFER, 0);
     glBindTexture(GL_TEXTURE_BUFFER, 0);
+
 }
 
 void Octree::freeVRAM(){
@@ -102,95 +103,53 @@ void Octree::resizeDataIfNeeded(uint32_t requiredCapacity) {
     }
 }
 
-void Octree::insert(glm::uvec3 position, Node leaf){
-    if(position.x >= (1u << depth) || position.y >= (1u << depth) || position.z >= (1u << depth))
-        return;
-    uint32_t offset = 0;
-    uint32_t lastNode = 0;
-    leaf.base.isNode=false;
-    for (int depth_ = 1; depth_ < depth; depth_++)
-    {
-        offset += locate(position, depth_);
-        Node node = data[offset];
-
-        if(!node.base.isNode){
-            uint32_t nextOffset;
-            if(freeNodes.empty()){
-                resizeDataIfNeeded(size+16);
-                nextOffset = size;
-                size+=8;
-            }else{
-                nextOffset = freeNodes.top();
-                freeNodes.pop();
-            }
-            Node node;
-            node.base.isNode = 1;
-            node.node.next = nextOffset;
-            node.node.count = 0;
-            data[offset] = node;
-            if(depth_>1)data[lastNode].node.count++;
-            UpdateNode(lastNode);
-            UpdateNode(offset);
-            lastNode = offset;
-            offset = nextOffset;
-        }else{
-            lastNode = offset;
-            offset = node.node.next;
-        }
-    }
-
-    int i = offset + locate(position, depth);
-    if(data[i].leaf.material == 0)data[lastNode].node.count++;
-    data[i] = leaf;
-    numVoxels++;
-    UpdateNode(lastNode);
-    UpdateNode(i);
-}
-
-void Octree::remove(glm::uvec3 position){
-
-}
-
 // ---------------------------------------------------------------------------
-// set() — bulk-upload from an OctreeCPU in a single glBufferData call.
-//
-// Normal computation happens on the CPU (O(n) 6-neighbour lookups per dirty
-// leaf).  For typical scene sizes this is well under 1 ms.  After that the
-// pointer tree is linearised into the flat GPU layout with one iterative DFS,
-// then uploaded in a single glBufferData call — no per-node GL calls at all.
+// set() — full bulk-upload from an OctreeCPU.  Use for initial scene load or
+// after large structural changes.  For incremental edits (insert/remove),
+// prefer applyEdits() which is O(changed_nodes) instead of O(total_nodes).
 // ---------------------------------------------------------------------------
 
 void Octree::set(OctreeCPU* cpu) {
     if (!cpu || !cpu->root) return;
 
-    // 1. CPU normal computation for any dirty leaves.
-    cpu->computeNormals();
-
-    // 2. Reset GPU-side state (keep capacity at current level to avoid
-    //    needless reallocs on repeated set() calls with similar scene sizes).
+    // Reset all bookkeeping — full rebuild discards any pending incremental state.
     Node zero; zero.raw = 0;
-    uint32_t prevCapacity = capacity;
-    data.assign(prevCapacity, zero);
-    size      = 8;
+    data.assign(capacity, zero);
+    size      = 9;      // slot 0 = root, slots 1-8 = root's 8 children
     numVoxels = 0;
-    while (!freeNodes.empty()) freeNodes.pop();
+    while (!freeBlocks.empty()) freeBlocks.pop();
+    cpu->freedGpuBlocks.clear();
+    resizeDataIfNeeded(size);
 
-    // 3. Linearise: root's 8 children map directly to GPU slots 0-7.
+    // Slot 0: explicit root node.
+    // The GPU shader at depth=0 always reads slot 0 (locate(ur, 2^depth) is
+    // always 0 for any position inside [0,2^depth)).  By placing the root here
+    // with next=1, depth=1 correctly selects one of the 8 real octants.
+    cpu->root->gpuBlock = 1;
+    cpu->root->dirty    = false;
+    Node root_gpu; root_gpu.raw = 0;
+    root_gpu.node.isNode = 1;
+    root_gpu.node.next   = 1;
+    root_gpu.node.count  = cpu->root->childrenCount;
+    data[0] = root_gpu;
+
+    // Slots 1-8: root's 8 children (one per octant of [0,2^depth)^3).
     for (int i = 0; i < 8; i++)
-        linearizeNode(cpu, cpu->root->children[i], (uint32_t)i, 2);
+        linearizeNode(cpu, cpu->root->children[i], uint32_t(i + 1), 2);
 
-    // 4. Single upload.
+    // Single bulk upload.
     glBindBuffer(GL_TEXTURE_BUFFER, gl_ID);
     glBufferData(GL_TEXTURE_BUFFER, size * 4, data.data(), GL_DYNAMIC_DRAW);
     glBindBuffer(GL_TEXTURE_BUFFER, 0);
 
-    // Rebind the texture buffer so the sampler sees the new allocation.
+    // Rebind so the sampler sees the (possibly reallocated) buffer.
     glBindTexture(GL_TEXTURE_BUFFER, texBufferID);
     glTexBuffer(GL_TEXTURE_BUFFER, GL_R32UI, gl_ID);
     glBindTexture(GL_TEXTURE_BUFFER, 0);
 }
 
-// Iterative DFS — avoids stack-overflow on deep/dense trees.
+// Iterative DFS that both linearises nodes into the GPU buffer and stamps
+// each CPU node with its gpuBlock (= where its children live in the buffer).
 void Octree::linearizeNode(OctreeCPU* cpu, OctreeCPU::Node* cpuNode,
                             uint32_t gpuOffset, uint8_t level) {
     using Entry = std::tuple<OctreeCPU::Node*, uint32_t, uint8_t>;
@@ -198,29 +157,33 @@ void Octree::linearizeNode(OctreeCPU* cpu, OctreeCPU::Node* cpuNode,
     stk.push(std::make_tuple(cpuNode, gpuOffset, level));
 
     while (!stk.empty()) {
-        OctreeCPU::Node* cn = std::get<0>(stk.top());
+        OctreeCPU::Node* cn  = std::get<0>(stk.top());
         uint32_t         off = std::get<1>(stk.top());
         uint8_t          lv  = std::get<2>(stk.top());
         stk.pop();
 
-        if (!cn) continue;  // empty slot — data[off] stays zero (no material)
+        if (!cn) continue;  // empty slot — data[off] stays zero
+
+        cn->dirty = false;  // this node is now in sync with the GPU
 
         if (lv > cpu->depth) {
-            // Leaf — this node IS the individual voxel.
-            if (cn->material == 0) continue;  // explicitly cleared voxel, skip
+            // Leaf voxel.
+            if (cn->material == 0) continue;
             resizeDataIfNeeded(off + 1);
             Node leaf; leaf.raw = 0;
             leaf.leaf.isNode   = 0;
             leaf.leaf.material = cn->material & 0x7F;
-            leaf.leaf.normal   = packedNormal(cn->normal);
+            leaf.leaf.normal   = 0;  // GPU refines on first hit
             data[off] = leaf;
             numVoxels++;
         } else {
-            // Internal — allocate a fresh block of 8 for the children.
+            // Internal node: allocate a fresh 8-slot block for children.
             resizeDataIfNeeded(off + 1);
             uint32_t block = size;
             size += 8;
             resizeDataIfNeeded(size);
+
+            cn->gpuBlock = block;  // record where children live for applyEdits
 
             Node internal; internal.raw = 0;
             internal.node.isNode = 1;
@@ -229,9 +192,122 @@ void Octree::linearizeNode(OctreeCPU* cpu, OctreeCPU::Node* cpuNode,
             data[off] = internal;
 
             for (int i = 0; i < 8; i++)
-                stk.push(std::make_tuple(cn->children[i], block + (uint32_t)i, (uint8_t)(lv + 1)));
+                stk.push(std::make_tuple(cn->children[i], block + uint32_t(i), uint8_t(lv + 1)));
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// applyEdits() — incremental GPU sync after CPU edits.
+//
+// Only visits nodes that have dirty=true (set by insertR/removeR).  Allocates
+// new 8-slot blocks for new internal nodes, reclaims freed blocks from
+// cpu->freedGpuBlocks into freeBlocks, and issues glBufferSubData for only
+// the changed slots.  O(changed_nodes) per call.
+// ---------------------------------------------------------------------------
+
+void Octree::applyEdits(OctreeCPU* cpu) {
+    if (!cpu || !cpu->root) return;
+
+    // Reclaim blocks freed by cpu->remove() into our free-block pool.
+    for (uint32_t b : cpu->freedGpuBlocks) freeBlocks.push(b);
+    cpu->freedGpuBlocks.clear();
+
+    if (!cpu->root->dirty) return;
+
+    // Update root (slot 0) — its count may have changed.
+    Node root_gpu; root_gpu.raw = 0;
+    root_gpu.node.isNode = 1;
+    root_gpu.node.next   = 1;
+    root_gpu.node.count  = cpu->root->childrenCount;
+    data[0] = root_gpu;
+    UpdateNode(0);
+    cpu->root->dirty = false;
+
+    // Process each of root's 8 children (GPU slots 1-8).
+    for (int i = 0; i < 8; i++)
+        applyEditsNode(cpu, cpu->root->children[i], uint32_t(i + 1), 2);
+}
+
+void Octree::applyEditsNode(OctreeCPU* cpu, OctreeCPU::Node* node,
+                             uint32_t gpuSlot, uint8_t level) {
+    if (!node) {
+        // Child was removed — zero the GPU slot so the shader sees an empty voxel.
+        if (data[gpuSlot].raw != 0) {
+            data[gpuSlot].raw = 0;
+            UpdateNode(gpuSlot);
+        }
+        return;
+    }
+    if (!node->dirty) return;  // subtree unchanged — skip
+    node->dirty = false;
+
+    if (level > cpu->depth) {
+        // Leaf.
+        Node leaf; leaf.raw = 0;
+        leaf.leaf.material = node->material & 0x7F;
+        leaf.leaf.normal   = 0;
+        data[gpuSlot] = leaf;
+        UpdateNode(gpuSlot);
+        if (node->material != 0) numVoxels++;
+        return;
+    }
+
+    // Internal node: ensure a children block is allocated.
+    if (node->gpuBlock == UINT32_MAX) {
+        uint32_t block;
+        if (!freeBlocks.empty()) {
+            block = freeBlocks.top(); freeBlocks.pop();
+            // Zero the recycled block so orphaned stale data doesn't leak through.
+            for (int i = 0; i < 8; i++) data[block + i].raw = 0;
+            glBindBuffer(GL_TEXTURE_BUFFER, gl_ID);
+            glBufferSubData(GL_TEXTURE_BUFFER, GLintptr(block) * 4, 8 * 4, &data[block]);
+            glBindBuffer(GL_TEXTURE_BUFFER, 0);
+        } else {
+            block = size; size += 8;
+            resizeDataIfNeeded(size);
+        }
+        node->gpuBlock = block;
+    }
+
+    // Write this node's own slot.
+    Node internal; internal.raw = 0;
+    internal.node.isNode = 1;
+    internal.node.next   = node->gpuBlock;
+    internal.node.count  = node->childrenCount;
+    data[gpuSlot] = internal;
+    UpdateNode(gpuSlot);
+
+    // Recurse into the 8 children, visiting all when the parent is dirty.
+    for (int i = 0; i < 8; i++)
+        applyEditsNode(cpu, node->children[i], node->gpuBlock + uint32_t(i), level + 1);
+}
+
+// ---------------------------------------------------------------------------
+// findGpuSlot() — CPU-tree traversal using stored gpuBlock pointers.
+// Returns the GPU buffer slot of the leaf at `pos`, or UINT32_MAX if absent.
+// Used to collect voxelIDs for targeted nBuffer invalidation after edits.
+// ---------------------------------------------------------------------------
+
+uint32_t Octree::findGpuSlot(OctreeCPU* cpu, glm::uvec3 pos) {
+    if (!cpu || !cpu->root) return UINT32_MAX;
+
+    OctreeCPU::Node* node  = cpu->root;
+    uint32_t         block = 1u;  // root's children are at GPU slots 1-8
+
+    for (uint8_t level = 1; level <= depth; level++) {
+        uint32_t          idx   = locate(pos, level);
+        uint32_t          slot  = block + idx;
+        OctreeCPU::Node*  child = node->children[idx];
+
+        if (!child) return UINT32_MAX;
+        if (level == depth) return slot;   // leaf
+
+        if (child->gpuBlock == UINT32_MAX) return UINT32_MAX;
+        block = child->gpuBlock;
+        node  = child;
+    }
+    return UINT32_MAX;
 }
 
 uint32_t Octree::locate(glm::uvec3 position, uint32_t depth_){
@@ -242,16 +318,16 @@ bool Octree::contained(glm::uvec3 position1, glm::uvec3 position2, uint32_t dept
      return ((position1.x >> depth_ == position2.x >> depth_) && (position1.y >> depth_ == position2.y >> depth_) && (position1.z >> depth_ == position2.z >> depth_));
 }
 
-uint32_t Octree::packedNormal(glm::vec3& normal){
-    // Convert normal vector components to 8-bit signed integers
-    glm::i8vec3 si = glm::i8vec3(
-        static_cast<int8_t>((normal.x + 1) * 127.0f),
-        static_cast<int8_t>((normal.y + 1) * 127.0f),
-        static_cast<int8_t>((normal.z + 1) * 127.0f)
-    );
-
-    // Pack the 8-bit integers into the 24-bit normal field
-    return ((uint32_t(si.x) & 0xFF) << 16) |
-            ((uint32_t(si.y) & 0xFF) << 8) |
-            (uint32_t(si.z) & 0xFF);
+void Octree::BindForAccumPass(GLuint accumProgram) {
+    // Bind the octree TBO to texture unit 0 and set uniforms on the
+    // accumulate compute program so it can traverse the octree for
+    // normal computation.  Must be called after glUseProgram(accumProgram).
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_BUFFER, texBufferID);
+    GLint texLoc   = glGetUniformLocation(accumProgram, "octreeTexture");
+    GLint depthLoc = glGetUniformLocation(accumProgram, "octreeDepth");
+    glUniform1i(texLoc, 0);
+    glUniform1ui(depthLoc, (GLuint)depth);
 }
+
+

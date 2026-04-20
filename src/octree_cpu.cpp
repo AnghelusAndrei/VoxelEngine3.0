@@ -1,35 +1,17 @@
 #include "octree_cpu.hpp"
-#include <glm/glm.hpp>
 
-// ---------------------------------------------------------------------------
-// Level convention (matches the GPU exactly):
-//
-//   insertR is called with level=1 for the root node.
-//   It calls locate(pos, level) at every level from 1 to depth,
-//   so all 'depth' bits of each coordinate are consumed.
-//   The LEAF is the child reached after the level==depth locate call,
-//   i.e. the node that insertR receives when level == depth+1.
-//
-//   This gives 2^depth unique voxel positions per axis (e.g. 256 for depth=8),
-//   matching the GPU tree that also performs 'depth' locate operations.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Construction / destruction
-// ---------------------------------------------------------------------------
 
 OctreeCPU::OctreeCPU(uint8_t depth_) {
     depth = depth_;
     root  = nullptr;
 
-    // utils_p2r[level] = bitmask for the coordinate bit tested at that level.
-    // Level 1 = MSB of the coordinate range, level depth = LSB (bit 0).
+
     uint32_t p2r = 1;
     for (int i = depth; i >= 1; i--) {
         utils_p2r[i] = p2r;
         p2r <<= 1;
     }
-    utils_p2r[0] = p2r; // unused but initialised to avoid UB
+    utils_p2r[0] = p2r; 
 }
 
 OctreeCPU::~OctreeCPU() {
@@ -48,10 +30,6 @@ void OctreeCPU::freeSubtree(Node* node) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// locate — identical bit-extraction to the GPU shader
-// ---------------------------------------------------------------------------
-
 uint32_t OctreeCPU::locate(glm::uvec3 pos, uint32_t level) const {
     uint32_t p2 = utils_p2r[level];
     return (uint32_t(bool(pos.x & p2)) << 2) |
@@ -59,60 +37,31 @@ uint32_t OctreeCPU::locate(glm::uvec3 pos, uint32_t level) const {
            uint32_t(bool(pos.z & p2));
 }
 
-// ---------------------------------------------------------------------------
-// insert
-// ---------------------------------------------------------------------------
-
-void OctreeCPU::insert(glm::uvec3 position, uint32_t material, glm::vec3 normal) {
+void OctreeCPU::insert(glm::uvec3 position, uint32_t material) {
     uint32_t bound = 1u << depth;
     if (position.x >= bound || position.y >= bound || position.z >= bound)
         return;
     if (!root) root = new Node();
-    insertR(position, material, normal, root, 1);
-
-    // Mark the 6 face-neighbours dirty — their normals change when a voxel
-    // is added or replaced next to them.
-    const glm::ivec3 faces[6] = {
-        {1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}
-    };
-    for (auto& f : faces) {
-        glm::ivec3 np = glm::ivec3(position) + f;
-        if (np.x < 0 || np.y < 0 || np.z < 0) continue;
-        if ((uint32_t)np.x >= bound || (uint32_t)np.y >= bound || (uint32_t)np.z >= bound) continue;
-        Node* nb = lookup(glm::uvec3(np));
-        if (nb) nb->normalDirty = true;
-    }
+    insertR(position, material, root, 1);
 }
 
-void OctreeCPU::insertR(glm::uvec3 pos, uint32_t material, glm::vec3 normal,
-                         Node*& node, uint8_t level) {
+void OctreeCPU::insertR(glm::uvec3 pos, uint32_t material, Node*& node, uint8_t level) {
     if (!node) node = new Node();
+    node->dirty = true;
 
-    // level > depth means we have descended all 'depth' bits and this
-    // node IS the individual voxel leaf.
     if (level > depth) {
         node->material = material;
-        if (glm::length(normal) > 0.001f) {
-            node->normal      = glm::normalize(normal);
-            node->normalDirty = false;
-        } else {
-            node->normalDirty = true;
-        }
+        node->childrenCount = 0;
         return;
     }
 
-    uint32_t idx         = locate(pos, level);
-    bool     childExisted = (node->children[idx] != nullptr);
-    insertR(pos, material, normal, node->children[idx], level + 1);
+    uint32_t idx = locate(pos, level);
+    bool childExisted = (node->children[idx] != nullptr);
+    insertR(pos, material, node->children[idx], level + 1);
 
-    // Increment childrenCount only when a genuinely new child was created.
     if (!childExisted && node->children[idx])
         node->childrenCount++;
 }
-
-// ---------------------------------------------------------------------------
-// remove
-// ---------------------------------------------------------------------------
 
 void OctreeCPU::remove(glm::uvec3 position) {
     uint32_t bound = 1u << depth;
@@ -120,22 +69,11 @@ void OctreeCPU::remove(glm::uvec3 position) {
         return;
     if (!root) return;
     removeR(position, root, 1);
-
-    // Dirty the face-neighbours so their normals are recomputed on next set().
-    const glm::ivec3 faces[6] = {
-        {1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}
-    };
-    for (auto& f : faces) {
-        glm::ivec3 np = glm::ivec3(position) + f;
-        if (np.x < 0 || np.y < 0 || np.z < 0) continue;
-        if ((uint32_t)np.x >= bound || (uint32_t)np.y >= bound || (uint32_t)np.z >= bound) continue;
-        Node* nb = lookup(glm::uvec3(np));
-        if (nb) nb->normalDirty = true;
-    }
 }
 
 void OctreeCPU::removeR(glm::uvec3 pos, Node*& node, uint8_t level) {
     if (!node) return;
+    node->dirty = true;
 
     if (level > depth) {
         delete node;
@@ -143,36 +81,137 @@ void OctreeCPU::removeR(glm::uvec3 pos, Node*& node, uint8_t level) {
         return;
     }
 
-    uint32_t idx      = locate(pos, level);
-    bool     hadChild = (node->children[idx] != nullptr);
+    uint32_t idx = locate(pos, level);
+    bool hadChild = (node->children[idx] != nullptr);
     removeR(pos, node->children[idx], level + 1);
 
-    if (hadChild && !node->children[idx]) {
+    if (hadChild && node->children[idx] == nullptr) {
         node->childrenCount--;
         if (node->childrenCount == 0) {
+            // Capture gpuBlock before this node is deleted so Octree can reclaim it.
+            if (node->gpuBlock != UINT32_MAX)
+                freedGpuBlocks.push_back(node->gpuBlock);
             delete node;
             node = nullptr;
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// lookup
-// ---------------------------------------------------------------------------
-
 OctreeCPU::Node* OctreeCPU::lookup(glm::uvec3 pos) const {
     uint32_t bound = 1u << depth;
     if (pos.x >= bound || pos.y >= bound || pos.z >= bound) return nullptr;
 
     Node* node = root;
-    // Traverse all depth levels; the node that arrives at level > depth is the leaf.
     for (uint8_t level = 1; level <= depth + 1; level++) {
-        if (!node) return nullptr;
+        if (node == nullptr) return nullptr;  // empty subtree
         if (level > depth) return node;   // reached the leaf
         uint32_t idx = locate(pos, level);
         node = node->children[idx];
     }
-    return nullptr; // unreachable but silences warnings
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Raycast — CPU port of ray.frag Raycast()
+// ---------------------------------------------------------------------------
+// The GPU algorithm keeps the ray origin FIXED after the initial advance and
+// computes all t-values relative to it.  We replicate that exactly so the
+// hit position matches what the GPU shader sees.
+//
+// Mapping GPU → CPU:
+//   texelFetch(octreeTexture, offset)  →  pointer tree traversal
+//   !leaf.type (non-leaf in GPU sense) →  node->children[idx] == nullptr
+//   leaf.material != 0                 →  child->material != 0  (at lev==depth)
+//   p2c[d] = octreeLength >> d         →  childSz = 1 << (depth - lev)
+// ---------------------------------------------------------------------------
+
+OctreeCPU::RayHit OctreeCPU::raycast(glm::vec3 origin, glm::vec3 direction,
+                                      uint32_t maxSteps) const {
+    RayHit noHit;
+    if (!root) return noHit;
+
+    const uint32_t octreeLen = 1u << depth;
+    const float bF = float(octreeLen);
+    const glm::vec3 invDir = 1.0f / direction;
+
+    origin += direction * 4.0f;
+
+    auto inBounds = [&](const glm::vec3& p) -> bool {
+        return p.x >= 0.0f && p.x <= bF &&
+               p.y >= 0.0f && p.y <= bF &&
+               p.z >= 0.0f && p.z <= bF;
+    };
+
+    glm::vec3 rpos;
+    if (inBounds(origin)) {
+        rpos = origin;
+    } else {
+        glm::vec3 t1  = (glm::vec3(0.0f) - origin + 0.001f) * invDir;
+        glm::vec3 t2  = (glm::vec3(bF)   - origin - 0.001f) * invDir;
+        glm::vec3 tmi = glm::min(t1, t2), tmx = glm::max(t1, t2);
+        float t_enter = glm::max(glm::max(tmi.x, tmi.y), tmi.z);
+        float t_exit  = glm::min(glm::min(tmx.x, tmx.y), tmx.z);
+        if (t_exit < t_enter || t_exit < 0.0f) return noHit;
+        rpos = direction * t_enter + origin;
+    }
+
+    for (uint32_t q = 0; inBounds(rpos) && q <= maxSteps; ++q) {
+        glm::uvec3 ur(uint32_t(rpos.x), uint32_t(rpos.y), uint32_t(rpos.z));
+
+        Node* node = root;
+        uint32_t tgtSz = octreeLen;   // size of block to DDA-skip
+        glm::uvec3 tgtOrig(0u, 0u, 0u);
+
+        for (uint32_t lev = 1; lev <= depth; ++lev) {
+            uint32_t   childSz = 1u << (depth - lev);
+            uint32_t   idx     = locate(ur, lev);
+            Node*      child   = node->children[idx];
+            glm::uvec3 cOrig(
+                ur.x & ~(childSz - 1u),
+                ur.y & ~(childSz - 1u),
+                ur.z & ~(childSz - 1u)
+            );
+
+            if (child == nullptr) {
+                // Empty subtree — mirrors GPU "!leaf.type" early-exit branch.
+                tgtSz  = childSz ? childSz : 1u;
+                tgtOrig = cOrig;
+                break;
+            }
+            if (lev == depth) {
+                // Deepest level reached: child IS the 1×1×1 voxel leaf.
+                // Mirrors GPU post-loop "if (leaf.material != 0) return hit".
+                if (child->material != 0) {
+                    RayHit h;
+                    h.hit      = true;
+                    h.node     = child;
+                    h.position = ur;
+                    return h;
+                }
+                // Present but empty material — skip this 1-unit block.
+                tgtSz  = 1u;
+                tgtOrig = ur;
+                break;
+            }
+            // Internal node — descend.
+            node    = child;
+            tgtSz   = childSz;
+            tgtOrig = cOrig;
+        }
+
+        // --- intersect_inside: advance rpos to the exit of tgtSz block ---
+        // Mirrors GPU intersect_inside(ray, target.position, target.position+size).
+        // Crucially uses the FIXED `origin` (not rpos) for all t computations.
+        glm::vec3 bmin = glm::vec3(tgtOrig);
+        glm::vec3 bmax = bmin + glm::vec3(float(tgtSz));
+        glm::vec3 t1   = (bmin - origin - 0.001f) * invDir;
+        glm::vec3 t2   = (bmax - origin + 0.001f) * invDir;
+        glm::vec3 tmi  = glm::min(t1, t2), tmx = glm::max(t1, t2);
+        float t_exit   = glm::min(glm::min(tmx.x, tmx.y), tmx.z);
+        rpos = direction * t_exit + origin;
+    }
+
+    return noHit;
 }
 
 // ---------------------------------------------------------------------------
@@ -220,61 +259,4 @@ void OctreeCPU::insertFunction(std::function<bool(glm::vec3)> fn,
     for (uint32_t z = min.z; z < max.z; z++)
         if (fn(glm::vec3(x + 0.5f, y + 0.5f, z + 0.5f)))
             insert(glm::uvec3(x, y, z), material);
-}
-
-// ---------------------------------------------------------------------------
-// Normal computation
-// ---------------------------------------------------------------------------
-
-void OctreeCPU::computeNormals(int radius) {
-    if (!root) return;
-    _normalRadius = radius;
-    computeNormalsR(root, glm::uvec3(0), 1);
-}
-
-void OctreeCPU::computeNormalsR(Node* node, glm::uvec3 origin, uint8_t level) {
-    if (!node) return;
-
-    if (level > depth) {
-        // This node IS the voxel leaf.
-        if (!node->normalDirty || node->material == 0) return;
-
-        glm::vec3 accum(0.0f);
-        int32_t   bound = (int32_t)(1u << depth);
-        int32_t   ox    = (int32_t)origin.x;
-        int32_t   oy    = (int32_t)origin.y;
-        int32_t   oz    = (int32_t)origin.z;
-
-        for (int dx = -_normalRadius; dx <= _normalRadius; dx++)
-        for (int dy = -_normalRadius; dy <= _normalRadius; dy++)
-        for (int dz = -_normalRadius; dz <= _normalRadius; dz++) {
-            if (dx == 0 && dy == 0 && dz == 0) continue;
-            int32_t nx = ox + dx, ny = oy + dy, nz = oz + dz;
-            bool outOfBounds = (nx < 0 || ny < 0 || nz < 0 ||
-                                nx >= bound || ny >= bound || nz >= bound);
-            bool empty = outOfBounds;
-            if (!outOfBounds) {
-                Node* nb = lookup(glm::uvec3((uint32_t)nx, (uint32_t)ny, (uint32_t)nz));
-                empty = (!nb || nb->material == 0);
-            }
-            if (empty) accum += glm::vec3((float)dx, (float)dy, (float)dz);
-        }
-
-        node->normal      = (glm::length(accum) > 0.001f)
-                                ? glm::normalize(accum)
-                                : glm::vec3(0.0f, 1.0f, 0.0f);
-        node->normalDirty = false;
-        return;
-    }
-
-    // Internal node — recurse with computed child origins.
-    uint32_t half = utils_p2r[level];
-    for (int i = 0; i < 8; i++) {
-        if (!node->children[i]) continue;
-        glm::uvec3 childOrigin = origin;
-        if (i & 4) childOrigin.x += half;
-        if (i & 2) childOrigin.y += half;
-        if (i & 1) childOrigin.z += half;
-        computeNormalsR(node->children[i], childOrigin, level + 1);
-    }
 }
