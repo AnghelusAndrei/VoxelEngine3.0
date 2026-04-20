@@ -18,7 +18,7 @@ Renderer::Renderer(core::RendererConfig *config_, Octree *volume_, Camera *camer
     lBuffer.size.y = lBuffer.stride * lBuffer.slots;
 
     nBuffer.stride = 3; //fixed size, determines the slot layout used in the pipeline
-    nBuffer.slots = 10; //variable size, determines the number of voxel slots in the normal buffer
+    nBuffer.slots = 20; //variable size, determines the number of voxel slots in the normal buffer
     nBuffer.size.x = lBuffer.size.x;
     nBuffer.size.y = nBuffer.stride * nBuffer.slots;
 

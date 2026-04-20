@@ -97,8 +97,8 @@ void main() {
     uint voxelID = uint(data.w);   // = voxel.id + 1 for hits, 0 for misses
 
     // Compute and cache the radius-3 normal in the nBuffer if not yet done.
-    // Stride=2 per slot: [owner, normal]. Walk slots with atomicCompSwap to claim;
-    // if bucket is full, give up (use face normal this frame, retry next frame).
+    // Stride=3 per slot: [owner, normal, timestamp]. Walk slots with atomicCompSwap to claim;
+    // if bucket is full, overwrite the least recently updated slot (tracked via timestamp in nBuffer) without claiming.
     if (voxelID > 0u) {
         uint octreeLength = 1u << octreeDepth;
         // Recover voxel position from the packed half-coordinate encoding.
@@ -111,6 +111,7 @@ void main() {
         pos.z = ((pckd >> (2u * bits)) & mask) * 2u;
 
         uint nHash = voxelID % uint(nBufferWidth - 1) + 1u;
+        bool foundSlot = false;
         for (int s = 0; s < nBufferSlots; s++) {
             uint prev = imageAtomicCompSwap(nBuffer, ivec2(int(nHash), s * nBufferStride), 0u, voxelID);
             if (prev == 0u || prev == voxelID) {
@@ -120,10 +121,29 @@ void main() {
                     vec3 n = computeRefinedNormal(pos, octreeLength);
                     imageAtomicCompSwap(nBuffer, ivec2(int(nHash), s * nBufferStride + 1), 0u, packNormalAccum(n));
                 }
+                imageAtomicExchange(nBuffer, ivec2(int(nHash), s * nBufferStride + 2), time);
+                foundSlot = true;
                 break;
             }
-            // Slot owned by a different voxel — try next slot.
         }
+        // Only evict when every slot in this bucket is owned by a different voxel.
+        if (!foundSlot) {
+            uint oldestTime = 0xFFFFFFFFu;
+            int oldestSlot = 0;
+            for (int s = 0; s < nBufferSlots; s++) {
+                uint slotTime = imageLoad(nBuffer, ivec2(int(nHash), s * nBufferStride + 2)).r;
+                if (slotTime < oldestTime) {
+                    oldestTime = slotTime;
+                    oldestSlot = s;
+                }
+            }
+            imageAtomicExchange(nBuffer, ivec2(int(nHash), oldestSlot * nBufferStride), voxelID);
+            vec3 n = computeRefinedNormal(pos, octreeLength);
+            // Use imageStore — the stolen slot's normal is non-zero, so CompSwap(0,x) would silently fail.
+            imageStore(nBuffer, ivec2(int(nHash), oldestSlot * nBufferStride + 1), uvec4(packNormalAccum(n), 0u, 0u, 0u));
+            imageAtomicExchange(nBuffer, ivec2(int(nHash), oldestSlot * nBufferStride + 2), time);
+        }
+
     }
 
     uint voxelHash = voxelID % uint(lBufferWidth - 1) + uint(1);
