@@ -137,8 +137,10 @@ void Info::DrawProfiler(){
                 gpu_accum_ms-=gpu_ms_plot[0];
                 gpu_ms_plot.erase(gpu_ms_plot.begin());
             }
-            gpu_ms_plot.push_back(data->gpu_end_ms - data->gpu_start_ms);
-            gpu_accum_ms+=data->gpu_end_ms - data->gpu_start_ms;
+            double gpu_ms = (double)data->gpu_pass1_actual_ns / 1000000.0 + (double)data->gpu_pass2_actual_ns / 1000000.0
+                          + (double)data->gpu_pass3_actual_ns / 1000000.0 + (double)data->gpu_pass4_actual_ns / 1000000.0;
+            gpu_ms_plot.push_back(gpu_ms);
+            gpu_accum_ms += gpu_ms;
 
             gpu_avg_ms = gpu_accum_ms/gpu_ms_plot.size();
 
@@ -150,22 +152,21 @@ void Info::DrawProfiler(){
 
         flags = ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_Leaf;
         char label[128];
-        snprintf(label, sizeof(label), "shader recompilation: %.2f", (data->gpu_shaderCompilation_ms - data->gpu_start_ms));
+
+        snprintf(label, sizeof(label), "pass1 (GPU actual): %.3f ms", 
+                 (double)data->gpu_pass1_actual_ns / 1000000.0);
         if (ImGui::TreeNodeEx(label, flags)) ImGui::TreePop();
 
-        snprintf(label, sizeof(label), "framebuffer resize: %2f", (data->gpu_framebufferResize_ms - data->gpu_shaderCompilation_ms));
+        snprintf(label, sizeof(label), "pass2 (GPU actual): %.3f ms", 
+                 (double)data->gpu_pass2_actual_ns / 1000000.0);
         if (ImGui::TreeNodeEx(label, flags)) ImGui::TreePop();
 
-        snprintf(label, sizeof(label), "pass1: %2f", (data->gpu_pass1_ms - data->gpu_framebufferResize_ms));
+        snprintf(label, sizeof(label), "pass3 (GPU actual): %.3f ms", 
+                 (double)data->gpu_pass3_actual_ns / 1000000.0);
         if (ImGui::TreeNodeEx(label, flags)) ImGui::TreePop();
 
-        snprintf(label, sizeof(label), "pass2: %2f", (data->gpu_pass2_ms - data->gpu_pass1_ms));
-        if (ImGui::TreeNodeEx(label, flags)) ImGui::TreePop();
-
-        snprintf(label, sizeof(label), "pass3: %2f", (data->gpu_pass3_ms - data->gpu_pass2_ms));
-        if (ImGui::TreeNodeEx(label, flags)) ImGui::TreePop();
-
-        snprintf(label, sizeof(label), "pass4: %2f", (data->gpu_end_ms - data->gpu_pass3_ms));
+        snprintf(label, sizeof(label), "pass4 (GPU actual): %.3f ms", 
+                 (double)data->gpu_pass4_actual_ns / 1000000.0);
         if (ImGui::TreeNodeEx(label, flags)) ImGui::TreePop();
 
         ImGui::TreePop();

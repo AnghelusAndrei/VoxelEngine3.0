@@ -2,7 +2,7 @@
 
 layout (local_size_x = 8, local_size_y = 8) in;
 
-layout (binding = 0, rgba32f) readonly uniform image2D inputColorBuffer;
+layout (binding = 0, rgba32ui) readonly uniform uimage2D inputColorBuffer;
 
 // Accumulated color and count per voxel
 layout (binding = 1, r32ui) coherent uniform uimage2D voxelColorAccumulationBuffer;
@@ -21,7 +21,7 @@ uniform int nBufferSlots;
 uniform usamplerBuffer octreeTexture;
 uniform uint octreeDepth;
 
-#define lBufferStride 10 // voxelID, count, r, g, b * 2 for double buffering
+#define lBufferStride 10 // [voxelID, count, r, g, b] * 2 for double buffering, avg.comp takes the weighted avg between the 2 with count1 + count2
 #define nBufferStride 3  // nBuffer slot layout: [owner, normal, timestamp]. Owner=0 means empty slot; owner=voxelID+1 means claimed by that voxel.
 uniform int lBufferSlots;
 uniform int lBufferWidth;
@@ -33,6 +33,7 @@ uniform int instruction;
 
 uniform uint time;
 uniform uint updateTime;
+#define normalPrecision 6 // radius of normal computation neighbourhood in voxels (e.g. 3 or 6)
 
 uniform ivec2 screenResolution;
 
@@ -65,11 +66,11 @@ bool lookupOccupied(uvec3 pos, uint octreeLength) {
 // Radius-7 neighbourhood normal: accumulate offsets of empty neighbours.
 vec3 computeRefinedNormal(uvec3 hitPos, uint octreeLength) {
     vec3 accum = vec3(0.0);
-    for (int dx = -7; dx <= 7; dx++)
-    for (int dy = -7; dy <= 7; dy++)
-    for (int dz = -7; dz <= 7; dz++) {
+    for (int dx = -int(normalPrecision); dx <= int(normalPrecision); dx++)
+    for (int dy = -int(normalPrecision); dy <= int(normalPrecision); dy++)
+    for (int dz = -int(normalPrecision); dz <= int(normalPrecision); dz++) {
         if (dx == 0 && dy == 0 && dz == 0) continue;
-        if (dx*2+dy*2+dz*2 > 49) continue; // skip corners to reduce noise
+        if (dx*dx+dy*dy+dz*dz > int(normalPrecision) * int(normalPrecision)) continue; // skip corners to reduce noise
         ivec3 np = ivec3(hitPos) + ivec3(dx, dy, dz);
         bool outOfBounds = any(lessThan(np, ivec3(0))) ||
                            any(greaterThanEqual(np, ivec3(int(octreeLength))));
@@ -93,8 +94,8 @@ void main() {
         return;
     }
 
-    vec4 data    = imageLoad(inputColorBuffer, pixelCoord).xyzw;
-    uint voxelID = uint(data.w);   // = voxel.id + 1 for hits, 0 for misses
+    uvec4 data   = imageLoad(inputColorBuffer, pixelCoord).xyzw;
+    uint voxelID = uint(data.w);   // = voxelKey(voxel)+1 for hits, 0 for misses
 
     // Compute and cache the radius-3 normal in the nBuffer if not yet done.
     // Stride=3 per slot: [owner, normal, timestamp]. Walk slots with atomicCompSwap to claim;
@@ -146,14 +147,10 @@ void main() {
 
     }
 
-    uint voxelHash = voxelID % uint(lBufferWidth - 1) + uint(1);
+    uint voxelHash = voxelID % uint(lBufferWidth - 1) + 1u;
 
     if(voxelHash > 0){
-        uvec3 udata = uvec3(
-            uint(data.x * 255.0),
-            uint(data.y * 255.0),
-            uint(data.z * 255.0)
-        );
+        uvec3 udata = data.xyz;
 
         uvec3 candidate = uvec3(time, uint(0), uint(0));
         for(int i = 0; i < lBufferStride * lBufferSlots; i+=lBufferStride){

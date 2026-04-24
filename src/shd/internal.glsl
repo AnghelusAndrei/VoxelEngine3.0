@@ -2,6 +2,8 @@ const uint type_mask = uint(1), count_mask = uint(14), next_mask = uint(42949672
 const float inv_127 = 1.0/127.0;
 uint octreeLength;
 
+uniform samplerCube skybox;
+
 struct Node {
     bool type;
     uint count, next, material, normal;
@@ -55,8 +57,45 @@ vec3 RandomDirection(inout uint state){
     return normalize(vec3(x, y, z));
 }
 
+// ============ BRDF FUNCTIONS (Fast Normalized Phong for Low-Variance Convergence) ============
+// Faster, lower variance than Cook-Torrance, ideal for differentiable rendering
+
+// Normalized Phong BRDF: much faster convergence than microfacet models
+// Maps roughness linearly to Phong exponent: specular_exp = 2 / (roughness^2)
+// This provides good perceptual control while maintaining low variance
+vec3 EvaluateBRDF(vec3 V, vec3 L, vec3 N, vec3 albedo, float roughness, 
+                   float metallic, float specularIntensity) {
+    
+    float NdotL = max(dot(N, L), 0.001);
+    if (NdotL < 0.001) return vec3(0.0);
+    
+    // Convert roughness [0,1] to Phong exponent [2, 256]
+    // Higher roughness = lower exponent = wider specular lobe = faster convergence
+    float roughClamped = max(roughness, 0.01);
+    float specExp = 2.0 / (roughClamped * roughClamped);
+    
+    // Compute half-vector for specular
+    vec3 H = normalize(L - V);
+    float NdotH = max(dot(N, H), 0.001);
+    
+    // Normalized Phong specular (Blinn variant, more efficient)
+    // Formula: (n+2)/(2π) * max(NdotH, 0)^n
+    float specNorm = (specExp + 2.0) * 0.15915494;  // 1/(2π)
+    float specular = specNorm * pow(NdotH, specExp);
+    
+    // Energy conservation: specular intensity reduces diffuse
+    float kS = specularIntensity * metallic;  // Metallic controls specular strength
+    float kD = 1.0 - kS * 0.5;  // Prevent over-darkening
+    
+    // Lambertian diffuse: 1/π = 0.31831
+    vec3 diffuse = albedo * kD * 0.31831;
+    vec3 spec = vec3(specular * kS);
+    
+    return (diffuse + spec) * NdotL;
+}
+
 vec3 sampleSkybox(vec3 dir){
-    return dir;
+    return texture(skybox, dir).rgb;
 }
 
 vec4 intersect(ray_t r, vec3 box_min, vec3 box_max) {
@@ -75,6 +114,36 @@ vec3 intersect_inside(ray_t r, vec3 box_min, vec3 box_max) {
     vec3 tmin = min(t1, t2), tmax = max(t1, t2);
     float t_exit = min(min(tmax.x, tmax.y), tmax.z);
     return r.direction * (t_exit) + r.origin;
+}
+
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352d;
+    x ^= x >> 15;
+    x *= 0x846ca68b;
+    x ^= x >> 16;
+    return x;
+}
+
+uint voxelKey(hit_t voxel) {
+    // Stable, position-based hash. voxel.id is the SVO linear offset and is NOT
+    // stable across scene edits: when the octree is re-linearised, the same
+    // spatial voxel ends up at a different offset, which invalidates every
+    // nBuffer/lBuffer entry keyed on it (seen as wrong normals drifting in
+    // over time). Position is invariant, so keying on it survives rebuilds.
+    //
+    // Encoding: bit-pack 10 bits per axis (supports octreeDepth <= 10, the same
+    // limit already assumed by the packed half-coord MRT). At higher depths the
+    // axes overlap but the mix below still yields a well-distributed hash.
+    // hash() decorrelates spatially adjacent voxels so nBuffer buckets don't
+    // cluster along planes.
+    uint p = voxel.position.x
+           | (voxel.position.y << 10u)
+           | (voxel.position.z << 20u);
+    // Mask to 31 bits so (voxelKey + 1) can never wrap to 0 — the miss sentinel
+    // used throughout the pipeline. Otherwise 1-in-2^32 voxels would silently
+    // fall out of the lBuffer/nBuffer.
+    return hash(p) & 0x7FFFFFFFu;
 }
 
 hit_t Raycast(ray_t ray) {
@@ -119,6 +188,7 @@ hit_t Raycast(ray_t ray) {
             target.size = p2c[depth];
             target.position = vec3(uvec3(ur_pos) & ~uvec3(target.size - uint(1)));
             uint voxelID = offset;
+            //uint voxelID = uint(target.position.x) + uint(target.position.y) * octreeLength + uint(target.position.z) * octreeLength * octreeLength;
             if (leaf.material != uint(0)) return hit_t(true, voxelID, leaf.material, uvec3(target.position));
         }
 

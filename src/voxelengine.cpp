@@ -39,8 +39,8 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
     };
 
     Camera::Config cameraConfig = {
-        .position = glm::vec3((1 << (octreeConfig.depth-1)), (1 << (octreeConfig.depth-1)), (1 << (octreeConfig.depth-1)) * 3),
-        .direction = glm::vec3(0, 0, 0),
+        .position = glm::vec3((1 << (octreeConfig.depth-1)), (1 << (octreeConfig.depth-1)), -(1 << (octreeConfig.depth-1))),
+        .direction = glm::vec3(0, 0, 1.0),
         .aspect_ratio = windowConfig->viewportAspectRatio,
         .FOV = 90.0f
     };
@@ -51,7 +51,8 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
         .TAA = false,
         .spp = 1,
         .bounces = 2,
-        .controlchecks = 300,
+        .normalPrecision = 6,
+        .controlchecks = 200,
         .shaderRecompilation = false,
         .renderToTexture = false
     };
@@ -59,7 +60,14 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
     octree = new Octree(&octreeConfig);
     camera = new FPCamera(&cameraConfig, &controllerConfig);
     materialPool = new MaterialPool();
-    renderer = new Renderer(&rendererConfig, octree, camera, materialPool);
+    skybox = new Skybox("./assets/skybox", 
+                        "skyrender0001.bmp", 
+                        "skyrender0004.bmp", 
+                        "skyrender0006.bmp", 
+                        "skyrender0003.bmp", 
+                        "skyrender0005.bmp", 
+                        "skyrender0002.bmp");
+    renderer = new Renderer(&rendererConfig, octree, camera, materialPool, skybox);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -76,34 +84,40 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
     Material emissive_m = {
         .color = glm::vec4(1.0f, 1.0f, 1.0f, 0.0f),
         .specularColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f),
-        .diffuse = 0.3f,
-        .specular = 0.4f,
-        .metallic = 0.3f,
+        .roughness = 0.4f,
+        .specular = 0.03f,
+        .metallic = 0.2f,
         .emissive = true,
-        .emissiveIntensity = 4.0f
+        .emissiveIntensity = 20.0f
     };
     Material red_m = {
         .color = glm::vec4(1.0f, 0.0f, 0.0f, 0.0f),
-        .specularColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f),
-        .diffuse = 0.7f, .specular = 0.6f, .metallic = 0.3f,
+        .specularColor = glm::vec4(0.8f, 1.0f, 0.7f, 1.0f),
+        .roughness = 0.3f, .specular = 0.9f, .metallic = 0.6f,
         .emissive = false, .emissiveIntensity = 0.01f
     };
     Material green_m = {
         .color = glm::vec4(0.0f, 1.0f, 0.0f, 0.0f),
         .specularColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f),
-        .diffuse = 0.7f, .specular = 0.6f, .metallic = 0.3f,
+        .roughness = 0.8f, .specular = 0.1f, .metallic = 0.0f,
+        .emissive = false, .emissiveIntensity = 0.0f
+    };
+    Material blue_m = {
+        .color = glm::vec4(0.0f, 0.0f, 1.0f, 0.0f),
+        .specularColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f),
+        .roughness = 0.8f, .specular = 0.1f, .metallic = 0.0f,
         .emissive = false, .emissiveIntensity = 0.0f
     };
     Material white_m = {
         .color = glm::vec4(1.0f, 1.0f, 1.0f, 0.0f),
         .specularColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f),
-        .diffuse = 0.8f, .specular = 0.7f, .metallic = 0.3f,
+        .roughness = 0.6f, .specular = 0.2f, .metallic = 0.0f,
         .emissive = false, .emissiveIntensity = 0.0f
     };
     Material metallic_m = {
-        .color = glm::vec4(0.0f, 0.0f, 1.0f, 0.0f),
+        .color = glm::vec4(0.8f, 0.8f, 0.8f, 0.0f),
         .specularColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f),
-        .diffuse = 0.01f, .specular = 0.9f, .metallic = 0.9f,
+        .roughness = 0.02f, .specular = 1.0f, .metallic = 0.8f,
         .emissive = false, .emissiveIntensity = 0.0f
     };
 
@@ -112,23 +126,23 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
     uint32_t green_mat    = materialPool->addMaterial(&green_m);
     uint32_t white_mat    = materialPool->addMaterial(&white_m);
     uint32_t metallic_mat = materialPool->addMaterial(&metallic_m);
+    uint32_t blue_mat     = materialPool->addMaterial(&blue_m);
 
     uint32_t L = 1u << octreeConfig.depth;
 
     scene = new OctreeCPU(octreeConfig.depth);
 
     
-    scene->insertSphere(glm::vec3(L/3.0f, L/3.0f - 5.0f, L/2.0f), L/3.0f - 10.0f, metallic_mat);
+    scene->insertSphere(glm::vec3(L/3.0f, L/3.0f - 5.0f, L/2.0f), L/4.0f, metallic_mat);
     scene->insertSphere(glm::vec3(L*3.0f/4.0f - 5.0f, L*3.0f/4.0f - 15.0f, L*3.0f/4.0f - 5.0f), L/4.0f, white_mat);
 
     scene->insertBox(glm::uvec3(0,   0,   0), glm::uvec3(L, 4,   L), white_mat);// Floor (y = 0..3)
     scene->insertBox(glm::uvec3(0,   0,   0), glm::uvec3(4, L,   L), green_mat);// Left wall (x = 0..3)
     scene->insertBox(glm::uvec3(L-4, 0,   0), glm::uvec3(L, L,   L), red_mat);// Right wall (x = L-4..L-1)
-    scene->insertBox(glm::uvec3(0,   0,   0), glm::uvec3(L, L,   4), metallic_mat);// mirror (z = 0..3)
+    scene->insertBox(glm::uvec3(0,   0,   L-4), glm::uvec3(L, L, L), metallic_mat);// mirror (z = 0..3)
     scene->insertBox(glm::uvec3(0,   L-4, 0), glm::uvec3(L, L,   L), white_mat);// Ceiling (y = L-4..L-1)
     scene->insertBox(glm::uvec3(L/4,   L-8, L/4), glm::uvec3(L*3/4, L-4, L*3/4), emissive_mat);// Emissive light panel just below the ceiling
     
-    //scene->insert(glm::uvec3(0,   0,   0), red_mat);
     octree->set(scene);
     
 
@@ -178,7 +192,7 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
                     if(dx*dx + dy*dy + dz*dz > R*R) continue;
                     glm::ivec3 vp = center + glm::ivec3(dx, dy, dz);
                     if(vp.x >= 0 && vp.y >= 0 && vp.z >= 0)
-                        scene->insert(glm::uvec3(vp), red_mat);
+                        scene->insert(glm::uvec3(vp), blue_mat);
                 }
 
                 octree->applyEdits(scene);
@@ -198,7 +212,8 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
             Widget *widgets[2] = {info, control};
             interface->Draw(widgets, 2);
         }else{
-            interface->Draw(nullptr, 0);
+            Widget *widgets[1] = {info};
+            interface->Draw(widgets, 1);
         }
 
         if(!renderer->run(&frameConfig))
@@ -217,6 +232,7 @@ VoxelEngine::~VoxelEngine(){
     delete camera;
     delete octree;
     delete materialPool;
+    delete skybox;
 
     delete interface;
     glfwDestroyWindow(window);

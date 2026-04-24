@@ -1,5 +1,5 @@
 #version 430 core
-layout(location = 0) out vec4 FragColor;
+layout(location = 0) out uvec4 FragColor;
 layout(location = 1) out uint NormalIdx;    // packed half-coords (keeps accum pipeline valid)
 
 in vec4 vertexPosition;
@@ -18,6 +18,8 @@ uniform ivec2 screenResolution;
 uniform int time;
 uniform int spp;
 uniform int lightBounces;
+
+#define nBufferStride 3
 
 layout (std140) uniform CameraUniform {
     vec4 position;
@@ -49,14 +51,14 @@ void main() {
 
     if (voxel.hit) {
         // nBuffer lookup — identical to ray.frag.
-        uint nKey  = voxel.id + 1u;
+        uint nKey  = voxelKey(voxel) + 1u;
         uint nHash = nKey % uint(nBufferWidth - 1) + 1u;
         uint normalField = 0u;
         bool cached = false;
         for (int s = 0; s < nBufferSlots; s++) {
-            uint owner = texelFetch(nBuffer, ivec2(int(nHash), s * 2), 0).r;
+            uint owner = texelFetch(nBuffer, ivec2(int(nHash), s * nBufferStride), 0).r;
             if (owner == nKey) {
-                normalField = texelFetch(nBuffer, ivec2(int(nHash), s * 2 + 1), 0).r;
+                normalField = texelFetch(nBuffer, ivec2(int(nHash), s * nBufferStride + 1), 0).r;
                 cached = true;
                 break;
             }
@@ -79,8 +81,9 @@ void main() {
         // Visualise: full-brightness normal map colour for cached normals,
         // dimmed (×0.35) for face-normal placeholders so pending voxels are obvious.
         vec3 col = normal * 0.5 + 0.5;
-        float brightness = (cached && normalField != 0u) ? 1.0 : 0.35;
-        FragColor = vec4(col * brightness, float(voxel.id + 1u));
+        float brightness = (cached && normalField != 0u) ? 1.0 : 0.0;
+        uint hashID = voxelKey(voxel); // *
+        FragColor = uvec4(uvec3(col * brightness * 255.0), hashID + 1u);
 
         // Keep the packed position output so the accum pipeline stays valid in this mode.
         uint bits = octreeDepth - 1u;
@@ -88,7 +91,7 @@ void main() {
                   | ((voxel.position.y >> 1u) << bits)
                   | ((voxel.position.z >> 1u) << (2u * bits));
     } else {
-        FragColor = vec4(direction * 0.5 + 0.5, 0.0);
+        FragColor = uvec4(uvec3(sampleSkybox(ray.direction) * 255.0), 0u);
         NormalIdx = 0u;
     }
 }

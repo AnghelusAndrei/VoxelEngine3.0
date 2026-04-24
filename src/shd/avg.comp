@@ -3,7 +3,7 @@
 layout (local_size_x = 8, local_size_y = 8) in;
 
 layout (binding = 0, r32ui) readonly uniform uimage2D voxelColorAccumulationBuffer;
-layout (binding = 1, rgba32f) readonly uniform image2D inputColorBuffer;
+layout (binding = 1, rgba32ui) readonly uniform uimage2D inputColorBuffer;
 layout (binding = 2, rgba32f) writeonly uniform image2D outputColorBuffer;
 
 uniform int lBufferSlots;
@@ -18,10 +18,10 @@ void main() {
         return;
     }
 
-    vec4 data = imageLoad(inputColorBuffer, pixelCoord).xyzw;
+    uvec4 data = imageLoad(inputColorBuffer, pixelCoord).xyzw;
     uint voxelID = uint(data.w);
     if(voxelID == 0){
-        imageStore(outputColorBuffer, pixelCoord, vec4(data.xyz, 1));
+        imageStore(outputColorBuffer, pixelCoord, vec4(vec3(data.xyz) / 255.0, 1.0));
         return;
     }
     uint voxelHash = voxelID % uint(lBufferWidth - 1) + uint(1);
@@ -51,6 +51,10 @@ void main() {
         vec4 averageColor = vec4((col.xyz / float(count1 + count2)) / 255.0, 1);
         imageStore(outputColorBuffer, pixelCoord, averageColor);
     } else {
-        imageStore(outputColorBuffer, pixelCoord, vec4(data.xyz, 1));
+        // lBuffer bucket full and this voxel was evicted: fall back to this frame's
+        // raw 1-spp colour so we render something sensible. Same /255 scaling as
+        // the averaged path and the miss path above — without it, these pixels
+        // render ~255× brighter and flash as bright specks under collision pressure.
+        imageStore(outputColorBuffer, pixelCoord, vec4(vec3(data.xyz) / 255.0, 1));
     }
 }

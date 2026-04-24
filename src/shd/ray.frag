@@ -1,5 +1,5 @@
 #version 430 core
-layout(location = 0) out vec4 FragColor;    // RGB = lighting, A = voxel.id+1 (lBuffer key)
+layout(location = 0) out uvec4 FragColor;    // RGB = lighting, A = voxelKey(voxel)+1 (stable lBuffer/nBuffer key)
 layout(location = 1) out uint NormalIdx;    // pckd half-coords for accum neighbourhood lookup
 
 in vec4 vertexPosition;
@@ -33,7 +33,7 @@ layout (std140) uniform CameraUniform {
 
 struct Material {
     vec4 color, specularColor;
-    float diffuse, specular, metallic;
+    float roughness, specular, metallic;
     bool emissive;
     float emissiveIntensity;
 };
@@ -47,13 +47,13 @@ layout (std140) uniform MaterialUniform {
 vec3 Trace(ray_t ray, hit_t voxel, inout uint randomState){
     vec3 incomingLight = vec3(0,0,0);
     vec3 rayColor = vec3(1,1,1);
+    
     for(int i = 0; i <= lightBounces; i++){
         uint raw = texelFetch(octreeTexture, int(voxel.id)).r;
         Node data = UnpackNode(raw);
 
-        // nBuffer lookup: find cached refined normal for this voxel.
-        // Key = voxel.id+1 (0 reserved for miss). Stride=3: [owner, normal, timestamp].
-        uint nKey  = voxel.id + 1u;
+        // nBuffer lookup: find cached refined normal for this voxel
+        uint nKey  = voxelKey(voxel) + 1u;
         uint nHash = nKey % uint(nBufferWidth - 1) + 1u;
         uint normalField = 0u;
         for (int s = 0; s < nBufferSlots; s++) {
@@ -66,10 +66,9 @@ vec3 Trace(ray_t ray, hit_t voxel, inout uint randomState){
 
         vec3 normal;
         if (normalField != 0u) {
-            // Cached refined normal from the accum pass.
             normal = normalize(UnpackNormal(normalField));
         } else {
-            // Not yet cached: face normal from dominant ray axis as placeholder.
+            // Face normal fallback
             vec3 adir = abs(ray.direction);
             if (adir.x > adir.y && adir.x > adir.z)
                 normal = vec3(-sign(ray.direction.x), 0.0, 0.0);
@@ -80,18 +79,27 @@ vec3 Trace(ray_t ray, hit_t voxel, inout uint randomState){
         }
 
         Material mat = material[data.material];
-
+        
+        // Generate cosine-weighted importance sample
+        vec3 sampleDir = normalize(normal + RandomDirection(randomState));
+        
+        // Evaluate BRDF: this replaces the old binary specular/diffuse choice
+        // EvaluateBRDF handles proper energy conservation and material blending
+        vec3 brdfValue = EvaluateBRDF(ray.direction, sampleDir, normal, 
+                                      mat.color.xyz, mat.roughness, mat.metallic, mat.specular);
+        
+        // Update ray for next bounce
         ray.origin = vec3(voxel.position) + vec3(0.5, 0.5, 0.5) + normal;
-        vec3 diffuseDir = normalize(normal + RandomDirection(randomState));
-        vec3 specularDir = reflect(ray.direction, normal);
-        bool isSpecular = mat.specular >= rand(randomState);
-        ray.direction = lerp(diffuseDir, specularDir, mat.metallic * float(isSpecular));
+        ray.direction = sampleDir;
         ray.inverted_direction = 1.0 / ray.direction;
 
+        // Handle emissive materials
         if(mat.emissive){
             incomingLight += mat.color.xyz * mat.emissiveIntensity * rayColor;
         }
-        rayColor *= lerp(mat.color.xyz, mat.specularColor.xyz, float(isSpecular));
+        
+        // Accumulate BRDF contribution (already includes NdotL weighting)
+        rayColor *= brdfValue;
 
         if(i < lightBounces){
             voxel = Raycast(ray);
@@ -124,8 +132,9 @@ void main() {
             incomingLight += Trace(ray, voxel, randomState);
         }
         incomingLight /= float(spp);
-        // Alpha = voxel.id+1 — unique per leaf, used as the lBuffer hash key.
-        FragColor = vec4(incomingLight.xyz, float(voxel.id + 1u));
+        // Alpha = stable position hash — used as the lBuffer and nBuffer key.
+        uint hashID = voxelKey(voxel); // *
+        FragColor = uvec4(uvec3(incomingLight * 255.0), hashID + 1u);
         // Second attachment: pckd half-coords for accum neighbourhood lookup.
         // Encoding: (x>>1) | ((y>>1)<<bits) | ((z>>1)<<(2*bits)), bits=octreeDepth-1.
         // Scales up to depth=11 (each half-coord needs depth-1 bits, 3*(depth-1)<=30).
@@ -134,7 +143,7 @@ void main() {
                   | ((voxel.position.y >> 1u) << bits)
                   | ((voxel.position.z >> 1u) << (2u * bits));
     }else{
-        FragColor = vec4(sampleSkybox(ray.direction), 0);
+        FragColor = uvec4(uvec3(sampleSkybox(ray.direction) * 255.0), 0u);
         NormalIdx = 0u;
     }
 }

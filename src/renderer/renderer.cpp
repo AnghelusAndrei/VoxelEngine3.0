@@ -3,7 +3,9 @@
 #include <string.h>
 
 
-Renderer::Renderer(core::RendererConfig *config_, Octree *volume_, Camera *camera_, MaterialPool *materialPool_) : config(config_), volume(volume_), camera(camera_), materialPool(materialPool_){
+Renderer::Renderer(core::RendererConfig *config_, Octree *volume_, Camera *camera_, MaterialPool *materialPool_, Skybox *skybox_) : config(config_), volume(volume_), camera(camera_), materialPool(materialPool_), skybox(skybox_){
+
+    printf("GL version: %s\n", glGetString(GL_VERSION));
 
     lBuffer.stride = 10;//fixed size, determines the slot layout used in the pipeline
     rrm.LBOinstruction = 1;
@@ -11,19 +13,21 @@ Renderer::Renderer(core::RendererConfig *config_, Octree *volume_, Camera *camer
     if(config->lBufferSize.x == -1)
         glGetIntegerv(GL_MAX_TEXTURE_SIZE, &config->lBufferSize.x);
     if(config->lBufferSize.y == -1)
-        config->lBufferSize.y = 1<<((volume->depth-4) <= 1 ? 1 : (volume->depth-4));
+        config->lBufferSize.y = 32; //default slot count, determines the number of voxel slots in the lighting buffer
 
     lBuffer.size.x = config->lBufferSize.x;
     lBuffer.slots = config->lBufferSize.y; //variable size, determines the number of voxel slots in the lighting buffer
     lBuffer.size.y = lBuffer.stride * lBuffer.slots;
 
     nBuffer.stride = 3; //fixed size, determines the slot layout used in the pipeline
-    nBuffer.slots = 20; //variable size, determines the number of voxel slots in the normal buffer
+    nBuffer.slots = 32;
     nBuffer.size.x = lBuffer.size.x;
     nBuffer.size.y = nBuffer.stride * nBuffer.slots;
 
+    rrm.LBOaccumulationTime = glfwGetTime();
+
     if(config->debuggingEnabled)config->logMessage("[%f] initializing the renderer \n", glfwGetTime());
-    checkGLError(&success);
+    checkGLError("Renderer initialization", &success);
 
     linkRaster(&rayPass, "./shd/ray.vert", "./shd/ray.frag");
     linkCompute(&accumPass, "./shd/accum.comp");
@@ -31,11 +35,12 @@ Renderer::Renderer(core::RendererConfig *config_, Octree *volume_, Camera *camer
     linkRaster(&finalPass, "./shd/final.vert", "./shd/final.frag");
 
     if(config->debuggingEnabled)config->logMessage("[%f] compiled shaders \n", glfwGetTime());
-    checkGLError(&success);
+    checkGLError("Shader linking", &success);
 
     camera->GenUBO(rayPass.program);
     volume->GenUBO(rayPass.program);
     materialPool->GenUBO(rayPass.program);
+    skybox->GenUBO(rayPass.program);
 
     rrm.displaySize = config->framebufferSize();
 
@@ -64,11 +69,14 @@ Renderer::Renderer(core::RendererConfig *config_, Octree *volume_, Camera *camer
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
 
     if(config->debuggingEnabled)config->logMessage("[%f] generated Quad Vertex Array Objects \n", glfwGetTime());
-    checkGLError(&success);
+    checkGLError("Quad objects initialization", &success);
 
     glGenTextures(1, &avgPass.texture);
     glGenTextures(1, &positionTexture);   // second MRT attachment for rayPass
 
+    // Create GPU timing query objects
+    for(int i = 0; i < QUERY_FRAMES; i++) {glGenQueries(8, queryObjects[i]);
+                                           queryInitialized[i] = false;}
 
     glGenFramebuffers(1, &rayPass.framebuffer);
     glGenTextures(1, &rayPass.texture);
@@ -80,7 +88,7 @@ Renderer::Renderer(core::RendererConfig *config_, Octree *volume_, Camera *camer
 
 
     if(config->debuggingEnabled)config->logMessage("[%f] building normal buffer \n", glfwGetTime());
-    checkGLError(&success);
+    checkGLError("generated textures", &success);
 
     glGenTextures(1, &nBuffer.texture);
     glBindTexture(GL_TEXTURE_2D, nBuffer.texture);
@@ -90,41 +98,64 @@ Renderer::Renderer(core::RendererConfig *config_, Octree *volume_, Camera *camer
     glBindTexture(GL_TEXTURE_2D, 0);
 
     if(config->debuggingEnabled)config->logMessage("[%f] building lighting buffer \n", glfwGetTime());
-    checkGLError(&success);
+    checkGLError("Generated normal buffer", &success);
 
     glGenTextures(1, &lBuffer.texture);
     glBindTexture(GL_TEXTURE_2D, lBuffer.texture);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, lBuffer.size.x, lBuffer.size.y, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, NULL);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    // Integer textures MUST use GL_NEAREST — GL_LINEAR on an integer format is
+    // undefined per spec (some drivers silently fall back to nearest, others
+    // return 0, and the GL debug output complains loudly).
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glBindTexture(GL_TEXTURE_2D, 0);
 
     if(config->debuggingEnabled)config->logMessage("[%f] built lighting buffer \n", glfwGetTime());
-    checkGLError(&success);
+    checkGLError("Generated lighting buffer", &success);
 
     framebufferEvent();
 
     if(config->debuggingEnabled)config->logMessage("[%f] generated all framebuffer objects \n", glfwGetTime());
-    checkGLError(&success);
+    checkGLError("Renderer nitialization end", &success);
 }
 
 bool Renderer::run(core::FrameConfig *frameConfig){
-    
-    debug.gpu_start_ms = glfwGetTime() * 1000.0;
+    int writeIdx = queryFrame % QUERY_FRAMES;
+    int readIdx  = (queryFrame + QUERY_FRAMES - 3) % QUERY_FRAMES;
+
+    // --- READ PREVIOUS FRAME ---
+    if (queryInitialized[readIdx]) {
+        GLuint64 start, end;
+
+        glGetQueryObjectui64v(queryObjects[readIdx][0], GL_QUERY_RESULT, &start);
+        glGetQueryObjectui64v(queryObjects[readIdx][1], GL_QUERY_RESULT, &end);
+        debug.gpu_pass1_actual_ns = end - start;
+
+        glGetQueryObjectui64v(queryObjects[readIdx][2], GL_QUERY_RESULT, &start);
+        glGetQueryObjectui64v(queryObjects[readIdx][3], GL_QUERY_RESULT, &end);
+        debug.gpu_pass2_actual_ns = end - start;
+
+        glGetQueryObjectui64v(queryObjects[readIdx][4], GL_QUERY_RESULT, &start);
+        glGetQueryObjectui64v(queryObjects[readIdx][5], GL_QUERY_RESULT, &end);
+        debug.gpu_pass3_actual_ns = end - start;
+
+        glGetQueryObjectui64v(queryObjects[readIdx][6], GL_QUERY_RESULT, &start);
+        glGetQueryObjectui64v(queryObjects[readIdx][7], GL_QUERY_RESULT, &end);
+        debug.gpu_pass4_actual_ns = end - start;
+
+    }
+
     debug.start_ms = debug.end_ms;
     debug.end_ms = glfwGetTime() * 1000.0;
 
     debug.scene_capacity = volume->capacity * sizeof(Octree::Node);
     debug.scene_mem = volume->size * sizeof(Octree::Node);
     debug.lBuffer_mem = lBuffer.size.x * lBuffer.size.y * sizeof(GLuint);
-
     debug.voxels_num = volume->numVoxels;
     debug.cam_position = camera->position;
     debug.cam_direction = camera->direction;
 
     handleShaderRecompilation(frameConfig);
-
-    debug.gpu_shaderCompilation_ms = glfwGetTime() * 1000.0;
 
     glm::ivec2 displayComparaison = rrm.displaySize;
     rrm.displaySize = config->framebufferSize();
@@ -132,10 +163,8 @@ bool Renderer::run(core::FrameConfig *frameConfig){
     if(rrm.displaySize != displayComparaison){
         framebufferEvent();
         if(config->debuggingEnabled)config->logMessage("[%f] framebuffer resized \n", glfwGetTime());
-        checkGLError(&success);
+        checkGLError("Framebuffer resized", &success);
     }
-
-    debug.gpu_framebufferResize_ms = glfwGetTime() * 1000.0;
     
     //rayPass
 
@@ -162,6 +191,8 @@ bool Renderer::run(core::FrameConfig *frameConfig){
         glUniform1i(glGetUniformLocation(rayPass.program, "nBufferSlots"), nBuffer.slots);
         rrm.texturesBound++;
 
+        skybox->BindUniforms(rayPass.program, rrm.texturesBound);
+
         GLint resLoc = glGetUniformLocation(rayPass.program, "screenResolution");
         GLint timeLoc = glGetUniformLocation(rayPass.program, "time");
         GLint sppLoc = glGetUniformLocation(rayPass.program, "spp");
@@ -176,14 +207,20 @@ bool Renderer::run(core::FrameConfig *frameConfig){
     }
 
     glBindVertexArray(rayPass.VAO);
+
+    glQueryCounter(queryObjects[writeIdx][0], GL_TIMESTAMP);
+    checkGLError("Query Pass1 Start", &success);
+
     glDrawArrays(GL_TRIANGLES, 0, 6);
+    checkGLError("Draw Pass1", &success);
+
+    glQueryCounter(queryObjects[writeIdx][1], GL_TIMESTAMP);
+    checkGLError("Query Pass1 End", &success);
     // Only an image barrier needed here — ray pass no longer writes the SSBO.
     // SSBO writes happen in accum; that barrier is placed after accum below.
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
-    debug.gpu_pass1_ms = glfwGetTime() * 1000.0;
     if(config->debuggingEnabled)config->logMessage("[%f] pass 1 \n", glfwGetTime());
-    checkGLError(&success);
 
     //accumPass
 
@@ -192,10 +229,9 @@ bool Renderer::run(core::FrameConfig *frameConfig){
     #define ADDCLEARLEFT 3
     #define ADDCLEARRIGHT 4
 
-    // TODO: Update normal buffer and octree here
 
     glUseProgram(accumPass.program);
-    glBindImageTexture(0, rayPass.texture,  0, GL_FALSE, 0, GL_READ_ONLY,  GL_RGBA32F);
+    glBindImageTexture(0, rayPass.texture,  0, GL_FALSE, 0, GL_READ_ONLY,  GL_RGBA32UI); // float -> uint change
     glBindImageTexture(1, lBuffer.texture,  0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
     glBindImageTexture(2, positionTexture,  0, GL_FALSE, 0, GL_READ_ONLY,  GL_R32UI);
     glBindImageTexture(3, nBuffer.texture,  0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
@@ -234,22 +270,30 @@ bool Renderer::run(core::FrameConfig *frameConfig){
             glUniform1i(instructionLoc, rrm.LBOinstruction);
         }
     }
+
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+    glQueryCounter(queryObjects[writeIdx][2], GL_TIMESTAMP);
+    checkGLError("Query Pass2 Start", &success);
+
     glDispatchCompute((GLuint)ceil((float)accumPass.globalSize.x / (float)accumPass.groupSize.x), (GLuint)ceil((float)accumPass.globalSize.y / (float)accumPass.groupSize.y), 1);
+    checkGLError("Dispatch Pass2", &success);
+    
+    glQueryCounter(queryObjects[writeIdx][3], GL_TIMESTAMP);
+    checkGLError("Query Pass2 End", &success);
     // SHADER_IMAGE_ACCESS_BARRIER_BIT: makes lBuffer image writes visible to the avg pass.
     // TEXTURE_FETCH_BARRIER_BIT: makes nBuffer image writes (imageAtomicCompSwap) visible
     // to the next frame's ray pass which reads via texelFetch (sampler, different cache domain).
     // Without this second bit, stale nBuffer reads cause scattered wrong normals every frame.
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
-    debug.gpu_pass2_ms = glfwGetTime() * 1000.0;
     if(config->debuggingEnabled)config->logMessage("[%f] pass 2 \n", glfwGetTime());
-    checkGLError(&success);
 
     //avgPass
 
     glUseProgram(avgPass.program);
     glBindImageTexture(0, lBuffer.texture, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32UI);
-    glBindImageTexture(1, rayPass.texture, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
+    glBindImageTexture(1, rayPass.texture, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32UI); // float -> uint change
     glBindImageTexture(2, avgPass.texture, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
     {
         GLint resLoc = glGetUniformLocation(avgPass.program, "screenResolution");
@@ -260,12 +304,16 @@ bool Renderer::run(core::FrameConfig *frameConfig){
         glUniform1i(slotsLoc, lBuffer.slots);
         glUniform1i(sizeLoc, lBuffer.size.x);
     }
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+    glQueryCounter(queryObjects[writeIdx][4], GL_TIMESTAMP);
+    checkGLError("Query Pass3 Start", &success);
     glDispatchCompute((GLuint)ceil((float)avgPass.globalSize.x / (float)avgPass.groupSize.x), (GLuint)ceil((float)avgPass.globalSize.y / (float)avgPass.groupSize.y), 1);
+    checkGLError("Query Pass2 Dispatch", &success);
+    glQueryCounter(queryObjects[writeIdx][5], GL_TIMESTAMP);
+    checkGLError("Query Pass2 End", &success);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
-    debug.gpu_pass3_ms = glfwGetTime() * 1000.0;
     if(config->debuggingEnabled)config->logMessage("[%f] pass 3 \n", glfwGetTime());
-    checkGLError(&success);
 
     //finalPass
 
@@ -289,15 +337,20 @@ bool Renderer::run(core::FrameConfig *frameConfig){
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, avgPass.texture);    // use the color attachment texture as the texture of the quad plane
     glUniform1i(glGetUniformLocation(finalPass.program, "screenTexture"), 0);
+    glQueryCounter(queryObjects[writeIdx][6], GL_TIMESTAMP);
+    checkGLError("Query Pass4 Start", &success);
     glDrawArrays(GL_TRIANGLES, 0, 6);
+    checkGLError("Query Pass4 Dispatch", &success);
+    glQueryCounter(queryObjects[writeIdx][7], GL_TIMESTAMP);
+    checkGLError("Query Pass4 End", &success);
 
     // Unbind the textures after drawing
     glBindTexture(GL_TEXTURE_BUFFER, 0);
     glBindTexture(GL_TEXTURE_2D, 0);
-
-    debug.gpu_end_ms = glfwGetTime() * 1000.0;
+    
+    queryInitialized[writeIdx] = true;
+    queryFrame++;
     if(config->debuggingEnabled)config->logMessage("[%f] frame end \n", glfwGetTime());
-    checkGLError(&success);
 
     return success; 
 }
@@ -318,6 +371,9 @@ Renderer::~Renderer(){
     glDeleteTextures(1, &avgPass.texture);
     glDeleteRenderbuffers(1, &rayPass.rbo);
     glDeleteFramebuffers(1, &rayPass.framebuffer);
+
+    glDeleteQueries(8, queryObjects[0]);
+    glDeleteQueries(8, queryObjects[1]);
 
     glDeleteProgram(rayPass.program);
     glDeleteProgram(accumPass.program);
@@ -364,11 +420,13 @@ void Renderer::framebufferEvent(){
 
     glBindFramebuffer(GL_FRAMEBUFFER, rayPass.framebuffer);
 
-    // Attachment 0 — RGBA32F colour + voxel.id in alpha (lBuffer key).
+    // Attachment 0 — RGBA32UI: rgb = 1-spp lighting×255, a = voxelKey(voxel)+1 (stable hash).
+    // GL_NEAREST because GL_LINEAR on integer formats is undefined (we only imageLoad
+    // this texture, but the filter still has to be valid for the framebuffer).
     glBindTexture(GL_TEXTURE_2D, rayPass.texture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, rrm.framebufferSize.x, rrm.framebufferSize.y, 0, GL_RGBA, GL_FLOAT, NULL);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32UI, rrm.framebufferSize.x, rrm.framebufferSize.y, 0, GL_RGBA_INTEGER, GL_UNSIGNED_INT, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rayPass.texture, 0);
 
     // Attachment 1 — R32UI position-based normalIdx (accum SSBO key).
@@ -452,7 +510,7 @@ void Renderer::handleShaderRecompilation(core::FrameConfig *frameConfig){
         currentRenderType = frameConfig->renderType;
         frameConfig->TAA = false;
         if(config->debuggingEnabled)config->logMessage("[%f] recompiled shaders \n", glfwGetTime());
-        checkGLError(&success);
+        checkGLError("Shader recompilation 1", &success);
     }
 
     if(frameConfig->shaderRecompilation){
@@ -466,7 +524,7 @@ void Renderer::handleShaderRecompilation(core::FrameConfig *frameConfig){
         frameConfig->shaderRecompilation = false;
         frameConfig->TAA = false;
         if(config->debuggingEnabled)config->logMessage("[%f] recompiled shaders \n", glfwGetTime());
-        checkGLError(&success);
+        checkGLError("shader recompilation 2", &success);
     }
 }
 
@@ -589,11 +647,11 @@ void Renderer::checkProgramCompileErrors(unsigned int program)
     config->logMessage("[%f] RENDERER::PROGRAM_LINKING_ERROR \n %s \n", glfwGetTime(), infoLog);
 }
 
-void Renderer::checkGLError(bool *success_s){
+void Renderer::checkGLError(const char* label, bool *success_s){
     GLenum error;
     while((error = glGetError()) != GL_NO_ERROR)
     {
-        config->logMessage("[%f] RENDERER::OPENGL_ERROR: %u \n", glfwGetTime(), (unsigned int)error);
+        config->logMessage("[%f] GL_ERROR at %s: %u\n", glfwGetTime(), label, (unsigned int)error);
         *success_s = false;
     }
 }

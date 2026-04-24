@@ -79,6 +79,7 @@ namespace core{
         //raytracing
         int spp = 1;
         int bounces = 2;
+        int normalPrecision = 6; // radius of normal computation neighbourhood in voxels (e.g. 3 or 6)
         int controlchecks = 160;
 
         bool shaderRecompilation = false;
@@ -91,14 +92,11 @@ namespace core{
         double start_ms = 0;
         double end_ms = 0;
 
-        //gpu
-        double gpu_start_ms;
-        double gpu_shaderCompilation_ms;
-        double gpu_framebufferResize_ms;
-        double gpu_pass1_ms;
-        double gpu_pass2_ms;
-        double gpu_pass3_ms;
-        double gpu_end_ms;
+        //gpu actual time (GPU timer queries in nanoseconds)
+        GLuint64 gpu_pass1_actual_ns = 0;  // Ray pass actual GPU time
+        GLuint64 gpu_pass2_actual_ns = 0;  // Accum pass actual GPU time
+        GLuint64 gpu_pass3_actual_ns = 0;  // Avg pass actual GPU time
+        GLuint64 gpu_pass4_actual_ns = 0;  // Final pass actual GPU time
 
         //cpu
         double cpu_start_ms = 0;

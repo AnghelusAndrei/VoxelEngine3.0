@@ -94,7 +94,7 @@ endif()
 message(STATUS "Copying all assets to destination folder...")
 file(
     COPY assets
-    DESTINATION ${OUTPUT_DIR}
+    DESTINATION ${CMAKE_CURRENT_BINARY_DIR}
 )
 
 # Handle shaders

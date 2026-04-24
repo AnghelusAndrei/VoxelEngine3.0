@@ -1,5 +1,5 @@
 #version 430 core
-layout(location = 0) out vec4 FragColor;
+layout(location = 0) out uvec4 FragColor;
 layout(location = 1) out uint NormalIdx;    // packed half-coords (keeps accum pipeline valid)
 
 in vec4 vertexPosition;
@@ -8,7 +8,7 @@ uniform usamplerBuffer octreeTexture;
 uniform uint octreeDepth;
 
 // nBuffer — same hash map as in ray.frag, read-only.
-// Stride=2: s*2=owner, s*2+1=packed 10-10-10 normal.
+#define nBufferStride 3 // Stride=3: s*3=owner, s*3+1=packed 10-10-10 normal, s*3+2=timestamp.
 uniform usampler2D nBuffer;
 uniform int nBufferWidth;
 uniform int nBufferSlots;
@@ -98,14 +98,14 @@ void main() {
 
     if (voxel.hit) {
         // nBuffer lookup — identical to ray.frag.
-        uint nKey  = voxel.id + 1u;
+        uint nKey  = voxelKey(voxel) + 1u;
         uint nHash = nKey % uint(nBufferWidth - 1) + 1u;
         uint normalField = 0u;
         bool cached = false;
         for (int s = 0; s < nBufferSlots; s++) {
-            uint owner = texelFetch(nBuffer, ivec2(int(nHash), s * 2), 0).r;
+            uint owner = texelFetch(nBuffer, ivec2(int(nHash), s * nBufferStride), 0).r;
             if (owner == nKey) {
-                normalField = texelFetch(nBuffer, ivec2(int(nHash), s * 2 + 1), 0).r;
+                normalField = texelFetch(nBuffer, ivec2(int(nHash), s * nBufferStride + 1), 0).r;
                 cached = true;
                 break;
             }
@@ -127,7 +127,8 @@ void main() {
 
         vec3 col;
         col.xyz = vec3(float(q)/65.0);
-        FragColor = vec4(col.xyz, float(voxel.id + 1u));
+        uint hashID = voxelKey(voxel); // *
+        FragColor = uvec4(uvec3(col.xyz * 255.0), hashID + 1u);
 
         // Keep the packed position output so the accum pipeline stays valid in this mode.
         uint bits = octreeDepth - 1u;
@@ -137,7 +138,7 @@ void main() {
     } else {
         vec3 col;
         col.xyz = vec3(float(q)/65.0);
-        FragColor = vec4(col.xyz, 0.0);
+        FragColor = uvec4(uvec3(col.xyz * 255.0), 0u);
         NormalIdx = 0u;
     }
 }

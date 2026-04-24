@@ -15,11 +15,11 @@
 #include <glm/vec4.hpp>
 
 struct Material{
-    glm::vec4 color;            //16 
-    glm::vec4 specularColor;    //16
-    float diffuse;              //4 
-    float specular;             //4 
-    float metallic;             //4 
+    glm::vec4 color;            //16 (Albedo/Diffuse color)
+    glm::vec4 specularColor;    //16 (Reserved for future use; set to color for metallic)
+    float roughness;            //4  (0=smooth mirror, 1=fully rough)
+    float specular;             //4  (Specular intensity, typically 0.04 for dielectrics)
+    float metallic;             //4  (0=dielectric, 1=metal)
     GLint emissive = 0;         //4  (GLint = 4 bytes, matches std140 bool layout)
     float emissiveIntensity;    //4
 };

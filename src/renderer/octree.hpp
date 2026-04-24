@@ -74,6 +74,8 @@ class Octree{
         GLuint program;
         GLuint texBufferID;
         GLuint depthUniformLocation;
+        GLint maxTextureSize;  // max texture buffer size from GPU
+        uint32_t gpuBufferSize = 0;  // actual size of GPU buffer in slots
 
         std::stack<uint32_t> freeBlocks;  // stack of recyclable 8-slot GPU blocks
 

@@ -6,6 +6,7 @@
 #include "./UI/info.hpp"
 #include "./UI/control.hpp"
 #include "./UI/viewportWidget.hpp"
+#include "./renderer/skybox.hpp"
 #include "fpcamera.hpp"
 
 class VoxelEngine{
@@ -28,6 +29,7 @@ class VoxelEngine{
         FPCamera *camera;
         Octree *octree;
         MaterialPool *materialPool;
+        Skybox *skybox;
         Interface *interface;
 
         bool ui_active = true;

@@ -1,19 +1,23 @@
 #version 430 core
-out vec4 FragColor;
+layout(location = 0) out uvec4 FragColor;
+layout(location = 1) out uint NormalIdx;    // packed half-coords (keeps accum pipeline valid)
 
 in vec4 vertexPosition;
 
 uniform usamplerBuffer octreeTexture;
 uniform uint octreeDepth;
-uniform int spp;
+
+// nBuffer — same hash map as in ray.frag, read-only.
+#define nBufferStride 3 // Stride=3: s*3=owner, s*3+1=packed 10-10-10 normal, s*3+2=timestamp.
+uniform usampler2D nBuffer;
+uniform int nBufferWidth;
+uniform int nBufferSlots;
+
 uniform uint controlchecks;
-uniform int lightBounces;
 uniform ivec2 screenResolution;
 uniform int time;
-
-#ifndef FLT_MAX
-#define FLT_MAX 3.402823466e+38
-#endif
+uniform int spp;
+uniform int lightBounces;
 
 layout (std140) uniform CameraUniform {
     vec4 position;
@@ -26,10 +30,7 @@ struct Material {
     bool emissive;
     float emissiveIntensity;
 };
-
-layout (std140) uniform MaterialUniform {
-    Material material[127];
-};
+layout (std140) uniform MaterialUniform { Material material[127]; };
 
 #include "internal.glsl"
 
@@ -45,12 +46,48 @@ void main() {
 
     hit_t voxel = Raycast(ray);
 
-    if(voxel.hit){
+    if (voxel.hit) {
+        // nBuffer lookup — identical to ray.frag.
+        uint nKey  = voxelKey(voxel) + 1u;
+        uint nHash = nKey % uint(nBufferWidth - 1) + 1u;
+        uint normalField = 0u;
+        bool cached = false;
+        for (int s = 0; s < nBufferSlots; s++) {
+            uint owner = texelFetch(nBuffer, ivec2(int(nHash), s * nBufferStride), 0).r;
+            if (owner == nKey) {
+                normalField = texelFetch(nBuffer, ivec2(int(nHash), s * nBufferStride + 1), 0).r;
+                cached = true;
+                break;
+            }
+        }
+
+        vec3 normal;
+        if (cached && normalField != 0u) {
+            normal = normalize(UnpackNormal(normalField));
+        } else {
+            // Face normal fallback — same placeholder as ray.frag.
+            vec3 adir = abs(direction);
+            if (adir.x > adir.y && adir.x > adir.z)
+                normal = vec3(-sign(direction.x), 0.0, 0.0);
+            else if (adir.y > adir.z)
+                normal = vec3(0.0, -sign(direction.y), 0.0);
+            else
+                normal = vec3(0.0, 0.0, -sign(direction.z));
+        }
+
+        //uint hashID = hash(uint(voxel.position.x) + uint(voxel.position.y) * octreeLength + uint(voxel.position.z) * octreeLength * octreeLength);
         Node data = UnpackNode(texelFetch(octreeTexture, int(voxel.id)).r);
-        vec3 normal = normalize(UnpackNormal(data.normal));
         Material mat = material[data.material];
-        FragColor = vec4(mat.color.xyz, float(voxel.id+1));
-    }else{
-        FragColor = vec4(sampleSkybox(ray.direction), 0);
+        uint hashID = voxelKey(voxel); // *
+        FragColor = uvec4(uvec3(mat.color.xyz * 255.0), hashID + 1u);
+
+        // Keep the packed position output so the accum pipeline stays valid in this mode.
+        uint bits = octreeDepth - 1u;
+        NormalIdx = (voxel.position.x >> 1u)
+                  | ((voxel.position.y >> 1u) << bits)
+                  | ((voxel.position.z >> 1u) << (2u * bits));
+    } else {
+        FragColor = uvec4(uvec3(sampleSkybox(ray.direction) * 255.0), 0u);
+        NormalIdx = 0u;
     }
 }

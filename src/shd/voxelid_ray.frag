@@ -1,5 +1,5 @@
 #version 430 core
-layout(location = 0) out vec4 FragColor;
+layout(location = 0) out uvec4 FragColor;
 layout(location = 1) out uint NormalIdx;    // packed half-coords (keeps accum pipeline valid)
 
 in vec4 vertexPosition;
@@ -48,7 +48,7 @@ void main() {
 
     if (voxel.hit) {
         // nBuffer lookup — identical to ray.frag.
-        uint nKey  = voxel.id + 1u;
+        uint nKey  = voxelKey(voxel) + 1u;
         uint nHash = nKey % uint(nBufferWidth - 1) + 1u;
         uint normalField = 0u;
         bool cached = false;
@@ -76,8 +76,9 @@ void main() {
         }
 
         vec3 col;
-        col.xyz = vec3(float((voxel.id + 1u) % 255) / 255.0); // Visualise: full-brightness normal map colour for cached normals, dimmed (×0.35) for face-normal placeholders so pending voxels are obvious.
-        FragColor = vec4(col.xyz, float(voxel.id + 1u));
+        uint hashID = voxelKey(voxel); // *
+        col.xyz = vec3(float((hashID+1u) % 255) / 255.0, float(((hashID+1u)/255u) % 255) / 255.0, float(((hashID+1u)/ (255u * 255u)) % 255) / 255.0); // Modulo for better visualization of IDs in debug mode.
+        FragColor = uvec4(uvec3(col.xyz * 255.0), hashID + 1u);
 
         // Keep the packed position output so the accum pipeline stays valid in this mode.
         uint bits = octreeDepth - 1u;
@@ -85,7 +86,7 @@ void main() {
                   | ((voxel.position.y >> 1u) << bits)
                   | ((voxel.position.z >> 1u) << (2u * bits));
     } else {
-        FragColor = vec4(direction * 0.5 + 0.5, 0.0);
+        FragColor = uvec4(uvec3(sampleSkybox(ray.direction) * 255.0), 0u);
         NormalIdx = 0u;
     }
 }

@@ -7,6 +7,9 @@ Octree::Octree(Config *config){
     delete config;
 
     capacity = 8;
+    
+    // Query the maximum texture buffer size from GPU
+    glGetIntegerv(GL_MAX_TEXTURE_BUFFER_SIZE, &maxTextureSize);
 
     uint32_t p2r = 1;
     for (int i = depth; i >= 1; i--)
@@ -62,11 +65,16 @@ Octree::~Octree(){
 
 void Octree::Update(){
     glBindBuffer(GL_TEXTURE_BUFFER, gl_ID);
-    glBufferData(GL_TEXTURE_BUFFER, size * 4, data.data(), GL_DYNAMIC_DRAW);
+    glBufferData(GL_TEXTURE_BUFFER, capacity * 4, data.data(), GL_DYNAMIC_DRAW);
     glBindBuffer(GL_TEXTURE_BUFFER, 0);
+    gpuBufferSize = capacity;  // Track GPU buffer size
 }
 
 void Octree::UpdateNode(uint32_t index){
+    // Ensure GPU buffer is large enough for this slot
+    if (index >= gpuBufferSize) {
+        resizeDataIfNeeded(index + 1);
+    }
     glBindBuffer(GL_TEXTURE_BUFFER, gl_ID);
     glBufferSubData(GL_TEXTURE_BUFFER, index * 4, 4, &data[index].raw);
     glBindBuffer(GL_TEXTURE_BUFFER, 0);
@@ -90,16 +98,23 @@ void Octree::resizeDataIfNeeded(uint32_t requiredCapacity) {
         while (capacity < requiredCapacity) {
             capacity *= 2;
         }
+        
+        // Clamp capacity to GPU's maximum texture buffer size
+        if (capacity > (uint32_t)maxTextureSize) {
+            capacity = (uint32_t)maxTextureSize;
+        }
 
         Octree::Node newNode;
         newNode.raw = 0;
 
         data.resize(capacity, newNode);
     
-        // Update UBO to reflect new capacity
+        // Update GPU buffer to reflect new capacity
         glBindBuffer(GL_TEXTURE_BUFFER, gl_ID);
         glBufferData(GL_TEXTURE_BUFFER, capacity * 4, data.data(), GL_DYNAMIC_DRAW);
         glBindBuffer(GL_TEXTURE_BUFFER, 0);
+        
+        gpuBufferSize = capacity;  // Track GPU buffer size
     }
 }
 
@@ -120,6 +135,7 @@ void Octree::set(OctreeCPU* cpu) {
     while (!freeBlocks.empty()) freeBlocks.pop();
     cpu->freedGpuBlocks.clear();
     resizeDataIfNeeded(size);
+    gpuBufferSize = capacity;  // Sync GPU buffer size
 
     // Slot 0: explicit root node.
     // The GPU shader at depth=0 always reads slot 0 (locate(ur, 2^depth) is
@@ -139,8 +155,9 @@ void Octree::set(OctreeCPU* cpu) {
 
     // Single bulk upload.
     glBindBuffer(GL_TEXTURE_BUFFER, gl_ID);
-    glBufferData(GL_TEXTURE_BUFFER, size * 4, data.data(), GL_DYNAMIC_DRAW);
+    glBufferData(GL_TEXTURE_BUFFER, capacity * 4, data.data(), GL_DYNAMIC_DRAW);
     glBindBuffer(GL_TEXTURE_BUFFER, 0);
+    gpuBufferSize = capacity;  // Track GPU buffer size
 
     // Rebind so the sampler sees the (possibly reallocated) buffer.
     glBindTexture(GL_TEXTURE_BUFFER, texBufferID);
@@ -166,14 +183,16 @@ void Octree::linearizeNode(OctreeCPU* cpu, OctreeCPU::Node* cpuNode,
 
         cn->dirty = false;  // this node is now in sync with the GPU
 
-        if (lv > cpu->depth) {
-            // Leaf voxel.
+        if (lv > cpu->depth || (cn->material != 0 && cn->childrenCount == 0)) {
+            // Leaf: either a true depth-limit voxel, or a compressed leaf where the
+            // entire region is one material.  Writes a GPU leaf so the ray traversal
+            // short-circuits here (potentially representing a large block, not just 1×1×1).
             if (cn->material == 0) continue;
             resizeDataIfNeeded(off + 1);
             Node leaf; leaf.raw = 0;
             leaf.leaf.isNode   = 0;
             leaf.leaf.material = cn->material & 0x7F;
-            leaf.leaf.normal   = 0;  // GPU refines on first hit
+            leaf.leaf.normal   = 0;
             data[off] = leaf;
             numVoxels++;
         } else {
@@ -242,14 +261,20 @@ void Octree::applyEditsNode(OctreeCPU* cpu, OctreeCPU::Node* node,
     if (!node->dirty) return;  // subtree unchanged — skip
     node->dirty = false;
 
-    if (level > cpu->depth) {
-        // Leaf.
+    if (level > cpu->depth || (node->material != 0 && node->childrenCount == 0)) {
+        // Leaf: true depth-limit voxel or compressed leaf (entire region = one material).
         Node leaf; leaf.raw = 0;
         leaf.leaf.material = node->material & 0x7F;
         leaf.leaf.normal   = 0;
         data[gpuSlot] = leaf;
         UpdateNode(gpuSlot);
         if (node->material != 0) numVoxels++;
+        // Release any GPU block that was previously allocated for this slot
+        // (happens when a subtree is overwritten by a compressed leaf).
+        if (node->gpuBlock != UINT32_MAX) {
+            freeBlocks.push(node->gpuBlock);
+            node->gpuBlock = UINT32_MAX;
+        }
         return;
     }
 
@@ -264,6 +289,11 @@ void Octree::applyEditsNode(OctreeCPU* cpu, OctreeCPU::Node* node,
             glBufferSubData(GL_TEXTURE_BUFFER, GLintptr(block) * 4, 8 * 4, &data[block]);
             glBindBuffer(GL_TEXTURE_BUFFER, 0);
         } else {
+            // Check if we have room to allocate a new block
+            if (size + 8 > (uint32_t)maxTextureSize) {
+                // Cannot allocate — texture buffer would exceed GPU limit
+                return;
+            }
             block = size; size += 8;
             resizeDataIfNeeded(size);
         }
