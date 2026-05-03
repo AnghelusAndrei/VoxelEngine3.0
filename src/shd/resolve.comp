@@ -1,0 +1,382 @@
+#version 430 core
+// =============================================================================
+// resolve.comp — full-resolution reconstruction + visualization modes.
+// =============================================================================
+// Runs after the wavefront shading passes have deposited radiance into the
+// lBuffer. Reads the GBuffer (gbufferColor) populated by generate_primary.comp
+// where .x = traversal check count and .w = voxelID+1 (0 on sky miss).
+//
+// renderType switches the output:
+//   DEFAULT    — lBuffer radiance lookup + 4-tap bilateral fallback for fresh
+//                or evicted voxels; skybox on miss.
+//   VOXELID    — voxel hash id mapped to a distinct RGB triple (debugging
+//                voxel identity / reprojection).
+//   NORMAL     — nBuffer normal lookup; uncached voxels render dark.
+//   ALBEDO     — octree material colour (no shading).
+//   STRUCTURE  — octree traversal checks / 65 as greyscale.
+//
+// These replace the old per-shader raster variants (voxelid_ray.frag,
+// normal_ray.frag, albedo_ray.frag, accel_struct_ray.frag). All visualizations
+// now share one dispatch path, so swapping modes is a single uniform flip.
+// =============================================================================
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// binding 0: raw lBuffer for the DEFAULT-mode per-pixel radiance lookup.
+//            The screen-space SVGF filter (svgf.comp) runs AFTER resolve and
+//            denoises the RGBA32F output — see runWavefrontFrame's SVGF block.
+// binding 3: raw lBuffer (currently the same texture as binding 0). Reserved
+//            for VARIANCE view's un-filtered variance lookup, kept as a
+//            separate binding so it can point at a distinct buffer if a
+//            future denoise pass writes back to the lBuffer hash itself.
+layout(binding = 0, r32ui)    readonly  uniform uimage2D voxelColorAccumulationBuffer;
+layout(binding = 1, rgba32ui) readonly  uniform uimage2D inputColorBuffer; // gbufferColor
+layout(binding = 2, rgba32f)  writeonly uniform image2D  outputColorBuffer;
+layout(binding = 3, r32ui)    readonly  uniform uimage2D rawLBuffer;
+
+uniform usampler2D nBuffer;
+uniform int   nBufferWidth;
+uniform int   nBufferSlots;
+
+uniform int   lBufferSlots;
+uniform int   lBufferWidth;
+uniform ivec2 screenResolution;
+
+uniform samplerCube skybox;
+
+// renderType: 0=DEFAULT, 1=STRUCTURE, 2=ALBEDO, 3=NORMAL, 4=VOXELID.
+// Matches core::RenderType in core.hpp. Keep in sync when adding modes.
+uniform int   renderType;
+
+// Timeout reconstruction — primary rays that exhausted their step budget
+// (checks >= primary_controlchecks) are filled from a weighted NxN gather
+// over neighbouring pixels that landed on real geometry.
+uniform uint  primary_controlchecks;
+uniform int   reconstructionRadius;
+
+// Variance view scale anchor. Mirrors rank.comp::varianceNorm so the variance
+// visualisation maps directly onto the importance-score axis: a voxel that
+// shows pure white in this view is one whose indirect-channel variance has
+// fully saturated rank's contribution (vn = 1.0). Without this anchor the
+// raw variance is in (255 * urgb)² units and looks uniformly dim.
+uniform float varianceNormForView;
+
+layout(std140, binding = 0) uniform CameraUniform {
+    vec4 position;
+    vec4 cameraPlane, cameraPlaneRight, cameraPlaneUp;
+} camera;
+
+struct Material {
+    vec4 color, specularColor;
+    float diffuse, specular, metallic;
+    bool emissive;
+    float emissiveIntensity;
+};
+layout(std140, binding = 1) uniform MaterialUniform { Material material[127]; };
+
+// lBufferStride is defined in wavefront.glsl (= 12). resolve.comp does NOT
+// include wavefront.glsl (it doesn't touch the ring/list SSBOs), so we
+// duplicate the literal here. Keep in sync with wavefront.glsl::lBufferStride.
+#define lBufferStride 12
+#define nBufferStride 3
+#define TRUSTED_THRESHOLD 128u
+
+vec3 unpackNormalField(uint p) {
+    return vec3(
+        float((p >> 22u) & 0x3FFu) / 511.0 - 1.0,
+        float((p >> 12u) & 0x3FFu) / 511.0 - 1.0,
+        float((p >>  2u) & 0x3FFu) / 511.0 - 1.0
+    );
+}
+
+const ivec2 bilateralOffsets[4] = ivec2[4](
+    ivec2( 1,  0), ivec2(-1,  0),
+    ivec2( 0,  1), ivec2( 0, -1)
+);
+
+// Dual-channel slot layout (mirror of wavefront.glsl + shade.comp):
+//   [0]  vid                 [6]  ind_count
+//   [1]  dir_count           [7..9] ind_r/g/b sums
+//   [2..4] dir_r/g/b sums    [10] ind_L²_sum
+//   [5]  dir_L²_sum          [11] last_time
+// Final radiance = direct EMA + indirect EMA. Variance reported back to the
+// caller is the INDIRECT-channel variance only — that's the dominant noise
+// signal and matches the variance signal rank.comp uses for budget
+// allocation (so the bilateral fallback weights line up).
+//
+// `count` returned is dir_count + ind_count combined — the bilateral
+// fallback only uses it as a confidence weight, so the sum is fine.
+vec3 lookupVoxelAvg(uint vid, out uint count, out float variance) {
+    if (vid == 0u) { count = 0u; variance = 0.0; return vec3(0.0); }
+    uint h = vid % uint(lBufferWidth - 1) + 1u;
+    for (int i = 0; i < lBufferStride * lBufferSlots; i += lBufferStride) {
+        uint id = imageLoad(voxelColorAccumulationBuffer, ivec2(int(h), i)).r;
+        if (id != vid) continue;
+
+        uint dCount = imageLoad(voxelColorAccumulationBuffer, ivec2(int(h), i + 1)).r;
+        uint iCount = imageLoad(voxelColorAccumulationBuffer, ivec2(int(h), i + 6)).r;
+        count = dCount + iCount;
+        if (count == 0u) { variance = 0.0; return vec3(0.0); }
+
+        vec3 dirAvg = vec3(0.0);
+        if (dCount > 0u) {
+            uint dr = imageLoad(voxelColorAccumulationBuffer, ivec2(int(h), i + 2)).r;
+            uint dg = imageLoad(voxelColorAccumulationBuffer, ivec2(int(h), i + 3)).r;
+            uint db = imageLoad(voxelColorAccumulationBuffer, ivec2(int(h), i + 4)).r;
+            float invDN = 1.0 / float(dCount);
+            dirAvg = vec3(float(dr), float(dg), float(db)) * invDN / 255.0;
+        }
+
+        vec3 indAvg = vec3(0.0);
+        variance = 0.0;
+        if (iCount > 0u) {
+            uint ir  = imageLoad(voxelColorAccumulationBuffer, ivec2(int(h), i + 7)).r;
+            uint ig  = imageLoad(voxelColorAccumulationBuffer, ivec2(int(h), i + 8)).r;
+            uint ib  = imageLoad(voxelColorAccumulationBuffer, ivec2(int(h), i + 9)).r;
+            uint iL2 = imageLoad(voxelColorAccumulationBuffer, ivec2(int(h), i + 10)).r;
+            float invIN = 1.0 / float(iCount);
+            indAvg = vec3(float(ir), float(ig), float(ib)) * invIN / 255.0;
+            float meanL = float(ir + ig + ib) * invIN / 3.0;
+            variance = max(float(iL2) * invIN - meanL * meanL, 0.0) / (255.0 * 255.0);
+        }
+
+        return dirAvg + indAvg;
+    }
+    count = 0u;
+    variance = 0.0;
+    return vec3(0.0);
+}
+
+// nBuffer lookup — returns true if a refined normal is cached for this voxel.
+// vidPlus1 is voxelKey+1 (same encoding as gbufferColor.w).
+bool lookupNormal(uint vidPlus1, out vec3 n) {
+    n = vec3(0.0);
+    if (vidPlus1 == 0u) return false;
+    uint h = vidPlus1 % uint(nBufferWidth - 1) + 1u;
+    for (int s = 0; s < nBufferSlots; s++) {
+        uint owner = texelFetch(nBuffer, ivec2(int(h), s * nBufferStride), 0).r;
+        if (owner == vidPlus1) {
+            uint field = texelFetch(nBuffer, ivec2(int(h), s * nBufferStride + 1), 0).r;
+            if (field == 0u) return false;
+            n = normalize(unpackNormalField(field));
+            return true;
+        }
+    }
+    return false;
+}
+
+// Reconstruct the per-pixel primary ray direction for sky sampling on miss
+// and face-normal fallback in NORMAL mode.
+vec3 pixelDirection(ivec2 pix) {
+    vec2 ndc = vec2(
+        (float(pix.x) + 0.5) / float(screenResolution.x) * 2.0 - 1.0,
+        (float(pix.y) + 0.5) / float(screenResolution.y) * 2.0 - 1.0
+    );
+    return normalize(
+        camera.cameraPlane.xyz
+        + ndc.x * camera.cameraPlaneRight.xyz
+        - ndc.y * camera.cameraPlaneUp.xyz
+    );
+}
+
+// Returns true when this pixel's primary ray timed out before hitting anything.
+// Such pixels carry voxelID==0 (miss sentinel) but their check count sat at or
+// above the primary budget — they are NOT genuine sky misses.
+bool isTimeout(uint voxelID, uint checks) {
+    return voxelID == 0u && checks >= primary_controlchecks;
+}
+
+// Weighted spatial gather over the (2R+1)×(2R+1) neighbourhood.
+// Only borrows from pixels with a real hit (voxelID != 0) that are not
+// themselves timed out.  Falls back to skybox if the whole neighbourhood is
+// sky or also timed out (open-sky areas where timeout doesn't apply).
+vec3 reconstructTimeout(ivec2 pix) {
+    vec3  sum  = vec3(0.0);
+    float wsum = 0.0;
+    int   r    = reconstructionRadius;
+    for (int dy = -r; dy <= r; dy++) {
+    for (int dx = -r; dx <= r; dx++) {
+        if (dx == 0 && dy == 0) continue;
+        ivec2 q = pix + ivec2(dx, dy);
+        if (q.x < 0 || q.y < 0 || q.x >= screenResolution.x || q.y >= screenResolution.y) continue;
+        uvec4 nd      = imageLoad(inputColorBuffer, q);
+        uint  nvid    = nd.w;
+        uint  nchecks = nd.x;
+        // Skip sky misses and other timed-out pixels — only borrow real hits.
+        if (nvid == 0u || nchecks >= primary_controlchecks) continue;
+        uint  nCount;
+        float nVar;
+        vec3  nAvg = lookupVoxelAvg(nvid, nCount, nVar);
+        if (nCount == 0u) continue;
+        // Weight: closer pixels and better-sampled voxels contribute more.
+        float dist = float(dx * dx + dy * dy);
+        float w    = float(min(nCount, 32u)) / (1.0 + dist * 0.15);
+        sum  += nAvg * w;
+        wsum += w;
+    }}
+    // Fall back to skybox only if no usable neighbours were found (e.g. all sky).
+    return (wsum > 0.0001) ? sum / wsum : texture(skybox, pixelDirection(pix)).rgb;
+}
+
+// =============================================================================
+// DEFAULT mode — radiance resolve (identical to the original resolve.comp path).
+// =============================================================================
+vec3 resolveDefault(ivec2 pix, uint voxelID, uint checks) {
+    if (voxelID == 0u) {
+        if (isTimeout(voxelID, checks)) return reconstructTimeout(pix);
+        return texture(skybox, pixelDirection(pix)).rgb;
+    }
+
+    uint  cCount;
+    float cVar;
+    vec3  cAvg = lookupVoxelAvg(voxelID, cCount, cVar);
+
+    // Fast path — trusted cache hit.
+    if (cCount >= TRUSTED_THRESHOLD && cVar < 0.02) return cAvg;
+
+    // Noisy, fresh, or evicted: pull from neighbours.
+    //TODO: Remove this it doesnt work, replace with proper per-voxel
+    //neighbour blur. This is screen space (useless),
+    //TRUSTED_TRESHOLD doesn't change anything
+    vec3  sum  = cAvg * float(cCount);
+    float wsum = float(cCount);
+    for (int k = 0; k < 4; k++) {
+        ivec2 q = pix + bilateralOffsets[k];
+        if (q.x < 0 || q.y < 0 || q.x >= screenResolution.x || q.y >= screenResolution.y) continue;
+        uvec4 nd = imageLoad(inputColorBuffer, q);
+        uint nvid = nd.w;
+        if (nvid == 0u || nvid == voxelID) continue;
+        uint  nCount;
+        float nVar;
+        vec3  nAvg = lookupVoxelAvg(nvid, nCount, nVar);
+        if (nCount == 0u) continue;
+        float dc = length(nAvg - cAvg);
+        float wc = exp(-dc * 6.0);
+        float wv = 1.0 / (1.0 + nVar * 32.0);
+        float w  = wc * wv * float(min(nCount, 32u));
+        sum  += nAvg * w;
+        wsum += w;
+    }
+    return (wsum > 0.0001) ? (sum / wsum) : vec3(0.0);
+}
+
+// =============================================================================
+// VOXELID mode — voxel hash as RGB triple. Matches voxelid_ray.frag output.
+// =============================================================================
+vec3 resolveVoxelID(ivec2 pix, uint vidPlus1, uint checks) {
+    if (vidPlus1 == 0u) {
+        if (isTimeout(vidPlus1, checks)) return reconstructTimeout(pix);
+        return texture(skybox, pixelDirection(pix)).rgb;
+    }
+    // vidPlus1 == voxelKey+1, so we undo the +1 to match the old shader.
+    uint hashID = vidPlus1 - 1u;
+    return vec3(
+        float((hashID + 1u) % 255u) / 255.0,
+        float(((hashID + 1u) / 255u) % 255u) / 255.0,
+        float(((hashID + 1u) / (255u * 255u)) % 255u) / 255.0
+    );
+}
+
+// =============================================================================
+// NORMAL mode — nBuffer lookup. Uncached voxels render dark (brightness=0),
+// matching normal_ray.frag's behaviour where pending normals fade in as the
+// accumulator refines them.
+// =============================================================================
+vec3 resolveNormal(ivec2 pix, uint vidPlus1, uint checks) {
+    if (vidPlus1 == 0u) {
+        if (isTimeout(vidPlus1, checks)) return reconstructTimeout(pix);
+        return texture(skybox, pixelDirection(pix)).rgb;
+    }
+    vec3 n;
+    if (!lookupNormal(vidPlus1, n)) return vec3(0.0);
+    return n * 0.5 + 0.5;
+}
+
+// =============================================================================
+// ALBEDO mode — raw material colour, no shading. Reads the material index
+// stored in gbufferColor.y by generate_primary.comp and indexes the material
+// UBO directly. Matches the original albedo_ray.frag output exactly.
+// =============================================================================
+vec3 resolveAlbedo(ivec2 pix, uint vidPlus1, uint matIdx, uint checks) {
+    if (vidPlus1 == 0u) {
+        if (isTimeout(vidPlus1, checks)) return reconstructTimeout(pix);
+        return texture(skybox, pixelDirection(pix)).rgb;
+    }
+    if (matIdx == 0u || matIdx >= 127u) return vec3(0.0);
+    return material[matIdx].color.xyz;
+}
+
+// =============================================================================
+// STRUCTURE mode — traversal-check count / 65 as greyscale. Matches
+// accel_struct_ray.frag output.
+// =============================================================================
+vec3 resolveStructure(uint checks) {
+    return vec3(float(checks) / 65.0);
+}
+
+
+// =============================================================================
+// VARIANCE mode — visualisation of the indirect-channel variance signal that
+// drives rank.comp's budget allocation. Reads the RAW lBuffer (binding 3)
+// so the user sees un-filtered noise even when the SVGF filter is active.
+//
+// Local helper: same maths as lookupVoxelAvg's variance branch, but pulls
+// from rawLBuffer instead of voxelColorAccumulationBuffer.
+// =============================================================================
+float lookupRawIndirectVariance(uint vid) {
+    if (vid == 0u) return 0.0;
+    uint h = vid % uint(lBufferWidth - 1) + 1u;
+    for (int i = 0; i < lBufferStride * lBufferSlots; i += lBufferStride) {
+        uint id = imageLoad(rawLBuffer, ivec2(int(h), i)).r;
+        if (id == 0u) return 0.0;
+        if (id != vid) continue;
+        uint c = imageLoad(rawLBuffer, ivec2(int(h), i + 6)).r;
+        if (c < 2u) return 0.0;
+        uint rs  = imageLoad(rawLBuffer, ivec2(int(h), i + 7)).r;
+        uint gs  = imageLoad(rawLBuffer, ivec2(int(h), i + 8)).r;
+        uint bs  = imageLoad(rawLBuffer, ivec2(int(h), i + 9)).r;
+        uint l2s = imageLoad(rawLBuffer, ivec2(int(h), i + 10)).r;
+        float fc = float(c);
+        float meanL  = float(rs + gs + bs) / (3.0 * fc);
+        float meanL2 = float(l2s) / fc;
+        return max(meanL2 - meanL * meanL, 0.0) / (255.0 * 255.0);
+    }
+    return 0.0;
+}
+
+vec3 resolveVariance(ivec2 pix, uint voxelID, uint checks) {
+    if (voxelID == 0u) {
+        if (isTimeout(voxelID, checks)) return reconstructTimeout(pix);
+        return texture(skybox, pixelDirection(pix)).rgb;
+    }
+
+    float cVar = lookupRawIndirectVariance(voxelID);
+
+    // Multiply by 255² and divide by the rank saturation anchor so the
+    // displayed grey level corresponds directly to rank's vn ∈ [0, 1].
+    float scaled = cVar * (255.0 * 255.0) / max(varianceNormForView, 1.0);
+    return vec3(clamp(scaled, 0.0, 1.0));
+}
+
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= screenResolution.x || pix.y >= screenResolution.y) return;
+
+    uvec4 gbuf = imageLoad(inputColorBuffer, pix);
+    uint  checks   = gbuf.x;
+    uint  matIdx   = gbuf.y;
+    uint  vidPlus1 = gbuf.w;
+
+    vec3 col;
+    switch (renderType) {
+        case 1:  col = resolveStructure(checks);                       break;  // STRUCTURE
+        case 2:  col = resolveAlbedo(pix, vidPlus1, matIdx, checks);   break;  // ALBEDO
+        case 3:  col = resolveNormal(pix, vidPlus1, checks);           break;  // NORMAL
+        case 4:  col = resolveVoxelID(pix, vidPlus1, checks);          break;  // VOXELID
+        case 5:  col = resolveVariance(pix, vidPlus1, checks);         break; // VARIANCE
+        default: col = resolveDefault(pix, vidPlus1, checks);          break;  // DEFAULT
+    }
+
+    imageStore(outputColorBuffer, pix, vec4(col, 1.0));
+}

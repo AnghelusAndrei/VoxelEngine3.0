@@ -1,0 +1,70 @@
+#version 430 core
+// =============================================================================
+// trace.comp — wavefront trace stage.
+// =============================================================================
+// Reads rays in the window [ring_tail, ring_head). For each LIVE ray (bounce
+// not yet terminated) runs Raycast and stores hit_voxel_id/hit_material back
+// into the same ring slot. Origin/direction/throughput/primary_voxel_id are
+// left untouched for shade.comp to consume.
+//
+// Terminated rays (bounce_idx >= MAX_BOUNCES) skip the raycast. This keeps
+// the dispatch size uniform and avoids a separate compaction pass here.
+// =============================================================================
+
+layout(local_size_x = 64) in;
+
+uniform usamplerBuffer octreeTexture;
+uniform uint octreeDepth;
+uniform uint controlchecks;
+uniform uint rayWindowBase;   // == ring_tail at dispatch time (host captures)
+uniform uint rayWindowSize;   // == ring_head - ring_tail at dispatch time
+
+#include "wavefront.glsl"
+#include "internal.glsl"
+
+void main() {
+    uint t = gl_GlobalInvocationID.x;
+    if (t >= rayWindowSize) return;
+
+    uint slot = (rayWindowBase + t) % RAY_CAPACITY;
+    Ray r = rays[slot];
+
+    // Skip terminated rays — shade.comp will ignore them on the next pass
+    // too. Avoids wasting traversal work.
+    if (r.bounce_idx >= MAX_BOUNCES) return;
+
+    octreeLength = 1u << octreeDepth;
+
+    ray_t ray;
+    ray.origin = r.origin;
+    ray.direction = r.direction;
+    ray.inverted_direction = 1.0 / r.direction;
+
+    hit_t hit = Raycast(ray);
+
+    if (hit.hit) {
+        // Stash enough info for shade.comp. We don't have hit_t fields in
+        // our Ray struct, so encode what shade needs:
+        //   hit_voxel_id  = unique voxel key (for stable nBuffer lookup and
+        //                   for the self-check when recurring)
+        //   hit_material  = material index
+        //   _pad0         = voxel lattice extent (repurposed std430 padding;
+        //                   used by shade.comp's NEE registration so the
+        //                   emissive list can sample a uniform face point)
+        // The hit position is re-derivable from (origin + direction * t) but
+        // we store the voxel's lattice position by packing into r.origin
+        // (reused as hit_position after the trace). This avoids bloating the
+        // payload: after trace, the 'origin' field means "hit lattice pos".
+        // shade.comp will lift this back into world space.
+        r.origin      = vec3(hit.position);
+        r._pad0       = float(hit.size);
+        r.hit_voxel_id = voxelKey(hit) + 1u;
+        r.hit_material = hit.material;
+    } else {
+        // Miss — shade will add skybox * throughput and terminate this ray.
+        r.hit_voxel_id = 0u;
+        r.hit_material = 0u;
+    }
+
+    rays[slot] = r;
+}

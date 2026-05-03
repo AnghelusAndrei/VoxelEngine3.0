@@ -1,0 +1,101 @@
+#version 430 core
+// =============================================================================
+// emit.comp — expand the shading list into primary-bounce rays in the ring.
+// =============================================================================
+// Reads shade_list[chunkBase .. chunkBase+chunkSize) and writes one ray per
+// entry into the ring. samplesPerVoxel is handled by schedule.comp, which
+// writes K consecutive entries per unique voxel. Each entry here fires exactly
+// one ray, so there is no inner loop and no extra atomic pressure on ring_head.
+//
+// RNG differentiation: listIdx is mixed into rng_state, so K consecutive
+// entries for the same voxel (same vid, same pixIndex) get different seeds
+// and produce independent bounce paths — no extra bookkeeping needed here.
+//
+// Ray origin/direction are reconstructed by re-casting the primary ray from
+// camera.position toward the representative pixel. We deliberately DON'T
+// start from the hit point — a fresh primary ray is cheap and guarantees
+// the hit info in trace.comp is consistent with what the rest of the
+// pipeline would see. The trace.comp next dispatch fills in hit details.
+// =============================================================================
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0, rgba32ui) readonly uniform uimage2D gbufferColor;
+
+uniform ivec2 screenResolution;
+uniform uint  chunkBase;    // index into shade_list this chunk starts at
+uniform uint  chunkSize;    // number of entries to emit
+uniform uint  frameSeed;    // per-frame RNG seed (legacy white-noise mix)
+uniform uint  frameIdx;     // monotonic frame counter — drives the LDS sample idx
+uniform uint  octreeDepth_; // passed through to Raycast helper (internal.glsl)
+
+layout(std140, binding = 0) uniform CameraUniform {
+    vec4 position;
+    vec4 cameraPlane, cameraPlaneRight, cameraPlaneUp;
+} camera;
+
+#include "wavefront.glsl"
+
+void main() {
+    uint t = gl_GlobalInvocationID.x;
+    if (t >= chunkSize) return;
+
+    uint listIdx  = chunkBase + t;
+    uvec2 entry   = shade_list[listIdx];
+    uint vid      = entry.x;
+    uint pixIndex = entry.y;
+
+    // Decode representative pixel.
+    uint px = pixIndex % uint(screenResolution.x);
+    uint py = pixIndex / uint(screenResolution.x);
+
+    // Reconstruct primary ray direction for this pixel.
+    vec2 ndc = vec2(
+        (float(px) + 0.5) / float(screenResolution.x) * 2.0 - 1.0,
+        (float(py) + 0.5) / float(screenResolution.y) * 2.0 - 1.0
+    );
+    vec3 dir = normalize(
+        camera.cameraPlane.xyz
+        + ndc.x * camera.cameraPlaneRight.xyz
+        - ndc.y * camera.cameraPlaneUp.xyz
+    );
+
+    // Write a fresh ray into the ring. Trace.comp will fill hit fields.
+    Ray r;
+    r.origin            = camera.position.xyz;
+    r._pad0             = 0.0;
+    r.direction         = dir;
+    r._pad1             = 0.0;
+    r.throughput        = vec3(1.0);
+    r.primary_voxel_id  = vid;
+    r.direct_light      = vec3(0.0);
+    r.indirect_light    = vec3(0.0);
+    // LDS state encoding — see internal.glsl::rand() for the full spec.
+    //   high 24 bits = sample_idx, walks ±1 with frameIdx so the same pixel
+    //                  traces a Halton sequence over time (this is what gives
+    //                  LDS its convergence advantage over white noise).
+    //   low   8 bits = dim_counter, starts at 0 and is bumped per rand() call.
+    //
+    // sample_idx mixes:
+    //   * frameIdx          → monotonic time axis
+    //   * pixIndex hash     → Cranley-Patterson rotation (each pixel gets a
+    //                         distinct LDS starting point so neighbours don't
+    //                         all collapse onto identical sequences)
+    //   * listIdx hash      → decorrelates K duplicate entries for the same
+    //                         pixel (rank.comp's 2-sample tier)
+    uint pix_scramble  = pixIndex * 2654435761u;   // golden-ratio hash
+    uint list_scramble = listIdx  * 1442695040u;   // arbitrary large odd
+    uint sample_idx    = frameIdx + pix_scramble + list_scramble;
+    r.rng_state        = (sample_idx << 8) & 0xFFFFFF00u;   // dim_counter = 0
+    r.bounce_idx        = 0u;
+    r.hit_voxel_id      = 0u;
+    r.hit_material      = 0u;
+    r._pad2             = 0u;
+    r._pad3             = 0u;
+
+    // Append at ring_head. emit.comp is the sole producer before the first
+    // trace/shade pass, so no barrier is needed between the atomicAdd and
+    // the write — other threads can't be reading ring_head yet.
+    uint slot = atomicAdd(ring_head, 1u);
+    rays[slot % RAY_CAPACITY] = r;
+}

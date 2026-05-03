@@ -1,0 +1,123 @@
+#version 430 core
+// =============================================================================
+// schedule.comp — dedup visible voxels into the candidate list.
+// =============================================================================
+// One thread per pixel. Each thread reads its voxelID from the GBuffer and
+// probes the claimMap to locate (or insert) the voxel's canonical slot.
+//   * On the FIRST claim of a voxel (prev == 0u): append a Candidate to
+//     candidate_list with the canonical (vid, pixIndex, h, p) tuple. This is
+//     the only entry-point for voxels into rank.comp's input set.
+//   * On every claim (first or subsequent): atomic-increment the per-slot
+//     pixel count in sampleCountMap. rank.comp uses that count as the
+//     "coverage" component of the importance score.
+//
+// We no longer write the shade_list directly here, and there is no per-voxel
+// `samplesPerVoxel` quota — sample budgeting is now an explicit decision in
+// rank.comp based on importance, not first-come-first-served.
+//
+// Coverage is naturally captured because every pixel that lands on the same
+// voxel does an atomicAdd against the same (h, p) sampleCountMap slot — the
+// final value at end-of-pass is the exact pixel count for that voxel.
+// =============================================================================
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0, rgba32ui) readonly  uniform uimage2D gbufferColor;
+layout(binding = 1, r32ui)    coherent  uniform uimage2D claimMap;
+layout(binding = 2, r32ui)    coherent  uniform uimage2D sampleCountMap;
+
+uniform ivec2 screenResolution;
+uniform int   claimWidth;      // width of claimMap / sampleCountMap in texels
+uniform int   claimProbes;     // probe depth (height of both maps)
+uniform uint  frameSeed;       // rotates scramble each frame
+
+#include "wavefront.glsl"
+
+uint claimHash(uint vid) {
+    // Decorrelate consecutive voxelIDs so probe chains are shorter.
+    uint x = vid;
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    return x;
+}
+
+// 32-bit bit-reversal. Used to scramble workgroup arrival order so the
+// first-come-first-served atomicAdd on candidate_count produces a *spatially
+// uniform* candidate ordering rather than "everything with low y wins". GPUs
+// dispatch workgroups in near-scanline order; bit-reversing the linear group
+// ID scatters consecutive groups across the framebuffer.
+uint bitReverse(uint x) {
+    x = ((x >> 1) & 0x55555555u) | ((x & 0x55555555u) << 1);
+    x = ((x >> 2) & 0x33333333u) | ((x & 0x33333333u) << 2);
+    x = ((x >> 4) & 0x0F0F0F0Fu) | ((x & 0x0F0F0F0Fu) << 4);
+    x = ((x >> 8) & 0x00FF00FFu) | ((x & 0x00FF00FFu) << 8);
+    return (x >> 16) | (x << 16);
+}
+
+void main() {
+    // --- Workgroup scramble ---------------------------------------------------
+    // Re-map this workgroup to a scrambled tile position. Threads within a
+    // group stay contiguous in screen-space (good for cache / convergent
+    // claimMap access); only the per-group tile assignment is permuted.
+    uint gridW = (uint(screenResolution.x) + 7u) / 8u;
+    uint gridH = (uint(screenResolution.y) + 7u) / 8u;
+    uint totalGroups = gridW * gridH;
+
+    uint linearGrp = gl_WorkGroupID.y * gridW + gl_WorkGroupID.x;
+
+    // Bit-reverse + frame-rotated XOR = a bijection on [0, 2^log2) restricted
+    // to [0, totalGroups). For groups that land out of range we fall back to
+    // the unscrambled index — guarantees every tile is still visited.
+    uint log2G = totalGroups <= 1u ? 1u : findMSB(totalGroups - 1u) + 1u;
+    uint scrambled = bitReverse(linearGrp ^ frameSeed) >> (32u - log2G);
+    if (scrambled >= totalGroups) scrambled = linearGrp;
+
+    uint gx = scrambled % gridW;
+    uint gy = scrambled / gridW;
+    ivec2 pix = ivec2(gx * 8u + gl_LocalInvocationID.x,
+                      gy * 8u + gl_LocalInvocationID.y);
+    if (pix.x >= screenResolution.x || pix.y >= screenResolution.y) return;
+
+    uint vid = imageLoad(gbufferColor, pix).w;
+    if (vid == 0u) return;                 // sky miss
+
+    uint h = claimHash(vid) % uint(claimWidth);
+    uint pixIndex = uint(pix.y) * uint(screenResolution.x) + uint(pix.x);
+
+    // Linear probing — find or insert vid in the claimMap. The first thread
+    // to win the slot (prev == 0u) is the canonical pixel for the voxel and
+    // emits a Candidate. Every subsequent thread that lands on the same vid
+    // bumps the per-slot pixel count.
+    for (int p = 0; p < claimProbes; p++) {
+        uint prev = imageAtomicCompSwap(claimMap, ivec2(int(h), p), 0u, vid);
+        if (prev == 0u) {
+            // First claim — emit candidate, then bump pixel count to 1.
+            uint idx = atomicAdd(candidate_count, 1u);
+            if (idx < CANDIDATE_CAPACITY) {
+                Candidate c;
+                c.vid       = vid;
+                c.pix_index = pixIndex;
+                c.claim_h   = h;
+                c.claim_p   = uint(p);
+                candidates[idx] = c;
+            } else {
+                // Exceeded candidate capacity — undo the bump so future code
+                // doesn't see a bogus index. Voxel still owns the claim slot
+                // (so its pixel count keeps accumulating), but rank.comp
+                // won't see it this frame.
+                atomicAdd(candidate_count, 0xFFFFFFFFu);   // -1
+            }
+            imageAtomicAdd(sampleCountMap, ivec2(int(h), p), 1u);
+            return;
+        }
+        if (prev == vid) {
+            // Voxel already in the claim table at this slot — just bump count.
+            imageAtomicAdd(sampleCountMap, ivec2(int(h), p), 1u);
+            return;
+        }
+        // Collision with a different voxel at this slot — try next probe.
+    }
+    // Ran out of probes — extremely rare at reasonable claim-map sizes.
+    // Dropping is safe (same fallback as candidate-capacity exhaustion).
+}

@@ -1,0 +1,514 @@
+#version 430 core
+// =============================================================================
+// shade.comp — wavefront shading + lBuffer deposit + survivor compaction.
+// =============================================================================
+// Per thread: one ray in the current window. Responsibilities:
+//   1. If terminated or hit was a miss: add skybox * throughput to
+//      indirect_light, deposit (direct_light, indirect_light) into the primary
+//      voxel's lBuffer slot via depositSampleDual, mark the ray dead.
+//   2. If hit: route the emissive contribution to direct_light (bounce 0) or
+//      indirect_light (bounce > 0), perform NEE (RIS-weighted, shallow only)
+//      with the same channel routing, sample the next direction, multiply
+//      throughput by the BRDF, apply Russian roulette past RR_START_BOUNCE,
+//      and if the ray survives, append the updated payload at ring_head.
+//
+// Direct/indirect channel split: NEE + bounce-0 emissive = direct (low
+// variance, fast EMA); bounce>=1 emissive + skybox-on-miss = indirect
+// (high variance, slow EMA). Each channel uses its own SAMPLE_CAP for an
+// independent halve-at-cap blend rate. See depositSampleDual below and
+// wavefront.glsl::Ray for the per-ray accumulator layout.
+// =============================================================================
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0, r32ui) coherent uniform uimage2D lBuffer;
+layout(binding = 1, r32ui) readonly  uniform uimage2D nBuffer;  // written by accum.comp
+// Persistent dedup table for the emissive registry. We never reset it across
+// frames — once a light is claimed, it stays. Same atomicCompSwap pattern as
+// schedule.comp's claimMap.
+layout(binding = 2, r32ui) coherent uniform uimage2D emissiveClaim;
+
+uniform usamplerBuffer octreeTexture;
+uniform uint octreeDepth;
+uniform uint controlchecks;
+uniform uint rayWindowBase;
+uniform uint rayWindowSize;
+
+uniform int  lBufferWidth;
+uniform int  lBufferSlots;
+uniform int  nBufferWidth;
+uniform int  nBufferSlots;
+uniform uint time;
+uniform uint updateTime;
+
+// Runtime knobs for the lBuffer EMA (replaced the old `#define SAMPLE_CAP 64u`).
+// - SAMPLE_CAP_DIRECT / SAMPLE_CAP_INDIRECT control halve-at-cap PER CHANNEL.
+//   Small caps → fast response, more noise. Large caps → smoother but slow.
+//   Direct (NEE-fed) is low-variance after RIS, so we cap it low (~32) for
+//   responsive lighting changes. Indirect is high-variance GI, capped high
+//   (~256) to average over many bounces and stabilise the image.
+// - disableStaleReset, when true, skips the time-based slot reset so samples
+//   keep accumulating without the periodic flush. Paired with large caps it
+//   drives the image toward convergence when the camera is still.
+uniform uint SAMPLE_CAP_DIRECT;
+uniform uint SAMPLE_CAP_INDIRECT;
+uniform bool disableStaleReset;
+
+// Firefly clamp — keeps a single huge-luminance sample (low-PDF NEE / RIS
+// spike, deep emissive bounce) from yanking the running EMA mean. Per-channel
+// cap = max(running_mean × fireflyK, fireflyFloor). When an incoming sample
+// luma exceeds the cap, the per-channel urgb is rescaled to that cap before
+// the atomicAdd. fireflyK ≈ 4 is a good balance: tight enough to kill
+// fireflies, loose enough to track real lighting changes within ~3 frames.
+uniform float fireflyK;
+uniform float fireflyFloor;
+
+#define nBufferStride 3
+
+struct Material {
+    vec4 color, specularColor;
+    float roughness, specular, metallic;
+    bool emissive;
+    float emissiveIntensity;
+};
+layout(std140) uniform MaterialUniform { Material material[127]; };
+
+#include "wavefront.glsl"
+#include "internal.glsl"
+
+// ---------------- lBuffer deposit (direct + indirect dual-channel) ----------
+// Layout per slot (lBufferStride = 12 from wavefront.glsl):
+//   [0]  vid                 [6]  ind_count
+//   [1]  dir_count           [7..9] ind_r/g/b sums
+//   [2..4] dir_r/g/b sums    [10] ind_L²_sum
+//   [5]  dir_L²_sum          [11] last_time
+//
+// depositSampleDual writes BOTH channels in a single slot search to avoid
+// re-probing the hash. Each ray contributes one direct sample (NEE +
+// bounce-0 emissive) and one indirect sample (bounce>=1 emissive + skybox).
+// Either may be vec3(0) — we still bump the count so the EMA mean of zero
+// contribution is correctly recorded.
+
+void resetLSlotDual(int h, int i, uint vid,
+                    uvec3 dRgb, uint dL2,
+                    uvec3 iRgb, uint iL2) {
+    imageAtomicExchange(lBuffer, ivec2(h, i),    vid);
+    // direct
+    imageAtomicExchange(lBuffer, ivec2(h, i+1),  1u);
+    imageAtomicExchange(lBuffer, ivec2(h, i+2),  dRgb.x);
+    imageAtomicExchange(lBuffer, ivec2(h, i+3),  dRgb.y);
+    imageAtomicExchange(lBuffer, ivec2(h, i+4),  dRgb.z);
+    imageAtomicExchange(lBuffer, ivec2(h, i+5),  dL2);
+    // indirect
+    imageAtomicExchange(lBuffer, ivec2(h, i+6),  1u);
+    imageAtomicExchange(lBuffer, ivec2(h, i+7),  iRgb.x);
+    imageAtomicExchange(lBuffer, ivec2(h, i+8),  iRgb.y);
+    imageAtomicExchange(lBuffer, ivec2(h, i+9),  iRgb.z);
+    imageAtomicExchange(lBuffer, ivec2(h, i+10), iL2);
+    // bookkeeping
+    imageAtomicExchange(lBuffer, ivec2(h, i+11), time);
+}
+
+void halveLSlotDirect(int h, int i) {
+    uint c  = imageLoad(lBuffer, ivec2(h, i+1)).r;
+    uint r  = imageLoad(lBuffer, ivec2(h, i+2)).r;
+    uint g  = imageLoad(lBuffer, ivec2(h, i+3)).r;
+    uint b  = imageLoad(lBuffer, ivec2(h, i+4)).r;
+    uint L2 = imageLoad(lBuffer, ivec2(h, i+5)).r;
+    imageAtomicExchange(lBuffer, ivec2(h, i+1), c  >> 1u);
+    imageAtomicExchange(lBuffer, ivec2(h, i+2), r  >> 1u);
+    imageAtomicExchange(lBuffer, ivec2(h, i+3), g  >> 1u);
+    imageAtomicExchange(lBuffer, ivec2(h, i+4), b  >> 1u);
+    imageAtomicExchange(lBuffer, ivec2(h, i+5), L2 >> 1u);
+}
+
+void halveLSlotIndirect(int h, int i) {
+    uint c  = imageLoad(lBuffer, ivec2(h, i+6)).r;
+    uint r  = imageLoad(lBuffer, ivec2(h, i+7)).r;
+    uint g  = imageLoad(lBuffer, ivec2(h, i+8)).r;
+    uint b  = imageLoad(lBuffer, ivec2(h, i+9)).r;
+    uint L2 = imageLoad(lBuffer, ivec2(h, i+10)).r;
+    imageAtomicExchange(lBuffer, ivec2(h, i+6),  c  >> 1u);
+    imageAtomicExchange(lBuffer, ivec2(h, i+7),  r  >> 1u);
+    imageAtomicExchange(lBuffer, ivec2(h, i+8),  g  >> 1u);
+    imageAtomicExchange(lBuffer, ivec2(h, i+9),  b  >> 1u);
+    imageAtomicExchange(lBuffer, ivec2(h, i+10), L2 >> 1u);
+}
+
+uvec4 packRgbL2(vec3 rgb) {
+    // Clamp to avoid overflow from long emissive chains; 255*1024 fits in a uint
+    // under SAMPLE_CAP sums. .xyz = urgb, .w = L².
+    uvec3 urgb = uvec3(clamp(rgb, vec3(0.0), vec3(1024.0)) * 255.0);
+    uint  L    = (urgb.x + urgb.y + urgb.z) / 3u;
+    return uvec4(urgb, L * L);
+}
+
+void depositSampleDual(uint vid, vec3 dirRgb, vec3 indRgb) {
+    if (vid == 0u) return;
+
+    uvec4 d = packRgbL2(dirRgb);
+    uvec4 e = packRgbL2(indRgb);
+
+    uint h = vid % uint(lBufferWidth - 1) + 1u;
+
+    uvec3 candidate = uvec3(0xFFFFFFFFu, 0u, 0u);
+    for (int i = 0; i < lBufferStride * lBufferSlots; i += lBufferStride) {
+        imageAtomicCompSwap(lBuffer, ivec2(int(h), i), 0u, vid);
+        memoryBarrierImage();
+        uint id       = imageLoad(lBuffer, ivec2(int(h), i)).r;
+        uint slotTime = imageLoad(lBuffer, ivec2(int(h), i + 11)).r;
+
+        if (id != vid) {
+            if (slotTime < candidate.x)
+                candidate = uvec3(slotTime, id, uint(i));
+            continue;
+        }
+
+        if (!disableStaleReset && slotTime != 0u && slotTime + updateTime < time) {
+            resetLSlotDual(int(h), i, vid, d.xyz, d.w, e.xyz, e.w);
+            return;
+        }
+
+        // Halve each channel at its own SAMPLE_CAP. Counts diverge naturally
+        // since the caps differ — that's intentional, it's how the per-channel
+        // EMA blend rates are set.
+        uint dirCount = imageLoad(lBuffer, ivec2(int(h), i + 1)).r;
+        if (dirCount >= SAMPLE_CAP_DIRECT) halveLSlotDirect(int(h), i);
+        uint indCount = imageLoad(lBuffer, ivec2(int(h), i + 6)).r;
+        if (indCount >= SAMPLE_CAP_INDIRECT) halveLSlotIndirect(int(h), i);
+
+        // ---- FIREFLY CLAMP ---------------------------------------------------
+        // Re-read counts (they may have been halved above). Per-channel: if the
+        // incoming sample luma exceeds K × running mean (with absolute floor),
+        // rescale the urgb proportionally and recompute L². Skip when count is
+        // too low to estimate a meaningful mean (< 4 samples).
+        uint dirCountP = imageLoad(lBuffer, ivec2(int(h), i + 1)).r;
+        if (dirCountP > 4u) {
+            uint dRs = imageLoad(lBuffer, ivec2(int(h), i + 2)).r;
+            uint dGs = imageLoad(lBuffer, ivec2(int(h), i + 3)).r;
+            uint dBs = imageLoad(lBuffer, ivec2(int(h), i + 4)).r;
+            float meanL   = float(dRs + dGs + dBs) / float(3u * dirCountP);
+            float sampleL = float(d.x + d.y + d.z) / 3.0;
+            float thresh  = max(meanL * fireflyK, fireflyFloor);
+            if (sampleL > thresh) {
+                float scale = thresh / sampleL;
+                d.x = uint(float(d.x) * scale);
+                d.y = uint(float(d.y) * scale);
+                d.z = uint(float(d.z) * scale);
+                uint newL = (d.x + d.y + d.z) / 3u;
+                d.w = newL * newL;
+            }
+        }
+        uint indCountP = imageLoad(lBuffer, ivec2(int(h), i + 6)).r;
+        if (indCountP > 4u) {
+            uint iRs = imageLoad(lBuffer, ivec2(int(h), i + 7)).r;
+            uint iGs = imageLoad(lBuffer, ivec2(int(h), i + 8)).r;
+            uint iBs = imageLoad(lBuffer, ivec2(int(h), i + 9)).r;
+            float meanL   = float(iRs + iGs + iBs) / float(3u * indCountP);
+            float sampleL = float(e.x + e.y + e.z) / 3.0;
+            float thresh  = max(meanL * fireflyK, fireflyFloor);
+            if (sampleL > thresh) {
+                float scale = thresh / sampleL;
+                e.x = uint(float(e.x) * scale);
+                e.y = uint(float(e.y) * scale);
+                e.z = uint(float(e.z) * scale);
+                uint newL = (e.x + e.y + e.z) / 3u;
+                e.w = newL * newL;
+            }
+        }
+
+        // Direct accumulate.
+        imageAtomicAdd(lBuffer, ivec2(int(h), i + 1), 1u);
+        imageAtomicAdd(lBuffer, ivec2(int(h), i + 2), d.x);
+        imageAtomicAdd(lBuffer, ivec2(int(h), i + 3), d.y);
+        imageAtomicAdd(lBuffer, ivec2(int(h), i + 4), d.z);
+        imageAtomicAdd(lBuffer, ivec2(int(h), i + 5), d.w);
+
+        // Indirect accumulate.
+        imageAtomicAdd(lBuffer, ivec2(int(h), i + 6), 1u);
+        imageAtomicAdd(lBuffer, ivec2(int(h), i + 7), e.x);
+        imageAtomicAdd(lBuffer, ivec2(int(h), i + 8), e.y);
+        imageAtomicAdd(lBuffer, ivec2(int(h), i + 9), e.z);
+        imageAtomicAdd(lBuffer, ivec2(int(h), i + 10), e.w);
+
+        imageAtomicExchange(lBuffer, ivec2(int(h), i + 11), time);
+        return;
+    }
+
+    if (candidate.x != 0xFFFFFFFFu) {
+        resetLSlotDual(int(h), int(candidate.z), vid, d.xyz, d.w, e.xyz, e.w);
+    }
+}
+
+// ---------------- nBuffer refined-normal lookup (read-only) ------------------
+
+vec3 lookupNormal(uint vid, vec3 rayDir) {
+    uint nHash = vid % uint(nBufferWidth - 1) + 1u;
+    for (int s = 0; s < nBufferSlots; s++) {
+        uint owner = imageLoad(nBuffer, ivec2(int(nHash), s * nBufferStride)).r;
+        if (owner == vid) {
+            uint nf = imageLoad(nBuffer, ivec2(int(nHash), s * nBufferStride + 1)).r;
+            if (nf != 0u) return normalize(UnpackNormal(nf));
+        }
+    }
+    // Face-normal fallback, same heuristic ray.frag uses.
+    vec3 adir = abs(rayDir);
+    if (adir.x > adir.y && adir.x > adir.z) return vec3(-sign(rayDir.x), 0.0, 0.0);
+    if (adir.y > adir.z)                    return vec3(0.0, -sign(rayDir.y), 0.0);
+    return vec3(0.0, 0.0, -sign(rayDir.z));
+}
+
+// ---------------- main --------------------------------------------------------
+
+void main() {
+    uint t = gl_GlobalInvocationID.x;
+    if (t >= rayWindowSize) return;
+
+    uint slot = (rayWindowBase + t) % RAY_CAPACITY;
+    Ray r = rays[slot];
+
+    if (r.bounce_idx >= MAX_BOUNCES) return;
+
+    octreeLength = 1u << octreeDepth;
+
+    // Case 1: miss — add skybox contribution and terminate. Skybox is always
+    // attributed to INDIRECT — it's environment lighting, never a direct sample
+    // of a known light source. (Bounce-0 misses are rare numerical-jitter
+    // corner cases and also belong in indirect.)
+    if (r.hit_voxel_id == 0u) {
+        r.indirect_light += texture(skybox, r.direction).rgb * r.throughput;
+        depositSampleDual(r.primary_voxel_id, r.direct_light, r.indirect_light);
+        r.bounce_idx = MAX_BOUNCES;  // mark dead; no survivor append
+        rays[slot] = r;
+        return;
+    }
+
+    // Case 2: hit — add emissive, register to NEE list, NEE-sample, then
+    // build the survivor.
+    Material mat = material[r.hit_material];
+
+    // r.origin was overwritten by trace.comp to carry hit lattice position;
+    // r._pad0 holds the voxel's lattice extent (size).
+    uvec3 hitPos    = uvec3(r.origin);
+    uint  hitSize   = uint(r._pad0);
+    vec3  normal    = lookupNormal(r.hit_voxel_id, r.direction);
+
+    if (mat.emissive) {
+        // Standard direct-on-hit emissive contribution. Firefly-clamped so a
+        // single low-PDF path can't overwhelm the EMA. Channel routing:
+        //   bounce 0 → DIRECT (we hit a light directly with the primary ray)
+        //   bounce>0 → INDIRECT (a bounce path landed on a light)
+        vec3 emit = min(mat.color.xyz * mat.emissiveIntensity * r.throughput, vec3(20.0));
+        if (r.bounce_idx == 0u) r.direct_light   += emit;
+        else                    r.indirect_light += emit;
+
+        // Register this voxel in the emissive list for future NEE samples.
+        // PRIMARY HITS ONLY: discovery on bounce 0 keeps the camera-visible
+        // light set up to date and removes the bulk of atomic-CompSwap traffic
+        // (deep bounces hammered the same hot lights, with no useful info
+        // gained — those voxels were already registered by primary rays).
+        // Persistent claim — never reset. ((vid * golden) ^ shifts) hash is the
+        // same scheme schedule.comp uses for its claim map.
+        if (r.bounce_idx == 0u) {
+            uint vid = r.hit_voxel_id;
+            uint hh = vid; hh ^= hh >> 16; hh *= 0x7feb352du; hh ^= hh >> 15;
+            uint claimH = hh % EMISSIVE_CLAIM_W;
+            for (int p = 0; p < EMISSIVE_CLAIM_PROBES; p++) {
+                uint prev = imageAtomicCompSwap(emissiveClaim, ivec2(int(claimH), p), 0u, vid);
+                if (prev == vid) break;            // already known — done
+                if (prev == 0u) {                  // we won the claim — append
+                    uint idx = atomicAdd(emissive_count, 1u);
+                    if (idx < EMISSIVE_CAPACITY) {
+                        EmissiveVoxel e;
+                        e.emission = mat.color.xyz * mat.emissiveIntensity;
+                        e.voxel_id = vid;
+                        e.pos      = hitPos;
+                        e.size     = max(hitSize, 1u);
+                        emissives[idx] = e;
+                    } else {
+                        // Hit the cap — undo the count bump so future tries don't
+                        // see a bogus index. The claim slot is already taken,
+                        // which is fine; we just won't try to add this vid again.
+                        atomicAdd(emissive_count, 0xFFFFFFFFu);   // -1
+                    }
+                    break;
+                }
+                // collision: try next probe
+            }
+        }
+    }
+
+    // ---- NEE: direct light sample at this hit ---------------------------------
+    // Skip on emissive surfaces (they ARE lights — sampling onto themselves
+    // is redundant and biased). Skip on deeper bounces — past bounce 1 the
+    // BRDF path converges fast on its own and the shadow ray is the most
+    // expensive thing in shade.comp. Skip when the registry is empty (frame 0
+    // before any primary emissive hit has been registered).
+    if (!mat.emissive && r.bounce_idx < 2u && emissive_count > 0u) {
+        uint nLights = min(emissive_count, EMISSIVE_CAPACITY);
+
+        // RIS (Resampled Importance Sampling) over RIS_M uniform candidates,
+        // resampled with target ∝ luminance(emission) × size² (a cheap
+        // proxy for the light's "power"). Variance falls roughly with the
+        // mean/max ratio of light powers — equal-power scenes degrade to
+        // uniform, hot-light scenes get a large speedup. Same construction
+        // ReSTIR uses; we just pick once per shade instead of caching reservoirs.
+        const int RIS_M = 4;
+        float wSum = 0.0;
+        uint  chosen = 0u;
+        float chosenTarget = 0.0;
+        for (int k = 0; k < RIS_M; k++) {
+            uint pick = uint(rand(r.rng_state) * float(nLights));
+            if (pick >= nLights) pick = nLights - 1u;
+            EmissiveVoxel cand = emissives[pick];
+            float lum    = max(dot(cand.emission, vec3(0.2126, 0.7152, 0.0722)), 1e-6);
+            float target = lum * float(cand.size * cand.size);
+            wSum += target;
+            // Reservoir update: replace chosen with prob = target/wSum.
+            if (rand(r.rng_state) * wSum < target) {
+                chosen = pick;
+                chosenTarget = target;
+            }
+        }
+        float avgTarget = wSum / float(RIS_M);
+        EmissiveVoxel light = emissives[chosen];
+
+        // Pick one of 6 faces uniformly. Half land on back faces (cos_y<=0)
+        // and contribute zero — that's accounted for in the 1/6 PDF factor.
+        uint faceIdx = uint(rand(r.rng_state) * 6.0);
+        if (faceIdx >= 6u) faceIdx = 5u;
+        vec3 fNormal, fT, fB;
+        if (faceIdx < 2u) {
+            fNormal = vec3((faceIdx == 0u) ? 1.0 : -1.0, 0.0, 0.0);
+            fT = vec3(0.0, 1.0, 0.0);  fB = vec3(0.0, 0.0, 1.0);
+        } else if (faceIdx < 4u) {
+            fNormal = vec3(0.0, (faceIdx == 2u) ? 1.0 : -1.0, 0.0);
+            fT = vec3(1.0, 0.0, 0.0);  fB = vec3(0.0, 0.0, 1.0);
+        } else {
+            fNormal = vec3(0.0, 0.0, (faceIdx == 4u) ? 1.0 : -1.0);
+            fT = vec3(1.0, 0.0, 0.0);  fB = vec3(0.0, 1.0, 0.0);
+        }
+
+        float halfSize = float(light.size) * 0.5;
+        vec3 fCenter = vec3(light.pos) + vec3(halfSize);
+        vec3 lightPos = fCenter
+                      + fNormal * halfSize
+                      + (rand(r.rng_state) - 0.5) * 2.0 * halfSize * fT
+                      + (rand(r.rng_state) - 0.5) * 2.0 * halfSize * fB;
+
+        // Origin offset matches the survivor build below — surface point
+        // pushed out along the geometric normal so we don't self-shadow.
+        vec3 shadingPoint = vec3(hitPos) + vec3(0.5) + normal;
+        vec3 lightDir = lightPos - shadingPoint;
+        float dist2 = dot(lightDir, lightDir);
+        float dist  = sqrt(dist2);
+        if (dist > 1e-3 && chosenTarget > 0.0) {
+            lightDir /= dist;
+
+            float cosX = max(dot(normal,    lightDir), 0.0);
+            float cosY = max(dot(-lightDir, fNormal),  0.0);
+
+            if (cosX > 0.0 && cosY > 0.0) {
+                ray_t shadow;
+                shadow.origin            = shadingPoint;
+                shadow.direction         = lightDir;
+                shadow.inverted_direction = 1.0 / lightDir;
+
+                if (RaycastVisibilityToVoxel(shadow, light.voxel_id)) {
+                    // EvaluateBRDF returns BRDF * cos_x already; we still owe
+                    // the geometric-term cos_y / dist² and the inverse PDF.
+                    vec3 brdfCosX = EvaluateBRDF(r.direction, lightDir, normal,
+                                                 mat.color.xyz, mat.roughness, mat.metallic, mat.specular);
+                    float lightArea = 6.0 * float(light.size) * float(light.size);
+                    // RIS estimator: replace uniform 1/N PDF with
+                    //   marginal_pdf ≈ chosenTarget / (N · avgTarget)
+                    // i.e. multiply contribution by N · avgTarget / chosenTarget.
+                    // Equal-power lights: avgTarget == chosenTarget → reduces
+                    // to the old `* N` (uniform). Power-weighted otherwise.
+                    float risMul = float(nLights) * avgTarget / max(chosenTarget, 1e-6);
+                    float geom = cosY / max(dist2, 1e-6);
+                    vec3 contrib = light.emission * brdfCosX * geom * lightArea * risMul;
+                    contrib = min(contrib, vec3(20.0));   // firefly clamp
+                    vec3 weighted = r.throughput * contrib;
+                    // NEE channel routing: bounce 0 = direct light at primary
+                    // hit point; bounce 1 = direct light one-bounce-away,
+                    // which is INDIRECT from V's perspective.
+                    if (r.bounce_idx == 0u) r.direct_light   += weighted;
+                    else                    r.indirect_light += weighted;
+                }
+            }
+        }
+    }
+
+    // If we're at the last bounce we'd allow, no need to build a survivor.
+    // Just deposit what we have and kill the ray.
+    if (r.bounce_idx + 1u >= MAX_BOUNCES) {
+        depositSampleDual(r.primary_voxel_id, r.direct_light, r.indirect_light);
+        r.bounce_idx = MAX_BOUNCES;
+        rays[slot] = r;
+        return;
+    }
+
+    // BRDF branching — VNDF sampler for smooth metals, cosine-weighted diffuse
+    // otherwise. VNDF needs V (toward viewer) up front so the sampler can
+    // bias toward visible microfacets.
+    bool useGGX = mat.metallic * (1.0 - mat.roughness) > 0.5;
+    vec3 sampleDir;
+    vec3 brdfThroughput;
+    uint rng = r.rng_state;
+    if (useGGX) {
+        vec3 V  = -r.direction;
+        vec3 H  = sampleGGXVNDF(normal, V, mat.roughness, rng);
+        sampleDir = reflect(r.direction, H);
+        if (dot(sampleDir, normal) <= 0.0) {
+            // Below-horizon sample (rare with VNDF — happens at extreme
+            // grazing). Fall back to diffuse so the path doesn't die.
+            sampleDir = normalize(normal + RandomDirection(rng));
+            brdfThroughput = EvaluateBRDF(r.direction, sampleDir, normal,
+                                          mat.color.xyz, mat.roughness, mat.metallic, mat.specular);
+        } else {
+            vec3 F0 = mix(vec3(0.04), mat.color.xyz, mat.metallic);
+            brdfThroughput = ggxThroughput(normal, V, sampleDir, H, mat.roughness, F0);
+        }
+    } else {
+        sampleDir = normalize(normal + RandomDirection(rng));
+        brdfThroughput = EvaluateBRDF(r.direction, sampleDir, normal,
+                                      mat.color.xyz, mat.roughness, mat.metallic, mat.specular);
+    }
+    r.rng_state = rng;
+
+    vec3 newThroughput = r.throughput * brdfThroughput;
+
+    // Russian roulette. Before RR_START we always survive; past it we kill with
+    // probability (1-p) and boost throughput by 1/p to stay unbiased.
+    if (r.bounce_idx + 1u >= RR_START_BOUNCE) {
+        float p = clamp(max(newThroughput.r, max(newThroughput.g, newThroughput.b)), 0.05, 0.95);
+        float xi = rand(r.rng_state);
+        if (xi > p) {
+            depositSampleDual(r.primary_voxel_id, r.direct_light, r.indirect_light);
+            r.bounce_idx = MAX_BOUNCES;
+            rays[slot] = r;
+            return;
+        }
+        newThroughput /= p;
+    }
+
+    // Survive: build survivor state and append at ring_head.
+    r.origin             = vec3(hitPos) + vec3(0.5) + normal;
+    r.direction          = sampleDir;
+    r.throughput         = newThroughput;
+    r.bounce_idx         = r.bounce_idx + 1u;
+    r.hit_voxel_id       = 0u;
+    r.hit_material       = 0u;
+
+    // Mark the CURRENT slot dead so if trace re-reads it next iteration
+    // without compaction it gets skipped. Then append a fresh live copy.
+    uint dead_bounce = r.bounce_idx;
+    Ray survivor = r;
+    r.bounce_idx = MAX_BOUNCES;
+    rays[slot] = r;
+
+    survivor.bounce_idx = dead_bounce;
+    uint newSlot = atomicAdd(ring_head, 1u);
+    rays[newSlot % RAY_CAPACITY] = survivor;
+}

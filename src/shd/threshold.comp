@@ -1,0 +1,79 @@
+#version 430 core
+// =============================================================================
+// threshold.comp — derive next-frame importance thresholds from the histogram.
+// =============================================================================
+// Single workgroup. One thread does a serial reverse-cumulative scan over the
+// 256-bin histogram populated by rank.comp this frame. Finds the bin index
+// where the top `topFraction` fraction of voxels lives (→ tHigh) and the bin
+// where the next `midFraction` lives (→ tMid). Writes both back into the
+// RankStats SSBO; rank.comp reads them at the START of the next frame.
+//
+// This replaces the CPU readback of min/max + host-side threshold derivation.
+// Net win: zero CPU sync per frame (the previous readback was a measured
+// pipeline stall).
+//
+// Why single-threaded over 256 bins: a serial scan is ~256 ops, microseconds
+// on the GPU. A parallel prefix-sum here would dispatch more wavefronts than
+// the work justifies and complicate the code with no measurable speedup.
+//
+// Frame-0 fallback: an empty histogram (no candidates) writes +INF / -INF
+// sentinel thresholds so rank.comp drops every voxel into the mid tier,
+// matching the host-side fallback the previous design used.
+// =============================================================================
+
+layout(local_size_x = 1) in;
+
+uniform float topFraction;  // fraction of candidates to receive 2 samples (default 0.30)
+uniform float midFraction;  // fraction to receive 1 sample (default 0.40)
+
+#include "wavefront.glsl"
+
+void main() {
+    // Total voxel count = sum of all histogram bins. Could equivalently use
+    // stats_count, but recomputing keeps this pass independent of rank's
+    // atomicAdd-on-counter ordering relative to the histogram bumps.
+    uint total = 0u;
+    for (uint b = 0u; b < HISTOGRAM_BINS; b++) total += histogram[b];
+
+    if (total == 0u) {
+        // No candidates this frame — clamp thresholds to extremes so rank.comp
+        // next frame falls into the safe fallback (every visible voxel gets
+        // at least minSamples).
+        thigh_bits = floatBitsToUint( 1.0 / 0.0);  // +INF
+        tmid_bits  = floatBitsToUint(-1.0 / 0.0);  // -INF
+        return;
+    }
+
+    // Clamp the fraction inputs the host might have set out of range.
+    float topF = clamp(topFraction, 0.0, 1.0);
+    float midF = clamp(midFraction, 0.0, 1.0 - topF);
+
+    uint topCount    = uint(topF              * float(total));
+    uint topMidCount = uint((topF + midF)     * float(total));
+
+    // Reverse cumulative scan: walk bins high→low, summing the count seen so
+    // far. The first bin where cumAbove crosses each target percentile gives
+    // us the threshold bin index.
+    uint cumAbove   = 0u;
+    uint thigh_bin  = HISTOGRAM_BINS;   // sentinel "not yet reached"
+    uint tmid_bin   = HISTOGRAM_BINS;
+    for (int b = int(HISTOGRAM_BINS) - 1; b >= 0; b--) {
+        cumAbove += histogram[b];
+        if (thigh_bin == HISTOGRAM_BINS && cumAbove >= topCount)    thigh_bin = uint(b);
+        if (tmid_bin  == HISTOGRAM_BINS && cumAbove >= topMidCount) tmid_bin  = uint(b);
+        if (thigh_bin != HISTOGRAM_BINS && tmid_bin != HISTOGRAM_BINS) break;
+    }
+    // If a target is so small that no bin satisfies it (e.g. topF=0), drop
+    // back to the topmost bin so the threshold is "above the highest imp"
+    // and no voxel makes the cut.
+    if (thigh_bin == HISTOGRAM_BINS) thigh_bin = HISTOGRAM_BINS - 1u;
+    if (tmid_bin  == HISTOGRAM_BINS) tmid_bin  = HISTOGRAM_BINS - 1u;
+
+    // Bin b spans imp ∈ [b/256, (b+1)/256). rank.comp uses `imp >= tHigh`,
+    // so setting tHigh = bin/256 puts the entire chosen bin into the top tier.
+    float thigh = float(thigh_bin) / float(HISTOGRAM_BINS);
+    float tmid  = float(tmid_bin)  / float(HISTOGRAM_BINS);
+
+    thigh_bits = floatBitsToUint(thigh);
+    tmid_bits  = floatBitsToUint(tmid);
+}

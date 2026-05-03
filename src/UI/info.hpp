@@ -1,6 +1,7 @@
 #pragma once
 
 #include "widget.hpp"
+#include "../renderer/profiler.hpp"
 
 class Info : public Widget
 {
@@ -20,7 +21,9 @@ public:
     void AddLog(const char* fmt, ...) ;
     void DrawLog();
 
-    core::DebugInfo *data;
+    const Profiler        *profiler_ = nullptr;
+    const core::FrameStats *stats_   = nullptr;
+
     std::vector<float> ms_plot;
     std::vector<float> gpu_ms_plot;
     std::vector<float> cpu_ms_plot;
@@ -29,8 +32,8 @@ public:
     double cpu_accum_ms = 0;
     double max_ms = 0;
     const int max_samples = 200;
-    
-    void SetProfilerData(core::DebugInfo *data_);
+
+    void setData(const Profiler *profiler, const core::FrameStats *stats);
     void DrawProfiler();
 
     void DrawMemUsage();

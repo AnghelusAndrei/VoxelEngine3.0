@@ -1,0 +1,145 @@
+#version 430 core
+// =============================================================================
+// rank.comp — importance-aware sample budgeting for the candidate list.
+// =============================================================================
+// One thread per candidate. For each visible voxel:
+//   1. Read its pixel coverage from sampleCountMap (final count after
+//      schedule.comp finished — every pixel-arrival was an atomicAdd).
+//   2. Read its INDIRECT-channel variance from the lBuffer (last-frame state,
+//      since shade.comp writes lBuffer AFTER this pass — we're reading "what
+//      the user is currently looking at, with the GI noise level it had last
+//      frame"). Indirect variance is the dominant noise signal — direct is
+//      tamed by RIS NEE in 2-3 frames, so its variance is near-zero on
+//      converged voxels and conveys no useful budget info.
+//   3. Compute importance = wPixels * pixels_norm + wVariance * variance_norm,
+//      both normalised to roughly [0, 1] for predictable threshold tuning.
+//   4. Compare to per-frame thresholds (read from RankStats SSBO, written by
+//      threshold.comp at the END of the previous frame — fully GPU-derived,
+//      no host readback):
+//         imp >= tHigh           → emit 2 entries to shade_list (top tier)
+//         tMid <= imp < tHigh    → emit 1 entry  (mid tier)
+//         imp <  tMid            → minSamples (defaults to 1; 0 = strict drop)
+//   5. Bump histogram[bin(imp)] so threshold.comp can re-derive the
+//      thresholds for the NEXT frame.
+//   6. Atomic-update min/max in rank_stats (debug / display only — no longer
+//      drives scheduling).
+//
+// On frame 0 the lBuffer is empty and thresholds default to (+inf, -inf), so
+// every visible voxel falls into the mid tier and gets exactly one sample.
+// From frame 1 onward, threshold.comp's percentile-derived thresholds apply.
+// =============================================================================
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0, r32ui) readonly uniform uimage2D lBuffer;
+layout(binding = 1, r32ui) readonly uniform uimage2D sampleCountMap;
+
+uniform int   lBufferWidth;
+uniform int   lBufferSlots;
+uniform float wPixels;        // weight on coverage (default 0.3)
+uniform float wVariance;      // weight on variance  (default 0.7)
+uniform float pixelsNorm;     // pixels saturate at this count (default 100)
+uniform float varianceNorm;   // variance saturates at this raw value (default 10000)
+uniform int   minSamples;     // floor for the bottom tier. 1 = every visible voxel
+                              // gets at least 1 sample (recommended — avoids
+                              // stale-reset starving low-importance slots).
+                              // 0 = strict 30/40/30 drop; only sensible when
+                              // candidate_count > shadeBudget and you actually
+                              // need to shed work.
+uniform uint  shadeBudget;    // hard cap on emitted shade_list entries
+
+#include "wavefront.glsl"
+
+// Pull the INDIRECT-channel variance for `vid` out of the lBuffer hash. Slots
+// store dir/ind separately; we use indirect because direct is dominated by
+// NEE and converges fast — its variance flattens out and stops being a useful
+// noise signal. Indirect variance tracks GI roughness, which is the actual
+// driver of perceived noise.
+//
+// Probe layout: stride = 12 (lBufferStride from wavefront.glsl). Indices:
+//   +0  vid               +6  ind_count
+//   +1  dir_count         +7  ind_r_sum
+//   +2  dir_r_sum         +8  ind_g_sum
+//   +3  dir_g_sum         +9  ind_b_sum
+//   +4  dir_b_sum         +10 ind_L²_sum
+//   +5  dir_L²_sum        +11 last_time
+float lookupIndirectVariance(uint vid) {
+    uint h = vid % uint(lBufferWidth - 1) + 1u;
+    for (int s = 0; s < lBufferSlots; s++) {
+        int i = s * lBufferStride;
+        uint owner = imageLoad(lBuffer, ivec2(int(h), i)).r;
+        if (owner == 0u) return 0.0;       // not present yet
+        if (owner != vid) continue;        // collision, keep probing
+
+        uint c = imageLoad(lBuffer, ivec2(int(h), i + 6)).r;  // ind_count
+        if (c < 2u) return 0.0;            // need at least 2 samples for variance
+        uint rs  = imageLoad(lBuffer, ivec2(int(h), i + 7)).r;
+        uint gs  = imageLoad(lBuffer, ivec2(int(h), i + 8)).r;
+        uint bs  = imageLoad(lBuffer, ivec2(int(h), i + 9)).r;
+        uint l2s = imageLoad(lBuffer, ivec2(int(h), i + 10)).r;
+
+        float fc = float(c);
+        float meanL  = float(rs + gs + bs) / (3.0 * fc);
+        float meanL2 = float(l2s) / fc;
+        return max(meanL2 - meanL * meanL, 0.0);
+    }
+    return 0.0;
+}
+
+void main() {
+    uint t = gl_GlobalInvocationID.x;
+    if (t >= candidate_count || t >= CANDIDATE_CAPACITY) return;
+
+    Candidate cand = candidates[t];
+
+    // Pixel coverage: final atomic value at the canonical claim slot. Always
+    // >= 1 because the first-claimer thread incremented it.
+    uint pixels = imageLoad(sampleCountMap, ivec2(int(cand.claim_h), int(cand.claim_p))).r;
+
+    // Indirect-channel variance from the previous frame.
+    float var = lookupIndirectVariance(cand.vid);
+
+    // Both metrics live on different scales — pixels in [1, ~1000+], variance
+    // in [0, ~65000]. Normalise via saturation points so weight knobs operate
+    // on comparable [0, 1] quantities.
+    float pn = clamp(float(pixels) / max(pixelsNorm,   1.0), 0.0, 1.0);
+    float vn = clamp(var          / max(varianceNorm, 1.0), 0.0, 1.0);
+    float imp = wPixels * pn + wVariance * vn;
+
+    // Read GPU-derived thresholds. These were written by threshold.comp at the
+    // end of the previous frame; on frame 0 they're +INF/-INF (initialized
+    // host-side), causing every voxel to fall into the mid tier.
+    float tHigh = uintBitsToFloat(thigh_bits);
+    float tMid  = uintBitsToFloat(tmid_bits);
+
+    int samples;
+    if      (imp >= tHigh) samples = 2;
+    else if (imp >= tMid)  samples = 1;
+    else                   samples = minSamples;
+
+    // Emit shade_list entries with multiplicity. Each entry is identical —
+    // duplicates land in the ring as separate shading rays sharing the same
+    // primary voxel slot, depositing into the same lBuffer EMA.
+    for (int i = 0; i < samples; i++) {
+        uint idx = atomicAdd(shade_count, 1u);
+        if (idx < shadeBudget) {
+            shade_list[idx] = uvec2(cand.vid, cand.pix_index);
+        } else {
+            atomicAdd(shade_count, 0xFFFFFFFFu);  // -1; budget exhausted
+            break;
+        }
+    }
+
+    // ---- Histogram for next-frame threshold derivation ----------------------
+    // imp is already clamped into [0, 1]. Map to [0, 256) and clamp the right
+    // edge so imp == 1.0 doesn't index past the end of the histogram array.
+    uint bin = uint(imp * float(HISTOGRAM_BINS));
+    if (bin >= HISTOGRAM_BINS) bin = HISTOGRAM_BINS - 1u;
+    atomicAdd(histogram[bin], 1u);
+
+    // ---- Min/max debug stats (no longer drives scheduling) ------------------
+    uint impBits = floatBitsToUint(imp);
+    atomicMin(min_imp_bits, impBits);
+    atomicMax(max_imp_bits, impBits);
+    atomicAdd(stats_count, 1u);
+}
