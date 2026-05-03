@@ -27,6 +27,11 @@ layout(binding = 1, r32ui) readonly  uniform uimage2D nBuffer;  // written by ac
 // frames — once a light is claimed, it stays. Same atomicCompSwap pattern as
 // schedule.comp's claimMap.
 layout(binding = 2, r32ui) coherent uniform uimage2D emissiveClaim;
+// ReSTIR DI per-voxel reservoir store. Same hash family as lBuffer (vid → row),
+// 8 uints per slot. See rBuffer comment in wavefront.glsl for slot layout.
+// Read-write because every shade-bounce-0 invocation may load a stored
+// reservoir, combine it with new candidates + neighbours, and write back.
+layout(binding = 3, r32ui) coherent uniform uimage2D rBuffer;
 
 uniform usamplerBuffer octreeTexture;
 uniform uint octreeDepth;
@@ -38,6 +43,8 @@ uniform int  lBufferWidth;
 uniform int  lBufferSlots;
 uniform int  nBufferWidth;
 uniform int  nBufferSlots;
+uniform int  rBufferWidth;     // = lBufferWidth in practice; kept distinct in case we resize independently
+uniform int  rBufferSlots;     // = RBUFFER_SLOTS from renderer.hpp
 uniform uint time;
 uniform uint updateTime;
 
@@ -62,6 +69,15 @@ uniform bool disableStaleReset;
 // fireflies, loose enough to track real lighting changes within ~3 frames.
 uniform float fireflyK;
 uniform float fireflyFloor;
+
+// ReSTIR DI knobs (see core.hpp::FrameConfig for descriptions).
+uniform bool  restirEnabled;
+uniform int   restirM;
+uniform bool  restirTemporalEnabled;
+uniform bool  restirSpatialEnabled;
+uniform int   restirSpatialNeighbors;
+uniform float restirSpatialRadius;
+uniform int   restirMaxM;
 
 #define nBufferStride 3
 
@@ -258,6 +274,270 @@ vec3 lookupNormal(uint vid, vec3 rayDir) {
     return vec3(0.0, 0.0, -sign(rayDir.z));
 }
 
+// =============================================================================
+// ReSTIR DI helpers — per-voxel reservoirs in rBuffer.
+// =============================================================================
+// "Voxel-space ReSTIR DI" instead of the classic per-pixel variant: the
+// wavefront pipeline shades unique voxels (deduplicated by schedule.comp), not
+// pixels — there is no stable per-pixel reservoir home. One reservoir per
+// visible voxel (hashed by vid like lBuffer) gives:
+//   * Temporal reuse for free — same vid next frame finds the same slot.
+//   * Spatial reuse via positionally-perturbed vids (voxelKey is position-only,
+//     so a neighbour's vid is computable without an octree query).
+//   * Cache locality with the lBuffer EMA — both share the (vid % width) row.
+// Memory is fixed (~rBufferWidth × slots × 32 B); shadow ray cost stays at
+// 1/shade since we trace ONLY the chosen sample, never the candidates.
+//
+// Target distribution choice (Form B):
+//   phat = luminance(Le) × cos_y × area / dist²              (cos_x gates only)
+// We omit cos_x from phat so that, on spatial reuse, a sample that crosses
+// the new shading point's horizon (cos_x ≤ 0 here) is rejected outright via
+// computeTargetPdf returning 0, instead of contributing a 1/cos_x factor in
+// the contribution which spikes at grazing angles.
+// =============================================================================
+
+struct Reservoir {
+    uint  light_idx;     // index into emissives[]
+    uint  light_vid;     // emissives[light_idx].voxel_id at write time (validation)
+    uint  face_seed;     // packed face_idx (4b) + uv_x (14b) + uv_y (14b)
+    float Wsum;          // sum of RIS weights w_i
+    uint  M;             // sample count (capped at restirMaxM on reuse)
+    float target_pdf;    // phat(chosen) at the writing shading point
+};
+
+void rInit(out Reservoir r) {
+    r.light_idx  = 0u;
+    r.light_vid  = 0u;
+    r.face_seed  = 0u;
+    r.Wsum       = 0.0;
+    r.M          = 0u;
+    r.target_pdf = 0.0;
+}
+
+// Stream-update with one new candidate. Standard WRS: replace the running
+// pick with prob w/Wsum.
+void rUpdate(inout Reservoir r, uint light_idx, uint light_vid, uint face_seed,
+             float target, float w, inout uint rng) {
+    if (w <= 0.0) {
+        // Zero-weight candidate still counts toward M (unbiased) but can't be
+        // chosen.
+        r.M += 1u;
+        return;
+    }
+    r.Wsum += w;
+    r.M    += 1u;
+    if (rand(rng) * r.Wsum < w) {
+        r.light_idx  = light_idx;
+        r.light_vid  = light_vid;
+        r.face_seed  = face_seed;
+        r.target_pdf = target;
+    }
+}
+
+// Combine reservoir b into a, where target_at_us = phat(b.chosen) re-evaluated
+// at OUR shading point (the geometric jacobian — identical to b.target_pdf for
+// temporal reuse since the shading point matches). Standard ReSTIR combiner:
+//   weight = phat_us · b.W · b.M = phat_us · b.Wsum / b.target_pdf
+// (the M's cancel because b.W has 1/b.M in it).
+//
+// IMPORTANT: when b's chosen sample is invalid at our point (target_at_us = 0,
+// e.g. spatial neighbour whose chosen light is below our horizon) we SKIP
+// instead of bumping a.M. The "bump M without Wsum" form is Bitterli's
+// commonly-used biased variant — it shrinks W = Wsum/(M·phat) without
+// physical justification and noticeably darkens shadowed regions. Skipping is
+// the cleanest unbiased option for our setup.
+void rCombine(inout Reservoir a, Reservoir b, float target_at_us, inout uint rng) {
+    if (b.M == 0u || b.target_pdf <= 0.0 || target_at_us <= 0.0) {
+        return;
+    }
+    float w = target_at_us * b.Wsum / b.target_pdf;
+    a.Wsum += w;
+    a.M    += b.M;
+    if (rand(rng) * a.Wsum < w) {
+        a.light_idx  = b.light_idx;
+        a.light_vid  = b.light_vid;
+        a.face_seed  = b.face_seed;
+        a.target_pdf = target_at_us;
+    }
+}
+
+// Cap a reservoir's history at maxM. Both M *and* Wsum must scale proportionally
+// — capping M alone leaves Wsum unbounded, which makes W = Wsum/(M·phat) drift
+// upward by a factor of (true_M / capped_M) every frame the cap triggers, and
+// after ~10 frames the temporal compounding blows the direct-lighting term out.
+// (RTXDI / Falcor implement the cap exactly this way.)
+void rCapHistory(inout Reservoir r, uint maxM) {
+    if (r.M > maxM && maxM > 0u) {
+        r.Wsum = r.Wsum * float(maxM) / float(r.M);
+        r.M    = maxM;
+    }
+}
+
+// ---- face_seed packing ------------------------------------------------------
+// 4 bits face index + 14 bits each for uv = 32 bits exactly. uv quantisation
+// 1/16383 ≈ 0.006% is well below noise threshold for area-light sampling.
+uint packFaceSeed(uint faceIdx, float u, float v) {
+    uint ui = uint(clamp(u, 0.0, 0.9999) * 16383.0);
+    uint vi = uint(clamp(v, 0.0, 0.9999) * 16383.0);
+    return (faceIdx & 0xFu) | ((ui & 0x3FFFu) << 4u) | ((vi & 0x3FFFu) << 18u);
+}
+void unpackFaceSeed(uint seed, out uint faceIdx, out float u, out float v) {
+    faceIdx = seed & 0xFu;
+    u = float((seed >> 4u)  & 0x3FFFu) / 16383.0;
+    v = float((seed >> 18u) & 0x3FFFu) / 16383.0;
+}
+
+// Reconstruct (sample point, face normal) from the face_seed + light geometry.
+// Same six-face uniform construction as the legacy NEE block — two reservoirs
+// with the same face_seed and light_idx evaluate to the same surface point.
+void unpackLightSamplePoint(uint face_seed, uvec3 lightPos, uint lightSize,
+                            out vec3 sampleP, out vec3 sampleN) {
+    uint faceIdx; float u; float v;
+    unpackFaceSeed(face_seed, faceIdx, u, v);
+    if (faceIdx > 5u) faceIdx = 5u;
+
+    vec3 fNormal, fT, fB;
+    if (faceIdx < 2u) {
+        fNormal = vec3((faceIdx == 0u) ? 1.0 : -1.0, 0.0, 0.0);
+        fT = vec3(0.0, 1.0, 0.0);  fB = vec3(0.0, 0.0, 1.0);
+    } else if (faceIdx < 4u) {
+        fNormal = vec3(0.0, (faceIdx == 2u) ? 1.0 : -1.0, 0.0);
+        fT = vec3(1.0, 0.0, 0.0);  fB = vec3(0.0, 0.0, 1.0);
+    } else {
+        fNormal = vec3(0.0, 0.0, (faceIdx == 4u) ? 1.0 : -1.0);
+        fT = vec3(1.0, 0.0, 0.0);  fB = vec3(0.0, 1.0, 0.0);
+    }
+    float halfSize = float(lightSize) * 0.5;
+    vec3 fCenter   = vec3(lightPos) + vec3(halfSize);
+    sampleP = fCenter
+            + fNormal   * halfSize
+            + (u - 0.5) * 2.0 * halfSize * fT
+            + (v - 0.5) * 2.0 * halfSize * fB;
+    sampleN = fNormal;
+}
+
+// ---- target distribution phat(x) -------------------------------------------
+// phat = luminance(Le) × cos_y × area / dist², gated by cos_x > 0 and cos_y > 0.
+// Excludes BRDF and V — those are evaluated once on the FINAL chosen sample.
+float computeTargetPdf(EmissiveVoxel light, uint face_seed,
+                       vec3 shadingPoint, vec3 normal) {
+    vec3 sampleP, sampleN;
+    unpackLightSamplePoint(face_seed, light.pos, light.size, sampleP, sampleN);
+    vec3 toLight = sampleP - shadingPoint;
+    float dist2  = dot(toLight, toLight);
+    if (dist2 < 1e-6) return 0.0;
+    float dist     = sqrt(dist2);
+    vec3  lightDir = toLight / dist;
+    float cosX = dot(normal,    lightDir);
+    if (cosX <= 0.0) return 0.0;             // sample is below this surface's horizon
+    float cosY = dot(-lightDir, sampleN);
+    if (cosY <= 0.0) return 0.0;             // back-face of the light's surface
+    float lum  = max(dot(light.emission, vec3(0.2126, 0.7152, 0.0722)), 1e-6);
+    float area = 6.0 * float(light.size * light.size);
+    return lum * cosY * area / dist2;
+}
+
+// Light still exists in the registry AND its voxel_id matches the value
+// stored at write time. Catches index reuse after a registry rebuild AND
+// torn writes from a contending shade invocation (in those cases the slot's
+// other fields will be inconsistent, but lightStillValid rejects the entry
+// before we'd notice).
+bool lightStillValid(Reservoir r) {
+    if (r.M == 0u || r.light_idx >= emissive_count) return false;
+    return emissives[r.light_idx].voxel_id == r.light_vid;
+}
+
+// ---- rBuffer load/store -----------------------------------------------------
+// Hash matches lBuffer's: row = vid % (width-1) + 1. Probe rBufferSlots
+// rows; the first slot whose [0] matches `vid` is ours. Race tolerance: an
+// invocation reading mid-write can see a torn slot, but lightStillValid
+// rejects it (the emission voxel_id won't match) and the slot self-heals
+// next frame.
+
+uint rBufferRow(uint vid) {
+    return vid % uint(rBufferWidth - 1) + 1u;
+}
+
+bool rBufferLoadAtSlot(int row, int slot, uint vid, out Reservoir r) {
+    rInit(r);
+    int base = slot * rBufferStride;
+    uint stored_vid = imageLoad(rBuffer, ivec2(row, base + 0)).r;
+    if (stored_vid != vid) return false;
+    r.light_idx  = imageLoad(rBuffer, ivec2(row, base + 1)).r;
+    r.light_vid  = imageLoad(rBuffer, ivec2(row, base + 2)).r;
+    r.face_seed  = imageLoad(rBuffer, ivec2(row, base + 3)).r;
+    r.Wsum       = uintBitsToFloat(imageLoad(rBuffer, ivec2(row, base + 4)).r);
+    r.M          = imageLoad(rBuffer, ivec2(row, base + 5)).r;
+    r.target_pdf = uintBitsToFloat(imageLoad(rBuffer, ivec2(row, base + 6)).r);
+    return true;
+}
+
+bool rBufferLoad(uint vid, out Reservoir r) {
+    rInit(r);
+    int row = int(rBufferRow(vid));
+    for (int s = 0; s < rBufferSlots; s++) {
+        if (rBufferLoadAtSlot(row, s, vid, r)) {
+            uint t = imageLoad(rBuffer, ivec2(row, s * rBufferStride + 7)).r;
+            // Stale-reset shares the lBuffer's mechanism — reservoirs older
+            // than updateTime frames are treated as empty so a moved camera
+            // doesn't keep ghost samples around.
+            if (!disableStaleReset && t != 0u && t + updateTime < time) {
+                rInit(r);
+                return false;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+void rBufferStoreAtSlot(int row, int slot, uint vid, Reservoir r) {
+    int base = slot * rBufferStride;
+    imageStore(rBuffer, ivec2(row, base + 0), uvec4(vid,                            0u, 0u, 0u));
+    imageStore(rBuffer, ivec2(row, base + 1), uvec4(r.light_idx,                    0u, 0u, 0u));
+    imageStore(rBuffer, ivec2(row, base + 2), uvec4(r.light_vid,                    0u, 0u, 0u));
+    imageStore(rBuffer, ivec2(row, base + 3), uvec4(r.face_seed,                    0u, 0u, 0u));
+    imageStore(rBuffer, ivec2(row, base + 4), uvec4(floatBitsToUint(r.Wsum),        0u, 0u, 0u));
+    imageStore(rBuffer, ivec2(row, base + 5), uvec4(r.M,                            0u, 0u, 0u));
+    imageStore(rBuffer, ivec2(row, base + 6), uvec4(floatBitsToUint(r.target_pdf),  0u, 0u, 0u));
+    imageStore(rBuffer, ivec2(row, base + 7), uvec4(time,                           0u, 0u, 0u));
+}
+
+void rBufferStore(uint vid, Reservoir r) {
+    int row = int(rBufferRow(vid));
+    int oldestSlot = 0;
+    uint oldestT   = 0xFFFFFFFFu;
+    for (int s = 0; s < rBufferSlots; s++) {
+        // CompSwap on slot[0]: claim empty OR keep our existing slot.
+        uint prev = imageAtomicCompSwap(rBuffer, ivec2(row, s * rBufferStride + 0), 0u, vid);
+        if (prev == 0u || prev == vid) {
+            rBufferStoreAtSlot(row, s, vid, r);
+            return;
+        }
+        uint t = imageLoad(rBuffer, ivec2(row, s * rBufferStride + 7)).r;
+        if (t < oldestT) { oldestT = t; oldestSlot = s; }
+    }
+    // No empty slot — evict the oldest (LRU). The atomicExchange on slot[0]
+    // ensures vid swap is observed atomically; subsequent slot fields fall
+    // into place via plain store.
+    imageAtomicExchange(rBuffer, ivec2(row, oldestSlot * rBufferStride + 0), vid);
+    rBufferStoreAtSlot(row, oldestSlot, vid, r);
+}
+
+// ---- Spatial neighbour vid lookup ------------------------------------------
+// voxelKey hashes voxel.position only (10 bits per axis). Snap an offset to
+// the voxel's lattice so the neighbour shares its LOD level (sparse-octree
+// LOD nodes cover several lattice positions at a coarser size).
+uint neighbourVid(uvec3 hitPos, uint hitSize, ivec3 latticeOff) {
+    ivec3 perturbed = ivec3(hitPos) + latticeOff * int(hitSize);
+    if (perturbed.x < 0 || perturbed.y < 0 || perturbed.z < 0) return 0u;
+    uvec3 snapped = uvec3(perturbed) & ~uvec3(hitSize - 1u);
+    uint  p = (snapped.x & 0x3FFu)
+            | ((snapped.y & 0x3FFu) << 10u)
+            | ((snapped.z & 0x3FFu) << 20u);
+    return (hash(p) & 0x7FFFFFFFu) + 1u;
+}
+
 // ---------------- main --------------------------------------------------------
 
 void main() {
@@ -338,103 +618,218 @@ void main() {
         }
     }
 
-    // ---- NEE: direct light sample at this hit ---------------------------------
-    // Skip on emissive surfaces (they ARE lights — sampling onto themselves
-    // is redundant and biased). Skip on deeper bounces — past bounce 1 the
-    // BRDF path converges fast on its own and the shadow ray is the most
-    // expensive thing in shade.comp. Skip when the registry is empty (frame 0
-    // before any primary emissive hit has been registered).
+    // ---- Direct-lighting sample at this hit ----------------------------------
+    // Two paths:
+    //   * Bounce 0 + restirEnabled → full ReSTIR DI pipeline (initial RIS,
+    //     temporal reuse, K spatial neighbours, single shadow ray, writeback).
+    //   * Otherwise (bounce 1, or restir disabled) → legacy single-pick RIS
+    //     NEE (no reservoir storage, one shadow ray per shade — same as before
+    //     ReSTIR was wired in).
+    // Common gates: skip on emissive surfaces (sampling onto self is biased),
+    // skip past bounce 1 (BRDF path converges and shadow rays dominate cost),
+    // skip when registry is empty (frame 0 pre-discovery).
     if (!mat.emissive && r.bounce_idx < 2u && emissive_count > 0u) {
         uint nLights = min(emissive_count, EMISSIVE_CAPACITY);
-
-        // RIS (Resampled Importance Sampling) over RIS_M uniform candidates,
-        // resampled with target ∝ luminance(emission) × size² (a cheap
-        // proxy for the light's "power"). Variance falls roughly with the
-        // mean/max ratio of light powers — equal-power scenes degrade to
-        // uniform, hot-light scenes get a large speedup. Same construction
-        // ReSTIR uses; we just pick once per shade instead of caching reservoirs.
-        const int RIS_M = 4;
-        float wSum = 0.0;
-        uint  chosen = 0u;
-        float chosenTarget = 0.0;
-        for (int k = 0; k < RIS_M; k++) {
-            uint pick = uint(rand(r.rng_state) * float(nLights));
-            if (pick >= nLights) pick = nLights - 1u;
-            EmissiveVoxel cand = emissives[pick];
-            float lum    = max(dot(cand.emission, vec3(0.2126, 0.7152, 0.0722)), 1e-6);
-            float target = lum * float(cand.size * cand.size);
-            wSum += target;
-            // Reservoir update: replace chosen with prob = target/wSum.
-            if (rand(r.rng_state) * wSum < target) {
-                chosen = pick;
-                chosenTarget = target;
-            }
-        }
-        float avgTarget = wSum / float(RIS_M);
-        EmissiveVoxel light = emissives[chosen];
-
-        // Pick one of 6 faces uniformly. Half land on back faces (cos_y<=0)
-        // and contribute zero — that's accounted for in the 1/6 PDF factor.
-        uint faceIdx = uint(rand(r.rng_state) * 6.0);
-        if (faceIdx >= 6u) faceIdx = 5u;
-        vec3 fNormal, fT, fB;
-        if (faceIdx < 2u) {
-            fNormal = vec3((faceIdx == 0u) ? 1.0 : -1.0, 0.0, 0.0);
-            fT = vec3(0.0, 1.0, 0.0);  fB = vec3(0.0, 0.0, 1.0);
-        } else if (faceIdx < 4u) {
-            fNormal = vec3(0.0, (faceIdx == 2u) ? 1.0 : -1.0, 0.0);
-            fT = vec3(1.0, 0.0, 0.0);  fB = vec3(0.0, 0.0, 1.0);
-        } else {
-            fNormal = vec3(0.0, 0.0, (faceIdx == 4u) ? 1.0 : -1.0);
-            fT = vec3(1.0, 0.0, 0.0);  fB = vec3(0.0, 1.0, 0.0);
-        }
-
-        float halfSize = float(light.size) * 0.5;
-        vec3 fCenter = vec3(light.pos) + vec3(halfSize);
-        vec3 lightPos = fCenter
-                      + fNormal * halfSize
-                      + (rand(r.rng_state) - 0.5) * 2.0 * halfSize * fT
-                      + (rand(r.rng_state) - 0.5) * 2.0 * halfSize * fB;
-
-        // Origin offset matches the survivor build below — surface point
-        // pushed out along the geometric normal so we don't self-shadow.
+        // Surface-anchored shading point (offset along geometric normal so we
+        // don't self-shadow; matches the survivor build below).
         vec3 shadingPoint = vec3(hitPos) + vec3(0.5) + normal;
-        vec3 lightDir = lightPos - shadingPoint;
-        float dist2 = dot(lightDir, lightDir);
-        float dist  = sqrt(dist2);
-        if (dist > 1e-3 && chosenTarget > 0.0) {
-            lightDir /= dist;
 
-            float cosX = max(dot(normal,    lightDir), 0.0);
-            float cosY = max(dot(-lightDir, fNormal),  0.0);
+        if (restirEnabled && r.bounce_idx == 0u) {
+            // ============================================================
+            // ReSTIR DI — primary-hit direct lighting.
+            //   1. Initial RIS over restirM uniform candidates → reservoir.
+            //   2. Temporal reuse from this voxel's prev-frame reservoir.
+            //   3. Spatial reuse from K positionally-perturbed neighbours.
+            //   4. Single shadow ray on the FINAL chosen sample.
+            //   5. Deposit unbiased contribution; write reservoir back.
+            // ============================================================
+            Reservoir res; rInit(res);
+            uint primaryVid = r.primary_voxel_id;
 
-            if (cosX > 0.0 && cosY > 0.0) {
-                ray_t shadow;
-                shadow.origin            = shadingPoint;
-                shadow.direction         = lightDir;
-                shadow.inverted_direction = 1.0 / lightDir;
+            // (1) Initial RIS over uniform (light × face × uv) source pdf.
+            // Source pdf p(x) = (1/nLights) × (1/6) × 1 × 1, so
+            //   w_i = phat(x_i) / p(x_i) = phat(x_i) × 6 × nLights.
+            int nM = max(restirM, 1);
+            float invSourcePdf = float(nLights) * 6.0;
+            for (int k = 0; k < nM; k++) {
+                uint pick = uint(rand(r.rng_state) * float(nLights));
+                if (pick >= nLights) pick = nLights - 1u;
+                EmissiveVoxel cand = emissives[pick];
+                uint faceIdx = uint(rand(r.rng_state) * 6.0);
+                if (faceIdx >= 6u) faceIdx = 5u;
+                float uu = rand(r.rng_state);
+                float vv = rand(r.rng_state);
+                uint  seed = packFaceSeed(faceIdx, uu, vv);
+                float target = computeTargetPdf(cand, seed, shadingPoint, normal);
+                float w = target * invSourcePdf;
+                rUpdate(res, pick, cand.voxel_id, seed, target, w, r.rng_state);
+            }
 
-                if (RaycastVisibilityToVoxel(shadow, light.voxel_id)) {
-                    // EvaluateBRDF returns BRDF * cos_x already; we still owe
-                    // the geometric-term cos_y / dist² and the inverse PDF.
-                    vec3 brdfCosX = EvaluateBRDF(r.direction, lightDir, normal,
-                                                 mat.color.xyz, mat.roughness, mat.metallic, mat.specular);
-                    float lightArea = 6.0 * float(light.size) * float(light.size);
-                    // RIS estimator: replace uniform 1/N PDF with
-                    //   marginal_pdf ≈ chosenTarget / (N · avgTarget)
-                    // i.e. multiply contribution by N · avgTarget / chosenTarget.
-                    // Equal-power lights: avgTarget == chosenTarget → reduces
-                    // to the old `* N` (uniform). Power-weighted otherwise.
-                    float risMul = float(nLights) * avgTarget / max(chosenTarget, 1e-6);
-                    float geom = cosY / max(dist2, 1e-6);
-                    vec3 contrib = light.emission * brdfCosX * geom * lightArea * risMul;
-                    contrib = min(contrib, vec3(20.0));   // firefly clamp
-                    vec3 weighted = r.throughput * contrib;
-                    // NEE channel routing: bounce 0 = direct light at primary
-                    // hit point; bounce 1 = direct light one-bounce-away,
-                    // which is INDIRECT from V's perspective.
-                    if (r.bounce_idx == 0u) r.direct_light   += weighted;
-                    else                    r.indirect_light += weighted;
+            // (2) Temporal reuse — same voxel, previous frame.
+            if (restirTemporalEnabled) {
+                Reservoir tres;
+                if (rBufferLoad(primaryVid, tres) && lightStillValid(tres)) {
+                    // Cap M *and* scale Wsum proportionally — capping M alone
+                    // leaves Wsum unbounded, blowing the contribution out as
+                    // history compounds frame after frame. Smaller cap → more
+                    // responsive to lighting changes; larger cap → lower
+                    // variance once converged.
+                    rCapHistory(tres, uint(restirMaxM));
+                    // Same shading point → target_at_us = tres.target_pdf.
+                    rCombine(res, tres, tres.target_pdf, r.rng_state);
+                }
+            }
+
+            // (3) Spatial reuse — K positionally-perturbed neighbour voxels.
+            // Tangent frame around the surface normal so offsets stay on the
+            // surface (same-LOD voxels along the tangent plane). Each neighbour
+            // re-evaluates phat at OUR shading point (geometric jacobian) so
+            // angular/distance disagreements get auto-rejected via target=0.
+            if (restirSpatialEnabled && restirSpatialNeighbors > 0) {
+                vec3 up = abs(normal.z) < 0.999 ? vec3(0.0, 0.0, 1.0)
+                                                 : vec3(1.0, 0.0, 0.0);
+                vec3 T  = normalize(cross(up, normal));
+                vec3 B  = cross(normal, T);
+                int  K  = min(restirSpatialNeighbors, 6);
+                for (int k = 0; k < K; k++) {
+                    float ang = 6.2831853 * rand(r.rng_state);
+                    float rr  = restirSpatialRadius * sqrt(rand(r.rng_state));
+                    vec3 off  = (cos(ang) * T + sin(ang) * B) * rr;
+                    ivec3 latOff = ivec3(round(off));
+                    if (latOff.x == 0 && latOff.y == 0 && latOff.z == 0) continue;
+                    uint nvid = neighbourVid(hitPos, hitSize, latOff);
+                    if (nvid == 0u || nvid == primaryVid) continue;
+                    Reservoir nbr;
+                    if (!rBufferLoad(nvid, nbr) || !lightStillValid(nbr)) continue;
+                    EmissiveVoxel light = emissives[nbr.light_idx];
+                    float target_at_us = computeTargetPdf(light, nbr.face_seed,
+                                                           shadingPoint, normal);
+                    if (target_at_us <= 0.0) continue;   // jacobian rejects this neighbour
+                    rCapHistory(nbr, uint(restirMaxM));
+                    rCombine(res, nbr, target_at_us, r.rng_state);
+                }
+            }
+
+            // (4) Visibility + (5) deposit. Unbiased ReSTIR estimator:
+            //   contrib = f̃(y) × W,   W = Wsum / (M × phat(y))
+            // Here f̃ is the integrand in our PARAMETER-space (light × face × uv∈[0,1]²),
+            // which carries a size² Jacobian from the uv→world-position mapping:
+            //   f̃ = Le × BRDF × cos_x × cos_y × size² / dist² × V
+            // NOT  Le × BRDF × cos_x × cos_y × area  / dist² × V (that would be 6× the
+            // correct value, since area = 6×size²). The 6 comes from face counting and is
+            // already baked into the source pdf p = 1/(N · 6 · 1), so it must NOT also
+            // appear in the integrand. Earlier version put `area` here and produced
+            // exactly 6× over-bright direct lighting.
+            if (res.M > 0u && res.target_pdf > 0.0) {
+                EmissiveVoxel light = emissives[res.light_idx];
+                // Re-validate after combines — light_idx may have come from a
+                // stale neighbour; if the registry was rebuilt, voxel_id mismatches.
+                if (light.voxel_id == res.light_vid) {
+                    vec3 sampleP, sampleN;
+                    unpackLightSamplePoint(res.face_seed, light.pos, light.size,
+                                           sampleP, sampleN);
+                    vec3 toLight = sampleP - shadingPoint;
+                    float dist2  = dot(toLight, toLight);
+                    float dist   = sqrt(max(dist2, 1e-12));
+                    if (dist > 1e-3) {
+                        vec3 lightDir = toLight / dist;
+                        float cosX = max(dot(normal,    lightDir), 0.0);
+                        float cosY = max(dot(-lightDir, sampleN),  0.0);
+                        if (cosX > 0.0 && cosY > 0.0) {
+                            ray_t shadow;
+                            shadow.origin             = shadingPoint;
+                            shadow.direction          = lightDir;
+                            shadow.inverted_direction = 1.0 / lightDir;
+                            if (RaycastVisibilityToVoxel(shadow, res.light_vid)) {
+                                vec3 brdfCosX = EvaluateBRDF(r.direction, lightDir, normal,
+                                                              mat.color.xyz, mat.roughness,
+                                                              mat.metallic, mat.specular);
+                                float W    = res.Wsum / (float(res.M) * res.target_pdf);
+                                float sz2  = float(light.size * light.size);  // NOT 6×size² (= area)
+                                float geom = cosY / max(dist2, 1e-6);
+                                vec3  contrib = light.emission * brdfCosX * geom * sz2 * W;
+                                contrib = min(contrib, vec3(20.0));   // firefly clamp
+                                r.direct_light += r.throughput * contrib;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // (5b) Write back — even on visibility-fail. The reservoir is
+            // statistically valid; visibility only zeros THIS frame's contribution.
+            // If the occluder moves, the same reservoir replays next frame and
+            // contributes naturally.
+            if (res.M > 0u) {
+                rBufferStore(primaryVid, res);
+            }
+        } else {
+            // ---- Legacy single-pick RIS NEE (bounce 1, or restirEnabled=false)
+            // Same construction as before ReSTIR was wired: M=4 uniform candidates,
+            // power-weighted resample, single shadow ray. No reservoir storage.
+            const int RIS_M = 4;
+            float wSum = 0.0;
+            uint  chosen = 0u;
+            float chosenTarget = 0.0;
+            for (int k = 0; k < RIS_M; k++) {
+                uint pick = uint(rand(r.rng_state) * float(nLights));
+                if (pick >= nLights) pick = nLights - 1u;
+                EmissiveVoxel cand = emissives[pick];
+                float lum    = max(dot(cand.emission, vec3(0.2126, 0.7152, 0.0722)), 1e-6);
+                float target = lum * float(cand.size * cand.size);
+                wSum += target;
+                if (rand(r.rng_state) * wSum < target) {
+                    chosen = pick;
+                    chosenTarget = target;
+                }
+            }
+            float avgTarget = wSum / float(RIS_M);
+            EmissiveVoxel light = emissives[chosen];
+
+            uint faceIdx = uint(rand(r.rng_state) * 6.0);
+            if (faceIdx >= 6u) faceIdx = 5u;
+            vec3 fNormal, fT, fB;
+            if (faceIdx < 2u) {
+                fNormal = vec3((faceIdx == 0u) ? 1.0 : -1.0, 0.0, 0.0);
+                fT = vec3(0.0, 1.0, 0.0);  fB = vec3(0.0, 0.0, 1.0);
+            } else if (faceIdx < 4u) {
+                fNormal = vec3(0.0, (faceIdx == 2u) ? 1.0 : -1.0, 0.0);
+                fT = vec3(1.0, 0.0, 0.0);  fB = vec3(0.0, 0.0, 1.0);
+            } else {
+                fNormal = vec3(0.0, 0.0, (faceIdx == 4u) ? 1.0 : -1.0);
+                fT = vec3(1.0, 0.0, 0.0);  fB = vec3(0.0, 1.0, 0.0);
+            }
+            float halfSize = float(light.size) * 0.5;
+            vec3 fCenter = vec3(light.pos) + vec3(halfSize);
+            vec3 lightPos = fCenter
+                          + fNormal * halfSize
+                          + (rand(r.rng_state) - 0.5) * 2.0 * halfSize * fT
+                          + (rand(r.rng_state) - 0.5) * 2.0 * halfSize * fB;
+            vec3 lightDir = lightPos - shadingPoint;
+            float dist2 = dot(lightDir, lightDir);
+            float dist  = sqrt(dist2);
+            if (dist > 1e-3 && chosenTarget > 0.0) {
+                lightDir /= dist;
+                float cosX = max(dot(normal,    lightDir), 0.0);
+                float cosY = max(dot(-lightDir, fNormal),  0.0);
+                if (cosX > 0.0 && cosY > 0.0) {
+                    ray_t shadow;
+                    shadow.origin             = shadingPoint;
+                    shadow.direction          = lightDir;
+                    shadow.inverted_direction = 1.0 / lightDir;
+                    if (RaycastVisibilityToVoxel(shadow, light.voxel_id)) {
+                        vec3 brdfCosX = EvaluateBRDF(r.direction, lightDir, normal,
+                                                     mat.color.xyz, mat.roughness,
+                                                     mat.metallic, mat.specular);
+                        float lightArea = 6.0 * float(light.size) * float(light.size);
+                        float risMul    = float(nLights) * avgTarget / max(chosenTarget, 1e-6);
+                        float geom      = cosY / max(dist2, 1e-6);
+                        vec3 contrib    = light.emission * brdfCosX * geom * lightArea * risMul;
+                        contrib = min(contrib, vec3(20.0));
+                        vec3 weighted = r.throughput * contrib;
+                        if (r.bounce_idx == 0u) r.direct_light   += weighted;
+                        else                    r.indirect_light += weighted;
+                    }
                 }
             }
         }

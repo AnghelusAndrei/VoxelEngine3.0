@@ -34,6 +34,11 @@ Renderer::Renderer(core::RendererConfig *config_, Octree *volume_, Camera *camer
     nBuffer.size.x = lBuffer.size.x;
     nBuffer.size.y = nBuffer.stride * nBuffer.slots;
 
+    rBuffer.stride = RBUFFER_STRIDE;
+    rBuffer.slots  = RBUFFER_SLOTS;
+    rBuffer.size.x = lBuffer.size.x;
+    rBuffer.size.y = rBuffer.stride * rBuffer.slots;
+
     if (config->debuggingEnabled)
         config->logMessage("[%f] initializing the renderer \n", glfwGetTime());
     checkGLError("Renderer initialization", &success);
@@ -135,6 +140,25 @@ Renderer::Renderer(core::RendererConfig *config_, Octree *volume_, Camera *camer
     if (config->debuggingEnabled)
         config->logMessage("[%f] built lighting buffer \n", glfwGetTime());
     checkGLError("Generated lighting buffer", &success);
+
+    // ReSTIR reservoir image — same R32UI hash-image family as lBuffer.
+    // Memory footprint: rBuffer.size.x × rBuffer.size.y × 4 B
+    //   = max_texture_size × (RBUFFER_STRIDE * RBUFFER_SLOTS) × 4
+    //   typical: 16384 × 128 × 4 ≈ 8 MB
+    glGenTextures(1, &rBuffer.texture);
+    glBindTexture(GL_TEXTURE_2D, rBuffer.texture);
+    {
+        std::vector<GLuint> zeros(size_t(rBuffer.size.x) * size_t(rBuffer.size.y), 0u);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, rBuffer.size.x, rBuffer.size.y, 0,
+                     GL_RED_INTEGER, GL_UNSIGNED_INT, zeros.data());
+    }
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    if (config->debuggingEnabled)
+        config->logMessage("[%f] built reservoir buffer \n", glfwGetTime());
+    checkGLError("Generated reservoir buffer", &success);
 
     framebufferEvent();
     initWavefrontBuffers();
@@ -516,6 +540,7 @@ void Renderer::runWavefrontFrame(core::FrameConfig *frameConfig) {
             glBindImageTexture(0, lBuffer.texture,  0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
             glBindImageTexture(1, nBuffer.texture,  0, GL_FALSE, 0, GL_READ_ONLY,  GL_R32UI);
             glBindImageTexture(2, emissiveClaimTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+            glBindImageTexture(3, rBuffer.texture,  0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
             {
                 uint8_t unit = 0;
                 volume->BindForAccumPass(shadePass.program);
@@ -542,6 +567,24 @@ void Renderer::runWavefrontFrame(core::FrameConfig *frameConfig) {
                          frameConfig->fireflyFloor);
             glUniform1i (glGetUniformLocation(shadePass.program, "disableStaleReset"),
                          frameConfig->disableStaleReset);
+
+            // ReSTIR DI knobs (see core.hpp::FrameConfig comment for details).
+            glUniform1i (glGetUniformLocation(shadePass.program, "rBufferWidth"), rBuffer.size.x);
+            glUniform1i (glGetUniformLocation(shadePass.program, "rBufferSlots"), rBuffer.slots);
+            glUniform1i (glGetUniformLocation(shadePass.program, "restirEnabled"),
+                         frameConfig->restirEnabled ? 1 : 0);
+            glUniform1i (glGetUniformLocation(shadePass.program, "restirM"),
+                         frameConfig->restirM);
+            glUniform1i (glGetUniformLocation(shadePass.program, "restirTemporalEnabled"),
+                         frameConfig->restirTemporalEnabled ? 1 : 0);
+            glUniform1i (glGetUniformLocation(shadePass.program, "restirSpatialEnabled"),
+                         frameConfig->restirSpatialEnabled ? 1 : 0);
+            glUniform1i (glGetUniformLocation(shadePass.program, "restirSpatialNeighbors"),
+                         frameConfig->restirSpatialNeighbors);
+            glUniform1f (glGetUniformLocation(shadePass.program, "restirSpatialRadius"),
+                         frameConfig->restirSpatialRadius);
+            glUniform1i (glGetUniformLocation(shadePass.program, "restirMaxM"),
+                         frameConfig->restirMaxM);
 
             profiler.shadeStart(chunkIdx, (int)bounce);
             glDispatchCompute((windowSize + 63u) / 64u, 1, 1);
@@ -615,6 +658,7 @@ bool Renderer::run(core::FrameConfig *frameConfig) {
     stats.scene_capacity = volume->capacity * sizeof(Octree::Node);
     stats.scene_mem      = volume->size     * sizeof(Octree::Node);
     stats.lBuffer_mem    = lBuffer.size.x * lBuffer.size.y * sizeof(GLuint);
+    stats.rBuffer_mem    = rBuffer.size.x * rBuffer.size.y * sizeof(GLuint);
     stats.nBuffer_mem    = nBuffer.size.x * nBuffer.size.y * sizeof(GLuint);
     stats.rayRing_mem    = GLsizeiptr(RAY_CAPACITY_HOST) * RAY_STRIDE;
     stats.shadeList_mem  = GLsizeiptr(SHADE_BUDGET_MAX)  * GLsizeiptr(2 * sizeof(GLuint));
@@ -682,6 +726,7 @@ Renderer::~Renderer() {
     glDeleteTextures(1, &positionTexture);
     glDeleteTextures(1, &lBuffer.texture);
     glDeleteTextures(1, &nBuffer.texture);
+    glDeleteTextures(1, &rBuffer.texture);
     glDeleteTextures(1, &avgPass.texture);
     glDeleteTextures(1, &claimMapTex);
     glDeleteTextures(1, &sampleCountMapTex);

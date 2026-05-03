@@ -254,11 +254,12 @@ void Info::DrawMemUsage(){
     if (!stats_) { ImGui::TextDisabled("No stats available."); return; }
     constexpr double MB = 1000.0 * 1000.0;
     double total_mem = (double)(stats_->scene_mem + stats_->lBuffer_mem + stats_->nBuffer_mem
-                                + stats_->rayRing_mem + stats_->claimMap_mem) / MB;
+                                + stats_->rBuffer_mem + stats_->rayRing_mem + stats_->claimMap_mem) / MB;
     ImGui::Text("total memory allocated: %.3f mb", total_mem);
     ImGui::Text("volume memory: %.3f mb",    (double)stats_->scene_mem    / MB);
     ImGui::Text("volume capacity: %.3f mb",  (double)stats_->scene_capacity / MB);
     ImGui::Text("lBuffer memory: %.3f mb",   (double)stats_->lBuffer_mem  / MB);
+    ImGui::Text("rBuffer memory: %.3f mb",   (double)stats_->rBuffer_mem  / MB);
     ImGui::Text("nBuffer memory: %.3f mb",   (double)stats_->nBuffer_mem  / MB);
     ImGui::Text("ray ring memory: %.3f mb",  (double)stats_->rayRing_mem  / MB);
     ImGui::Text("shade list memory: %.3f mb",(double)stats_->shadeList_mem / MB);

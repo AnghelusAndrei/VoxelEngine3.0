@@ -40,6 +40,16 @@ private:
     core::hashBuffer lBuffer;
     core::hashBuffer nBuffer;
 
+    // ReSTIR DI per-voxel reservoir store. Same hash family as lBuffer (vid →
+    // row), 8 uints per slot. Bound to shade.comp at image unit 3. Layout:
+    //   [0] vid (claim, 0=empty)    [4] Wsum_bits   (sum of RIS weights, float)
+    //   [1] light_idx (chosen)      [5] M           (sample count, capped)
+    //   [2] light_vid (validation)  [6] target_pdf_bits (phat at chosen)
+    //   [3] face_seed (face|uv)     [7] last_time   (frame counter)
+    // Width matches lBuffer (max texture size); slots fewer (~16) since
+    // reservoirs are written less often per (vid % width) row.
+    core::hashBuffer rBuffer;
+
     // normalPass = nBuffer normal refinement.
     // avgPass.texture = resolve.comp RGBA32F output (avg.comp program unused).
     core::ComputePass normalPass;
@@ -79,6 +89,8 @@ private:
     // Wavefront constants (must match #defines in wavefront.glsl).
     static constexpr GLint  LBUFFER_SLOTS         = 32u;
     static constexpr GLint  NBUFFER_SLOTS         = 32u;
+    static constexpr GLint  RBUFFER_SLOTS         = 16;   // reservoir probes per row
+    static constexpr GLint  RBUFFER_STRIDE        = 8;    // uints per slot (see rBuffer comment)
     static constexpr GLuint RAY_CAPACITY_HOST     = 49152u;
     static constexpr GLuint SHADE_BUDGET_MAX      = 196608u;
     static constexpr GLint  CLAIM_WIDTH           = 16384;

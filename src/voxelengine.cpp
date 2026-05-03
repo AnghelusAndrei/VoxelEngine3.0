@@ -90,9 +90,9 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
     };
     Material red_m = {
         .color = glm::vec4(1.0f, 0.0f, 0.0f, 0.0f),
-        .specularColor = glm::vec4(0.8f, 1.0f, 0.7f, 1.0f),
-        .roughness = 0.3f, .specular = 0.9f, .metallic = 0.6f,
-        .emissive = false, .emissiveIntensity = 0.01f
+        .specularColor = glm::vec4(0.8f, 0.1f, 0.1f, 1.0f),
+        .roughness = 0.1f, .specular = 0.9f, .metallic = 0.2f,
+        .emissive = false, .emissiveIntensity = 0.0f
     };
     Material green_m = {
         .color = glm::vec4(0.0f, 1.0f, 0.0f, 0.0f),
@@ -152,6 +152,7 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
     glm::vec3 lastCamDir = glm::vec3(0.0f);
     int stationaryFrames = 0;
     bool motionStateInitialized = false;
+    uint32_t insertionMat = emissive_mat;
 
 
     while(!glfwWindowShouldClose(window)){
@@ -194,7 +195,7 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
         //                     flushed first.
         //   STATIONARY      → moderate updateTime, stale-reset on.
         if (moving) {
-            frameConfig.sampleCapDirect  = 128u;
+            frameConfig.sampleCapDirect  = 16u;
             frameConfig.sampleCapIndirect = 8u;
             frameConfig.updateTime = (GLuint)((1.0 * frameTime) / 10.0);   // previous default
         } else if (stationaryFrames > 10) { // TA mode
@@ -237,13 +238,27 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
             }
         }
 
+        if(glfwGetKey(window, GLFW_KEY_1) == GLFW_PRESS){
+            insertionMat = emissive_mat;
+        }else if(glfwGetKey(window, GLFW_KEY_2) == GLFW_PRESS){
+            insertionMat = red_mat;
+        }else if(glfwGetKey(window, GLFW_KEY_3) == GLFW_PRESS){
+            insertionMat = green_mat;
+        }else if(glfwGetKey(window, GLFW_KEY_4) == GLFW_PRESS){
+            insertionMat = white_mat;
+        }else if(glfwGetKey(window, GLFW_KEY_5) == GLFW_PRESS){
+            insertionMat = metallic_mat;
+        }else if(glfwGetKey(window, GLFW_KEY_6) == GLFW_PRESS){
+            insertionMat = blue_mat;
+        }
+
         if(currRight && !ui_active && scene){
             OctreeCPU::RayHit hit = scene->raycast(camera->position, camera->direction);
             if(hit.hit){
                 const int R = 10;
                 glm::ivec3 center = glm::ivec3(hit.position) + glm::ivec3(-camera->direction);
 
-                scene->insertSphere(center, R, emissive_mat);
+                scene->insertSphere(center, R, insertionMat);
 
                 octree->applyEdits(scene);
             }

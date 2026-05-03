@@ -111,6 +111,38 @@ struct FrameConfig {
     float midFraction    = 0.40f;
     int   minSamples     = 1;
 
+    // ReSTIR DI knobs (shade.comp). Per-voxel reservoirs in the rBuffer image.
+    // Pipeline at bounce 0: initial RIS over restirM uniform light candidates →
+    // optional temporal reuse (this voxel's reservoir from previous frame) →
+    // optional spatial reuse (restirSpatialNeighbors positionally-perturbed
+    // neighbour voxels) → single shadow ray on the final chosen sample →
+    // contribution + writeback. Bounce 1 still uses the simple single-pick RIS.
+    //
+    // Visibility (ray obstruction) is handled by tracing a fresh shadow ray on
+    // every reused sample at the new shading point — the reservoir stores the
+    // sample, never the visibility result, so a temporarily-blocked path
+    // recovers as soon as the occluder moves. Light invalidation is handled by
+    // storing the chosen light's voxel_id alongside its index — on reuse, we
+    // verify emissives[idx].voxel_id still matches; mismatch rejects the entry.
+    //
+    //   restirEnabled            : master switch (off = old single-pick RIS NEE)
+    //   restirM                  : initial RIS candidate count (1..16, ~4 good)
+    //   restirTemporalEnabled    : combine with this voxel's prev-frame reservoir
+    //   restirSpatialEnabled     : combine with neighbour voxels' reservoirs
+    //   restirSpatialNeighbors   : how many neighbours to probe (0..6)
+    //   restirSpatialRadius      : neighbour offset, in units of hitSize (0.5..4)
+    //   restirMaxM               : M-cap on temporal reuse — prevents stale
+    //                              samples from dominating new ones forever.
+    //                              16..32 standard; smaller = more responsive
+    //                              to lighting changes, larger = lower variance.
+    bool  restirEnabled          = true;
+    int   restirM                = 4;
+    bool  restirTemporalEnabled  = true;
+    bool  restirSpatialEnabled   = true;
+    int   restirSpatialNeighbors = 1;
+    float restirSpatialRadius    = 2.75f;
+    int   restirMaxM             = 24;
+
     // Firefly clamp (shade.comp::depositSampleDual). When a depositing sample's
     // luma exceeds K × the running per-channel mean, it is rescaled to that
     // threshold before going into the EMA. Eliminates the persistent-bright-
@@ -121,8 +153,8 @@ struct FrameConfig {
     //   fireflyK     : multiplier on the running mean (K=2 strict, K=8 loose)
     //   fireflyFloor : absolute lower bound on the threshold, in raw urgb units
     //                  — keeps near-black voxels from clamping too aggressively
-    float fireflyK     = 2.0f;
-    float fireflyFloor = 200.0f;
+    float fireflyK     = 1.0f;
+    float fireflyFloor = 255.0f;
 };
 
 // -----------------------------------------------------------------------------
@@ -141,6 +173,7 @@ struct FrameStats {
     uint32_t scene_capacity = 0;
     uint32_t scene_mem      = 0;
     uint32_t lBuffer_mem    = 0;
+    uint32_t rBuffer_mem    = 0;
     uint32_t nBuffer_mem    = 0;
     uint32_t rayRing_mem    = 0;
     uint32_t shadeList_mem  = 0;

@@ -174,6 +174,20 @@ layout(std430, binding = 8) buffer RankStats {
 #define CANDIDATE_CAPACITY 1048576u
 #define HISTOGRAM_BINS     256u
 
+// rBuffer (ReSTIR DI per-voxel reservoir store, image bound in shade.comp at
+// unit 3, R32UI). Same hash family as lBuffer (vid → row), but a separate
+// image so the EMA accumulator and the reservoir state don't fight each other.
+// rBufferStride uints per slot:
+//   [0] vid (claim, 0=empty)        [4] Wsum_bits (sum of RIS weights, float)
+//   [1] light_idx (chosen)          [5] M (sample count, capped at restirMaxM)
+//   [2] light_vid (validation key)  [6] target_pdf_bits (phat at chosen sample)
+//   [3] face_seed (face|uv16|uv16)  [7] last_time (frame counter, stale-reset)
+// Hash: (vid % (rBufferWidth-1)) + 1, identical to lBuffer's. The slot count
+// is intentionally smaller than lBuffer's (16 vs 32) — reservoirs change once
+// per frame per voxel, and the M-cap means a stale slot self-decays anyway,
+// so we don't need lBuffer's amount of probing depth.
+#define rBufferStride 8
+
 // lBuffer slot stride. 12 uints per slot = 48 B. Layout per slot:
 //   [0]  vid
 //   [1]  dir_count           — count of samples deposited into direct EMA

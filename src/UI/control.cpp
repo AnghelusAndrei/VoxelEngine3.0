@@ -67,6 +67,22 @@ void Control::DrawLightingControl(){
     ImGui::SliderFloat("variance saturate at", &(frameConfig->varianceNorm),   100.0f, 100000.0f);
 
     ImGui::Separator();
+    // ---- ReSTIR DI (shade.comp, primary-hit direct lighting) ---------------
+    // Per-voxel reservoirs in rBuffer. M = initial RIS candidate count.
+    // Temporal reuses prev-frame reservoir at the SAME voxel; spatial reuses
+    // K positionally-perturbed neighbour voxels' reservoirs (re-evaluating
+    // phat at our shading point so wrong-normal neighbours auto-reject).
+    // M-cap bounds historical sample weight — small = responsive, large = smooth.
+    ImGui::Text("ReSTIR DI (per-voxel reservoirs):");
+    ImGui::Checkbox  ("restir enabled",            &(frameConfig->restirEnabled));
+    ImGui::SliderInt ("restir M (init RIS)",       &(frameConfig->restirM), 1, 16);
+    ImGui::Checkbox  ("restir temporal reuse",     &(frameConfig->restirTemporalEnabled));
+    ImGui::Checkbox  ("restir spatial reuse",      &(frameConfig->restirSpatialEnabled));
+    ImGui::SliderInt ("restir spatial neighbors",  &(frameConfig->restirSpatialNeighbors), 0, 6);
+    ImGui::SliderFloat("restir spatial radius",    &(frameConfig->restirSpatialRadius), 0.5f, 4.0f);
+    ImGui::SliderInt ("restir max M (history cap)",&(frameConfig->restirMaxM), 4, 64);
+
+    ImGui::Separator();
     // ---- Firefly clamp (shade.comp::depositSampleDual) ---------------------
     // Per-channel relative luma clamp on incoming samples. Eliminates the
     // bright-stuck-voxel artifact from single low-PDF NEE / RIS spikes.
