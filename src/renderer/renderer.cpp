@@ -2,10 +2,12 @@
 #include <stdio.h>
 #include <string.h>
 
-// Ray ring layout (must match wavefront.glsl::Ray sizeof). Bumped from 80 → 96
-// when the ray gained separate direct_light / indirect_light vec3 fields for
-// the dual-channel lBuffer EMA.
-#define RAY_STRIDE    96
+// Ray ring layout (must match wavefront.glsl::Ray sizeof).
+//   80 → 96  : direct_light / indirect_light split (dual-channel lBuffer EMA).
+//   96 → 192 : ReSTIR GI scratch — first-bounce sample state + cached primary hit info.
+//   192 → 208: cached primaryViewDir for accurate BRDF eval on metallic/glossy
+//              primary hits at deposit time (V matters for the spec half-vector).
+#define RAY_STRIDE    208
 #define NBUFFER_STRIDE 3
 // lBuffer stride (must match wavefront.glsl::lBufferStride). Bumped from 7 → 12
 // to accommodate the direct/indirect channel split — see wavefront.glsl for the
@@ -22,7 +24,7 @@ Renderer::Renderer(core::RendererConfig *config_, Octree *volume_, Camera *camer
     : config(config_), volume(volume_), camera(camera_),
       materialPool(materialPool_), skybox(skybox_)
 {
-    printf("GL version: %s\n", glGetString(GL_VERSION));
+    config->logMessage("GL version: %s\n", glGetString(GL_VERSION));
 
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &lBuffer.size.x);
     lBuffer.slots  = LBUFFER_SLOTS;
@@ -38,6 +40,14 @@ Renderer::Renderer(core::RendererConfig *config_, Octree *volume_, Camera *camer
     rBuffer.slots  = RBUFFER_SLOTS;
     rBuffer.size.x = lBuffer.size.x;
     rBuffer.size.y = rBuffer.stride * rBuffer.slots;
+
+    // ReSTIR GI per-voxel reservoir store. Wider slots (18 uints) than DI
+    // because each GI sample carries (ω, y, N(y), L_out). Same hash family
+    // so a shade invocation finds DI + GI rows in the same cache line.
+    rBufferGI.stride = RBUFFERGI_STRIDE;
+    rBufferGI.slots  = RBUFFERGI_SLOTS;
+    rBufferGI.size.x = lBuffer.size.x;
+    rBufferGI.size.y = rBufferGI.stride * rBufferGI.slots;
 
     if (config->debuggingEnabled)
         config->logMessage("[%f] initializing the renderer \n", glfwGetTime());
@@ -159,6 +169,24 @@ Renderer::Renderer(core::RendererConfig *config_, Octree *volume_, Camera *camer
     if (config->debuggingEnabled)
         config->logMessage("[%f] built reservoir buffer \n", glfwGetTime());
     checkGLError("Generated reservoir buffer", &success);
+
+    // ReSTIR GI reservoir image. Same R32UI family as rBuffer; bigger per-slot
+    // footprint (18 uints instead of 8). Memory: max_texture_size × 288 × 4
+    //   typical: 16384 × 288 × 4 ≈ 18.9 MB.
+    glGenTextures(1, &rBufferGI.texture);
+    glBindTexture(GL_TEXTURE_2D, rBufferGI.texture);
+    {
+        std::vector<GLuint> zeros(size_t(rBufferGI.size.x) * size_t(rBufferGI.size.y), 0u);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, rBufferGI.size.x, rBufferGI.size.y, 0,
+                     GL_RED_INTEGER, GL_UNSIGNED_INT, zeros.data());
+    }
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    if (config->debuggingEnabled)
+        config->logMessage("[%f] built GI reservoir buffer \n", glfwGetTime());
+    checkGLError("Generated GI reservoir buffer", &success);
 
     framebufferEvent();
     initWavefrontBuffers();
@@ -541,6 +569,7 @@ void Renderer::runWavefrontFrame(core::FrameConfig *frameConfig) {
             glBindImageTexture(1, nBuffer.texture,  0, GL_FALSE, 0, GL_READ_ONLY,  GL_R32UI);
             glBindImageTexture(2, emissiveClaimTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
             glBindImageTexture(3, rBuffer.texture,  0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+            glBindImageTexture(4, rBufferGI.texture, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
             {
                 uint8_t unit = 0;
                 volume->BindForAccumPass(shadePass.program);
@@ -585,6 +614,22 @@ void Renderer::runWavefrontFrame(core::FrameConfig *frameConfig) {
                          frameConfig->restirSpatialRadius);
             glUniform1i (glGetUniformLocation(shadePass.program, "restirMaxM"),
                          frameConfig->restirMaxM);
+
+            // ReSTIR GI knobs.
+            glUniform1i (glGetUniformLocation(shadePass.program, "rBufferGIWidth"), rBufferGI.size.x);
+            glUniform1i (glGetUniformLocation(shadePass.program, "rBufferGISlots"), rBufferGI.slots);
+            glUniform1i (glGetUniformLocation(shadePass.program, "restirGIEnabled"),
+                         frameConfig->restirGIEnabled ? 1 : 0);
+            glUniform1i (glGetUniformLocation(shadePass.program, "restirGITemporalEnabled"),
+                         frameConfig->restirGITemporalEnabled ? 1 : 0);
+            glUniform1i (glGetUniformLocation(shadePass.program, "restirGISpatialEnabled"),
+                         frameConfig->restirGISpatialEnabled ? 1 : 0);
+            glUniform1i (glGetUniformLocation(shadePass.program, "restirGISpatialNeighbors"),
+                         frameConfig->restirGISpatialNeighbors);
+            glUniform1f (glGetUniformLocation(shadePass.program, "restirGISpatialRadius"),
+                         frameConfig->restirGISpatialRadius);
+            glUniform1i (glGetUniformLocation(shadePass.program, "restirGIMaxM"),
+                         frameConfig->restirGIMaxM);
 
             profiler.shadeStart(chunkIdx, (int)bounce);
             glDispatchCompute((windowSize + 63u) / 64u, 1, 1);
@@ -659,6 +704,7 @@ bool Renderer::run(core::FrameConfig *frameConfig) {
     stats.scene_mem      = volume->size     * sizeof(Octree::Node);
     stats.lBuffer_mem    = lBuffer.size.x * lBuffer.size.y * sizeof(GLuint);
     stats.rBuffer_mem    = rBuffer.size.x * rBuffer.size.y * sizeof(GLuint);
+    stats.rBufferGI_mem  = rBufferGI.size.x * rBufferGI.size.y * sizeof(GLuint);
     stats.nBuffer_mem    = nBuffer.size.x * nBuffer.size.y * sizeof(GLuint);
     stats.rayRing_mem    = GLsizeiptr(RAY_CAPACITY_HOST) * RAY_STRIDE;
     stats.shadeList_mem  = GLsizeiptr(SHADE_BUDGET_MAX)  * GLsizeiptr(2 * sizeof(GLuint));
@@ -727,6 +773,7 @@ Renderer::~Renderer() {
     glDeleteTextures(1, &lBuffer.texture);
     glDeleteTextures(1, &nBuffer.texture);
     glDeleteTextures(1, &rBuffer.texture);
+    glDeleteTextures(1, &rBufferGI.texture);
     glDeleteTextures(1, &avgPass.texture);
     glDeleteTextures(1, &claimMapTex);
     glDeleteTextures(1, &sampleCountMapTex);

@@ -54,8 +54,49 @@ struct Ray {
     uint  hit_voxel_id;        // 80..83  filled by trace; 0 on miss
     uint  hit_material;        // 84..87  filled by trace
     uint  _pad2;               // 88..91
-    uint  _pad3;               // 92..95  std430 stride padding
-};  // sizeof == 96 B (RAY_STRIDE in renderer.cpp must match).
+    uint  _pad3;               // 92..95
+
+    // ReSTIR GI scratch — one in-flight first-bounce sample per ray. Populated
+    // as the path traces and consumed at termination to stream-update rBufferGI.
+    //
+    //   firstBounceDir       : direction sampled at the primary hit (the ω in
+    //                          the GI reservoir's (ω,y,L_out) sample).
+    //   firstBounceHitPos    : lattice position of the secondary hit y.
+    //   firstBounceHitNormal : N(y), used by the spatial-reuse jacobian.
+    //   firstBounceThroughput: BRDF × cos / pdf at the primary hit. We DON'T
+    //                          carry L_out as a separate field — it's derived
+    //                          at termination as L_out = indirect_light /
+    //                          firstBounceThroughput, since the path naturally
+    //                          accumulates throughput × L_out into indirect_light.
+    //   firstBounceHitVid    : voxel_id of the secondary hit (= 0 means no
+    //                          GI candidate from this path; non-zero is the
+    //                          validity flag AND the visibility-check target).
+    //
+    //   primaryHit{Pos,Size,Normal,Material} : cached primary hit info, captured
+    //                          at the start of bounce-0 shade. Needed at deposit
+    //                          time (which can be any bounce) to evaluate
+    //                          BRDF(primary, ω_chosen) for the reservoir's
+    //                          chosen sample, and to reconstruct ω from a
+    //                          spatial neighbour's reused y as (y − primaryHit).
+    vec3  firstBounceDir;          //  96..107
+    float _pad4;                   // 108..111
+    vec3  firstBounceHitPos;       // 112..123
+    float _pad5;                   // 124..127
+    vec3  firstBounceHitNormal;    // 128..139
+    float _pad6;                   // 140..143
+    vec3  firstBounceThroughput;   // 144..155
+    uint  firstBounceHitVid;       // 156..159  (0 = no GI candidate)
+    vec3  primaryHitPos;           // 160..171
+    uint  primaryHitSize;          // 172..175
+    vec3  primaryHitNormal;        // 176..187
+    uint  primaryHitMaterial;      // 188..191
+    // Cached primary ray direction (camera → surface). Needed at deposit time
+    // to evaluate BRDF correctly for metallic / glossy primary hits — the
+    // half-vector for the specular lobe depends on this. Otherwise approximating
+    // V = -primaryHitNormal collapses the spec lobe and metals lose reflections.
+    vec3  primaryViewDir;          // 192..203
+    uint  _pad8;                   // 204..207
+};  // sizeof == 208 B (RAY_STRIDE in renderer.cpp must match).
 
 // --- Ring buffer (producer = emit / shade survivors, consumer = trace / shade) -----
 layout(std430, binding = 0) buffer RayRing { Ray rays[]; };
@@ -187,6 +228,25 @@ layout(std430, binding = 8) buffer RankStats {
 // per frame per voxel, and the M-cap means a stale slot self-decays anyway,
 // so we don't need lBuffer's amount of probing depth.
 #define rBufferStride 8
+
+// rBufferGI (ReSTIR GI per-voxel reservoir store, image bound in shade.comp at
+// unit 4, R32UI). Same hash family as rBuffer/lBuffer. 19 uints per slot:
+//   [0]   vid (claim, 0=empty)
+//   [1..3]   firstBounceDir.{x,y,z}    (floatBitsToUint)
+//   [4..6]   firstBounceHitPos.{x,y,z} (lattice coords as float bits)
+//   [7..9]   firstBounceHitNormal.{x,y,z}
+//   [10..12] L_out.{r,g,b}             (radiance at y back along -dir)
+//   [13]  Wsum_bits
+//   [14]  M (sample count, capped at restirGIMaxM)
+//   [15]  target_pdf_bits (phat at the writing primary)
+//   [16]  last_time (frame counter, stale-reset)
+//   [17]  hitVid (voxel_id of y, used for shadow-ray validation)
+//   [18]  dist_writer_to_y_bits — distance from writer's primary to y. Together
+//         with firstBounceDir, lets us reconstruct x_writer = y − ω·dist exactly,
+//         which is needed for an unbiased spatial-reuse Jacobian. Without this
+//         field we had to approximate x_writer from lattice offsets, and the
+//         error compounded across multiple neighbours into runaway brightness.
+#define rBufferGIStride 19
 
 // lBuffer slot stride. 12 uints per slot = 48 B. Layout per slot:
 //   [0]  vid

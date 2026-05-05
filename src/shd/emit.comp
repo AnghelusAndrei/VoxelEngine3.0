@@ -93,6 +93,25 @@ void main() {
     r._pad2             = 0u;
     r._pad3             = 0u;
 
+    // ReSTIR GI scratch — start empty. Populated by shade.comp during the
+    // bounce loop and consumed at termination. primaryHit* fields are filled
+    // at the start of bounce-0 shade once the primary hit's normal/material
+    // are known.
+    r.firstBounceDir          = vec3(0.0);
+    r._pad4                   = 0.0;
+    r.firstBounceHitPos       = vec3(0.0);
+    r._pad5                   = 0.0;
+    r.firstBounceHitNormal    = vec3(0.0);
+    r._pad6                   = 0.0;
+    r.firstBounceThroughput   = vec3(0.0);
+    r.firstBounceHitVid       = 0u;
+    r.primaryHitPos           = vec3(0.0);
+    r.primaryHitSize          = 0u;
+    r.primaryHitNormal        = vec3(0.0);
+    r.primaryHitMaterial      = 0u;
+    r.primaryViewDir          = vec3(0.0);
+    r._pad8                   = 0u;
+
     // Append at ring_head. emit.comp is the sole producer before the first
     // trace/shade pass, so no barrier is needed between the atomicAdd and
     // the write — other threads can't be reading ring_head yet.

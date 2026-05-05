@@ -50,6 +50,13 @@ private:
     // reservoirs are written less often per (vid % width) row.
     core::hashBuffer rBuffer;
 
+    // ReSTIR GI per-voxel reservoir store. Same hash family as the others.
+    // Bound to shade.comp at image unit 4. 19 uints per slot — bigger than DI
+    // because the GI sample carries (ω, y, N(y), L_out) plus enough info to
+    // reconstruct the writer's primary for the spatial-reuse Jacobian. See
+    // wavefront.glsl::rBufferGIStride for the uint-by-uint layout.
+    core::hashBuffer rBufferGI;
+
     // normalPass = nBuffer normal refinement.
     // avgPass.texture = resolve.comp RGBA32F output (avg.comp program unused).
     core::ComputePass normalPass;
@@ -91,6 +98,8 @@ private:
     static constexpr GLint  NBUFFER_SLOTS         = 32u;
     static constexpr GLint  RBUFFER_SLOTS         = 16;   // reservoir probes per row
     static constexpr GLint  RBUFFER_STRIDE        = 8;    // uints per slot (see rBuffer comment)
+    static constexpr GLint  RBUFFERGI_SLOTS       = 16;   // GI reservoir probes per row
+    static constexpr GLint  RBUFFERGI_STRIDE      = 19;   // uints per GI slot (see rBufferGI comment)
     static constexpr GLuint RAY_CAPACITY_HOST     = 49152u;
     static constexpr GLuint SHADE_BUDGET_MAX      = 196608u;
     static constexpr GLint  CLAIM_WIDTH           = 16384;

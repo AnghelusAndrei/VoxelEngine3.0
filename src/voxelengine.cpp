@@ -194,6 +194,7 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
         //                     a few still frames so mid-move deposits are
         //                     flushed first.
         //   STATIONARY      → moderate updateTime, stale-reset on.
+
         if (moving) {
             frameConfig.sampleCapDirect  = 16u;
             frameConfig.sampleCapIndirect = 8u;

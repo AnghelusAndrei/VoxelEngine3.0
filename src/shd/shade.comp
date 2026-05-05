@@ -32,6 +32,11 @@ layout(binding = 2, r32ui) coherent uniform uimage2D emissiveClaim;
 // Read-write because every shade-bounce-0 invocation may load a stored
 // reservoir, combine it with new candidates + neighbours, and write back.
 layout(binding = 3, r32ui) coherent uniform uimage2D rBuffer;
+// ReSTIR GI per-voxel reservoir store. Same hash family. 18 uints per slot —
+// holds (firstBounceDir, firstBounceHitPos, firstBounceHitNormal, L_out, Wsum,
+// M, target_pdf, last_time, secondary_vid). See renderer.hpp::rBufferGI for
+// the uint-by-uint layout. Updated every termination shade.
+layout(binding = 4, r32ui) coherent uniform uimage2D rBufferGI;
 
 uniform usamplerBuffer octreeTexture;
 uniform uint octreeDepth;
@@ -45,6 +50,8 @@ uniform int  nBufferWidth;
 uniform int  nBufferSlots;
 uniform int  rBufferWidth;     // = lBufferWidth in practice; kept distinct in case we resize independently
 uniform int  rBufferSlots;     // = RBUFFER_SLOTS from renderer.hpp
+uniform int  rBufferGIWidth;   // = rBufferWidth in practice
+uniform int  rBufferGISlots;   // = RBUFFERGI_SLOTS from renderer.hpp
 uniform uint time;
 uniform uint updateTime;
 
@@ -78,6 +85,14 @@ uniform bool  restirSpatialEnabled;
 uniform int   restirSpatialNeighbors;
 uniform float restirSpatialRadius;
 uniform int   restirMaxM;
+
+// ReSTIR GI knobs.
+uniform bool  restirGIEnabled;
+uniform bool  restirGITemporalEnabled;
+uniform bool  restirGISpatialEnabled;
+uniform int   restirGISpatialNeighbors;
+uniform float restirGISpatialRadius;
+uniform int   restirGIMaxM;
 
 #define nBufferStride 3
 
@@ -538,6 +553,446 @@ uint neighbourVid(uvec3 hitPos, uint hitSize, ivec3 latticeOff) {
     return (hash(p) & 0x7FFFFFFFu) + 1u;
 }
 
+// =============================================================================
+// ReSTIR GI helpers — per-voxel reservoir over (ω, y, N(y), L_out) samples.
+// =============================================================================
+// Each path produces one fresh GI sample: the bounce-1 hit point y, its normal
+// N(y), and the radiance L_out coming back at the primary along -ω. We cache
+// (ω, y, N(y)) in the Ray as the path traces, derive L_out at termination as
+//   L_out = r.indirect_light / r.firstBounceThroughput
+// (the path naturally accumulates throughput × L_out into indirect_light), and
+// stream-update the reservoir at rBufferGI[primary_voxel_id].
+//
+// Target distribution phat = ||BRDF × cos × L_out|| (luminance of the
+// rendering-equation integrand at the primary). We take V ≈ -primaryHitNormal
+// since the per-voxel cache loses the camera-vs-direction distinction — fine
+// for diffuse-dominated scenes, slight specular-lobe approximation. The
+// path-traced fresh sample's RIS weight is exactly w = lum(r.indirect_light)
+// — that's phat / p_BRDF for *any* BRDF importance sampling, since the path
+// integrand divided by p_BRDF IS r.indirect_light by construction.
+//
+// Spatial reuse jacobian (Ouyang 2021, Eq. 11):
+//   J = (cos(N(y), ω_n_at_y) × |x − y|²) / (cos(N(y), ω_at_y) × |x_n − y|²)
+// where x is our primary, x_n is the neighbour's primary. We approximate x_n
+// from our own primaryHitPos + latticeOff (since vid is position-based and
+// the neighbour shares our normal under the same-surface assumption).
+// =============================================================================
+
+struct GIReservoir {
+    // (dir, distWriter) jointly encode the writer's primary point exactly:
+    //   x_writer = y − dir × distWriter
+    // INVARIANT: dir always equals normalize(y − x_writer). distWriter equals
+    // |y − x_writer|. They are NEVER set independently. Whenever a fresh
+    // sample is added or a chosen sample replaces in rGICombine, BOTH are
+    // recomputed from the same (y, primary) pair — see rGIUpdate / rGICombine.
+    // Storing the original BRDF sample direction and a separate distance was
+    // the previous design, and the two drifted on propagation, breaking the
+    // spatial-reuse Jacobian.
+    vec3  dir;          // = normalize(y − x_writer)
+    vec3  hitPos;       // y, the secondary hit's lattice position
+    vec3  hitNormal;    // N(y)
+    vec3  Lout;         // radiance at y back along -dir
+    uint  hitVid;       // voxel_id of y — used to validate the shadow ray
+    float Wsum;
+    uint  M;            // sample count, capped at restirGIMaxM
+    float target_pdf;   // phat at the writing voxel's primary, for the chosen sample
+    float distWriter;   // = length(y − x_writer)
+};
+
+void rGIInit(out GIReservoir r) {
+    r.dir = vec3(0.0); r.hitPos = vec3(0.0); r.hitNormal = vec3(0.0); r.Lout = vec3(0.0);
+    r.hitVid = 0u; r.Wsum = 0.0; r.M = 0u; r.target_pdf = 0.0; r.distWriter = 0.0;
+}
+
+void rGIUpdate(inout GIReservoir r, vec3 dir, vec3 hitPos, vec3 hitNormal,
+               vec3 Lout, uint hitVid, float target, float distWriter,
+               float w, inout uint rng) {
+    if (w <= 0.0) {
+        r.M += 1u;
+        return;
+    }
+    r.Wsum += w;
+    r.M    += 1u;
+    if (rand(rng) * r.Wsum < w) {
+        r.dir        = dir;
+        r.hitPos     = hitPos;
+        r.hitNormal  = hitNormal;
+        r.Lout       = Lout;
+        r.hitVid     = hitVid;
+        r.target_pdf = target;
+        r.distWriter = distWriter;
+    }
+}
+
+// Combine reservoir b into a, with target_at_us = phat(b.chosen) re-evaluated
+// at our primary, and jacobian = solid-angle reparameterisation factor
+// (= 1 for temporal reuse; computeGIJacobian for spatial).
+// our_primary is the shading point of the voxel doing the combine (us). When
+// b's chosen sample replaces a's, we re-anchor BOTH dir AND distWriter so they
+// jointly encode our_primary as the new "writer primary" — preserving the
+// invariant x_writer = y − dir × distWriter. b.dir alone (the original
+// writer's BRDF sample direction) is NOT what we want here: we want the
+// direction from our_primary to y, which lets a downstream reuser correctly
+// reconstruct OUR primary. Otherwise (dir, distWriter) drift apart and the
+// Jacobian goes wild.
+void rGICombine(inout GIReservoir a, GIReservoir b,
+                float target_at_us, float jacobian,
+                vec3 our_primary, inout uint rng) {
+    if (b.M == 0u || b.target_pdf <= 0.0
+        || target_at_us <= 0.0 || jacobian <= 0.0) {
+        return;   // skip — same biased-form avoidance as DI
+    }
+    float w = target_at_us * b.Wsum * jacobian / b.target_pdf;
+    a.Wsum += w;
+    a.M    += b.M;
+    if (rand(rng) * a.Wsum < w) {
+        vec3  toY = b.hitPos - our_primary;
+        float d   = length(toY);
+        a.dir        = (d > 1e-6) ? toY / d : vec3(0.0, 1.0, 0.0);
+        a.distWriter = d;
+        a.hitPos     = b.hitPos;
+        a.hitNormal  = b.hitNormal;
+        a.Lout       = b.Lout;
+        a.hitVid     = b.hitVid;
+        a.target_pdf = target_at_us;
+    }
+}
+
+// Cap M and proportionally scale Wsum, same fix as DI's rCapHistory.
+void rGICapHistory(inout GIReservoir r, uint maxM) {
+    if (r.M > maxM && maxM > 0u) {
+        r.Wsum = r.Wsum * float(maxM) / float(r.M);
+        r.M    = maxM;
+    }
+}
+
+// phat = lum(BRDF × cos × L_out) at our primary, evaluated with our material
+// for a chosen sample at world position y with stored L_out.
+// V is the actual incoming primary ray direction (camera → surface), cached
+// in the Ray as primaryViewDir — matching EvaluateBRDF's convention. Using
+// the cached V is essential for metallic/glossy surfaces where the half-vector
+// determines the spec lobe.
+float computeGITargetPdf(vec3 sampleHitPos, vec3 sampleLout,
+                         vec3 primaryHitPos, vec3 primaryNormal,
+                         vec3 primaryViewDir, uint primaryMatId) {
+    vec3 toY = sampleHitPos - primaryHitPos;
+    float dist2 = dot(toY, toY);
+    if (dist2 < 1e-6) return 0.0;
+    vec3 omega = toY / sqrt(dist2);
+    float cosX = dot(primaryNormal, omega);
+    if (cosX <= 0.0) return 0.0;
+
+    Material primaryMat = material[primaryMatId];
+    vec3 brdfCos = EvaluateBRDF(primaryViewDir, omega, primaryNormal,
+                                primaryMat.color.xyz, primaryMat.roughness,
+                                primaryMat.metallic, primaryMat.specular);
+    vec3 integrand = brdfCos * sampleLout;
+    return max(dot(integrand, vec3(0.2126, 0.7152, 0.0722)), 0.0);
+}
+
+// J = (cos(N(y), ω_n) × dist_us²) / (cos(N(y), ω_us) × dist_n²)
+float computeGIJacobian(vec3 sampleHitPos, vec3 sampleHitNormal,
+                        vec3 ourPrimary, vec3 neighbourPrimary) {
+    vec3 toUs   = ourPrimary       - sampleHitPos;
+    vec3 toNbr  = neighbourPrimary - sampleHitPos;
+    float distUs2  = dot(toUs,  toUs);
+    float distNbr2 = dot(toNbr, toNbr);
+    if (distUs2 < 1e-6 || distNbr2 < 1e-6) return 0.0;
+    vec3 omegaUs  = toUs  / sqrt(distUs2);
+    vec3 omegaNbr = toNbr / sqrt(distNbr2);
+    float cosUs   = max(dot(sampleHitNormal, omegaUs ), 0.0);
+    float cosNbr  = max(dot(sampleHitNormal, omegaNbr), 0.0);
+    if (cosUs <= 1e-6 || cosNbr <= 1e-6) return 0.0;
+    return (cosNbr * distUs2) / (cosUs * distNbr2);
+}
+
+// ---- rBufferGI load/store ---------------------------------------------------
+
+uint rGIBufferRow(uint vid) {
+    return vid % uint(rBufferGIWidth - 1) + 1u;
+}
+
+bool rGILoadAtSlot(int row, int slot, uint vid, out GIReservoir r) {
+    rGIInit(r);
+    int base = slot * rBufferGIStride;
+    uint stored_vid = imageLoad(rBufferGI, ivec2(row, base + 0)).r;
+    if (stored_vid != vid) return false;
+    r.dir.x = uintBitsToFloat(imageLoad(rBufferGI, ivec2(row, base + 1)).r);
+    r.dir.y = uintBitsToFloat(imageLoad(rBufferGI, ivec2(row, base + 2)).r);
+    r.dir.z = uintBitsToFloat(imageLoad(rBufferGI, ivec2(row, base + 3)).r);
+    r.hitPos.x = uintBitsToFloat(imageLoad(rBufferGI, ivec2(row, base + 4)).r);
+    r.hitPos.y = uintBitsToFloat(imageLoad(rBufferGI, ivec2(row, base + 5)).r);
+    r.hitPos.z = uintBitsToFloat(imageLoad(rBufferGI, ivec2(row, base + 6)).r);
+    r.hitNormal.x = uintBitsToFloat(imageLoad(rBufferGI, ivec2(row, base + 7)).r);
+    r.hitNormal.y = uintBitsToFloat(imageLoad(rBufferGI, ivec2(row, base + 8)).r);
+    r.hitNormal.z = uintBitsToFloat(imageLoad(rBufferGI, ivec2(row, base + 9)).r);
+    r.Lout.x = uintBitsToFloat(imageLoad(rBufferGI, ivec2(row, base + 10)).r);
+    r.Lout.y = uintBitsToFloat(imageLoad(rBufferGI, ivec2(row, base + 11)).r);
+    r.Lout.z = uintBitsToFloat(imageLoad(rBufferGI, ivec2(row, base + 12)).r);
+    r.Wsum = uintBitsToFloat(imageLoad(rBufferGI, ivec2(row, base + 13)).r);
+    r.M = imageLoad(rBufferGI, ivec2(row, base + 14)).r;
+    r.target_pdf = uintBitsToFloat(imageLoad(rBufferGI, ivec2(row, base + 15)).r);
+    r.hitVid = imageLoad(rBufferGI, ivec2(row, base + 17)).r;
+    r.distWriter = uintBitsToFloat(imageLoad(rBufferGI, ivec2(row, base + 18)).r);
+    return true;
+}
+
+bool rGILoad(uint vid, out GIReservoir r) {
+    rGIInit(r);
+    int row = int(rGIBufferRow(vid));
+    for (int s = 0; s < rBufferGISlots; s++) {
+        if (rGILoadAtSlot(row, s, vid, r)) {
+            uint t = imageLoad(rBufferGI, ivec2(row, s * rBufferGIStride + 16)).r;
+            if (!disableStaleReset && t != 0u && t + updateTime < time) {
+                rGIInit(r);
+                return false;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+void rGIStoreAtSlot(int row, int slot, uint vid, GIReservoir r) {
+    int base = slot * rBufferGIStride;
+    imageStore(rBufferGI, ivec2(row, base + 0),  uvec4(vid,                              0u, 0u, 0u));
+    imageStore(rBufferGI, ivec2(row, base + 1),  uvec4(floatBitsToUint(r.dir.x),         0u, 0u, 0u));
+    imageStore(rBufferGI, ivec2(row, base + 2),  uvec4(floatBitsToUint(r.dir.y),         0u, 0u, 0u));
+    imageStore(rBufferGI, ivec2(row, base + 3),  uvec4(floatBitsToUint(r.dir.z),         0u, 0u, 0u));
+    imageStore(rBufferGI, ivec2(row, base + 4),  uvec4(floatBitsToUint(r.hitPos.x),      0u, 0u, 0u));
+    imageStore(rBufferGI, ivec2(row, base + 5),  uvec4(floatBitsToUint(r.hitPos.y),      0u, 0u, 0u));
+    imageStore(rBufferGI, ivec2(row, base + 6),  uvec4(floatBitsToUint(r.hitPos.z),      0u, 0u, 0u));
+    imageStore(rBufferGI, ivec2(row, base + 7),  uvec4(floatBitsToUint(r.hitNormal.x),   0u, 0u, 0u));
+    imageStore(rBufferGI, ivec2(row, base + 8),  uvec4(floatBitsToUint(r.hitNormal.y),   0u, 0u, 0u));
+    imageStore(rBufferGI, ivec2(row, base + 9),  uvec4(floatBitsToUint(r.hitNormal.z),   0u, 0u, 0u));
+    imageStore(rBufferGI, ivec2(row, base + 10), uvec4(floatBitsToUint(r.Lout.x),        0u, 0u, 0u));
+    imageStore(rBufferGI, ivec2(row, base + 11), uvec4(floatBitsToUint(r.Lout.y),        0u, 0u, 0u));
+    imageStore(rBufferGI, ivec2(row, base + 12), uvec4(floatBitsToUint(r.Lout.z),        0u, 0u, 0u));
+    imageStore(rBufferGI, ivec2(row, base + 13), uvec4(floatBitsToUint(r.Wsum),          0u, 0u, 0u));
+    imageStore(rBufferGI, ivec2(row, base + 14), uvec4(r.M,                              0u, 0u, 0u));
+    imageStore(rBufferGI, ivec2(row, base + 15), uvec4(floatBitsToUint(r.target_pdf),    0u, 0u, 0u));
+    imageStore(rBufferGI, ivec2(row, base + 16), uvec4(time,                             0u, 0u, 0u));
+    imageStore(rBufferGI, ivec2(row, base + 17), uvec4(r.hitVid,                         0u, 0u, 0u));
+    imageStore(rBufferGI, ivec2(row, base + 18), uvec4(floatBitsToUint(r.distWriter),    0u, 0u, 0u));
+}
+
+void rGIStore(uint vid, GIReservoir r) {
+    int row = int(rGIBufferRow(vid));
+    int oldestSlot = 0;
+    uint oldestT = 0xFFFFFFFFu;
+    for (int s = 0; s < rBufferGISlots; s++) {
+        uint prev = imageAtomicCompSwap(rBufferGI, ivec2(row, s * rBufferGIStride + 0), 0u, vid);
+        if (prev == 0u || prev == vid) {
+            rGIStoreAtSlot(row, s, vid, r);
+            return;
+        }
+        uint t = imageLoad(rBufferGI, ivec2(row, s * rBufferGIStride + 16)).r;
+        if (t < oldestT) { oldestT = t; oldestSlot = s; }
+    }
+    imageAtomicExchange(rBufferGI, ivec2(row, oldestSlot * rBufferGIStride + 0), vid);
+    rGIStoreAtSlot(row, oldestSlot, vid, r);
+}
+
+// ---- ReSTIR GI termination handler ------------------------------------------
+// Replaces the bare depositSampleDual call at every termination point. Builds
+// a fresh GI candidate from the path's first-bounce sample, combines with
+// temporal + spatial neighbour reservoirs, traces a single shadow ray on the
+// chosen sample, and rewrites r.indirect_light with the resampled estimate
+// before depositing. When restirGIEnabled is off, this collapses to the
+// existing behaviour (just depositSampleDual).
+void depositGIThenSampleDual(inout Ray r) {
+    if (!restirGIEnabled) {
+        depositSampleDual(r.primary_voxel_id, r.direct_light, r.indirect_light);
+        return;
+    }
+
+    // Bounce-1 miss path (or bounce-0 miss): the path's r.indirect_light
+    // already holds the correct skybox-on-miss × throughput contribution. We
+    // SKIP the reservoir entirely here — using a temporal/spatial reservoir
+    // built from previous HIT frames would replace the skybox with stale
+    // bounce-hit data, killing reflections of the skybox on metals/glossy
+    // surfaces. The reservoir simply isn't updated this frame; next frame
+    // (when bounce 1 might hit again) it'll get a fresh sample.
+    if (r.firstBounceHitVid == 0u) {
+        depositSampleDual(r.primary_voxel_id, r.direct_light, r.indirect_light);
+        return;
+    }
+
+    uint primaryVid = r.primary_voxel_id;
+
+    // (1) Build fresh GI candidate. Skipped on degenerate throughput (e.g.
+    //     black surface) — firstBounceHitVid != 0u was already checked above.
+    // OUR shading point — primary lattice corner offset by 0.5 + normal so we
+    // sit just above the surface. Used as x in distance / Jacobian terms.
+    vec3 ourPrimaryShading = r.primaryHitPos + vec3(0.5) + r.primaryHitNormal;
+
+    GIReservoir res; rGIInit(res);
+    bool throughputOk = max(max(r.firstBounceThroughput.x,
+                                 r.firstBounceThroughput.y),
+                             r.firstBounceThroughput.z) > 1e-6;
+    if (throughputOk) {
+        // Componentwise divide; clamp the denominator to avoid blowing up dark
+        // channels. (For black surfaces L_out is meaningless anyway.)
+        vec3 safeThr = max(r.firstBounceThroughput, vec3(1e-4));
+        vec3 freshLout = r.indirect_light / safeThr;
+        // w_fresh = phat / p_BRDF = lum(r.indirect_light), independent of which
+        // BRDF importance-sampler the path used. See header comment.
+        float wFresh = max(dot(r.indirect_light, vec3(0.2126, 0.7152, 0.0722)), 0.0);
+        float target = computeGITargetPdf(r.firstBounceHitPos, freshLout,
+                                          r.primaryHitPos, r.primaryHitNormal,
+                                          r.primaryViewDir, r.primaryHitMaterial);
+        // Compute the dir/distWriter pair from the OUR-primary→y vector, NOT
+        // from the BRDF sample direction. This keeps the invariant that
+        //   x_writer = y − dir × distWriter
+        // works downstream (firstBounceDir is approximately this vector but
+        // not exactly — the trace lands somewhere inside the voxel containing
+        // y, so the lattice corner of y is offset from shading_point + sampleDir
+        // × t by an intra-voxel amount). Using the actual vector eliminates
+        // that approximation error.
+        vec3  freshToY  = r.firstBounceHitPos - ourPrimaryShading;
+        float freshDist = length(freshToY);
+        vec3  freshDir  = (freshDist > 1e-6) ? freshToY / freshDist
+                                              : r.firstBounceDir;
+        rGIUpdate(res, freshDir, r.firstBounceHitPos,
+                  r.firstBounceHitNormal, freshLout, r.firstBounceHitVid,
+                  target, freshDist, wFresh, r.rng_state);
+    }
+
+    // (2) Temporal reuse — same primary, previous frame's reservoir.
+    if (restirGITemporalEnabled) {
+        GIReservoir tres;
+        if (rGILoad(primaryVid, tres)) {
+            rGICapHistory(tres, uint(restirGIMaxM));
+            // Same primary point ⇒ jacobian = 1, target_at_us = tres.target_pdf.
+            rGICombine(res, tres, tres.target_pdf, 1.0, ourPrimaryShading, r.rng_state);
+        }
+    }
+
+    // ---- SNAPSHOT for buffer write-back ----
+    // We deliberately split the reservoir lineage here: the version that gets
+    // stored back into rBufferGI for the NEXT frame is the post-temporal one
+    // (`resTemporal`), with no spatial neighbour samples in it. Spatial reuse
+    // only contributes to THIS frame's shading via `res`. Reason: if we wrote
+    // the post-spatial reservoir back, neighbour A's sample lands in B's
+    // buffer, and next frame B passes it back to A, who passes it back to B,
+    // etc. The M-cap clamps sample count but the same firefly survives forever
+    // because nothing forces it to be re-justified by fresh evidence — each
+    // hop is a "free" credential. The standard RTXDI architecture (Bitterli
+    // 2020 §5.4, RTXDI sample app) saves only post-temporal reservoirs for
+    // exactly this reason. With this split, spatial gain is one-frame-only:
+    // it improves variance in the current image but cannot compound.
+    GIReservoir resTemporal = res;
+
+    // Cap the to-be-saved reservoir BEFORE doing spatial reuse so the M
+    // bookkeeping reflects what we'll actually persist.
+    rGICapHistory(resTemporal, uint(restirGIMaxM));
+
+    // (3) Spatial reuse — K positionally-perturbed neighbour reservoirs.
+    if (restirGISpatialEnabled && restirGISpatialNeighbors > 0) {
+        vec3 up = abs(r.primaryHitNormal.z) < 0.999 ? vec3(0.0, 0.0, 1.0)
+                                                     : vec3(1.0, 0.0, 0.0);
+        vec3 T = normalize(cross(up, r.primaryHitNormal));
+        vec3 B = cross(r.primaryHitNormal, T);
+        int  K = min(restirGISpatialNeighbors, 6);
+        for (int k = 0; k < K; k++) {
+            float ang = 6.2831853 * rand(r.rng_state);
+            float rr  = restirGISpatialRadius * sqrt(rand(r.rng_state));
+            vec3 off  = (cos(ang) * T + sin(ang) * B) * rr;
+            ivec3 latOff = ivec3(round(off));
+            if (latOff.x == 0 && latOff.y == 0 && latOff.z == 0) continue;
+            uint nvid = neighbourVid(uvec3(r.primaryHitPos), r.primaryHitSize, latOff);
+            if (nvid == 0u || nvid == primaryVid) continue;
+            GIReservoir nbr;
+            if (!rGILoad(nvid, nbr)) continue;
+            if (nbr.distWriter <= 0.0) continue;   // empty/unwritten slot guard
+
+            // Reconstruct the neighbour's actual primary EXACTLY using the
+            // stored writer→y geometry: nbrPrimary = y − ω·distWriter.
+            // (ω is the writer's first-bounce direction, pointing FROM writer
+            // toward y, so subtracting ω·dist takes us back to the writer.)
+            // No lattice/normal approximation, so the Jacobian is unbiased
+            // even on curved geometry where the previous lattice-offset
+            // approximation blew up.
+            vec3 nbrPrimary = nbr.hitPos - nbr.dir * nbr.distWriter;
+            float jac = computeGIJacobian(nbr.hitPos, nbr.hitNormal,
+                                          ourPrimaryShading, nbrPrimary);
+            if (jac <= 0.0) continue;
+            // Loose safety clamp — should rarely fire now that the geometry
+            // is reconstructed exactly. Catches grazing-angle pathologies
+            // (cos_us → 0 in the denominator) without distorting normal cases.
+            jac = clamp(jac, 0.05, 20.0);
+            float target_at_us = computeGITargetPdf(nbr.hitPos, nbr.Lout,
+                                                    r.primaryHitPos,
+                                                    r.primaryHitNormal,
+                                                    r.primaryViewDir,
+                                                    r.primaryHitMaterial);
+            if (target_at_us <= 0.0) continue;
+            rGICapHistory(nbr, uint(restirGIMaxM));
+            rGICombine(res, nbr, target_at_us, jac, ourPrimaryShading, r.rng_state);
+        }
+    }
+
+    // (4) Compute final indirect contribution from chosen sample.
+    //   contrib = (BRDF × cos × L_out) × Wsum / (M × phat_chosen)
+    //
+    // Two important deviations from the textbook formulation:
+    //
+    //   a) **No visibility ray.** RaycastVisibilityToVoxel requires the shadow
+    //      ray to hit the EXACT stored hitVid. For DI that's the chosen light
+    //      voxel and works well. For GI the stored y is just some surface;
+    //      on flat walls many neighbouring voxels share the surface and the
+    //      shadow ray often hits a NEIGHBOUR of y, so the check returns false
+    //      and zeros valid contributions. The compounding effect under spatial
+    //      reuse turned the image into noise. We accept the small static-scene
+    //      bias of trusting the original path's visibility instead.
+    //
+    //   b) **Path-traced fallback when M = 0.** If no fresh candidate could be
+    //      built (bounce-1 miss, so firstBounceHitVid = 0), and no temporal /
+    //      spatial reuse is available either, fall back to r.indirect_light.
+    //      The path's natural estimator IS unbiased; the lBuffer EMA will mix
+    //      it cleanly with ReSTIR-resampled deposits from neighbouring shades.
+    //      Without this, missed-bounce-1 paths (common off mirror reflections)
+    //      drop their skybox contribution entirely.
+    vec3 indirectContrib;
+    bool useReservoir = (res.M > 0u && res.target_pdf > 0.0 && res.hitVid != 0u);
+    if (useReservoir) {
+        vec3 toY = res.hitPos - ourPrimaryShading;
+        float dist2 = dot(toY, toY);
+        float dist  = sqrt(max(dist2, 1e-12));
+        vec3 omega = (dist > 1e-3) ? toY / dist : r.primaryHitNormal;
+        float cosX = max(dot(r.primaryHitNormal, omega), 0.0);
+        if (cosX > 0.0) {
+            Material primaryMat = material[r.primaryHitMaterial];
+            vec3 brdfCos = EvaluateBRDF(r.primaryViewDir, omega, r.primaryHitNormal,
+                                        primaryMat.color.xyz, primaryMat.roughness,
+                                        primaryMat.metallic, primaryMat.specular);
+            float W = res.Wsum / (float(res.M) * res.target_pdf);
+            indirectContrib = brdfCos * res.Lout * W;
+            indirectContrib = min(indirectContrib, vec3(20.0));
+        } else {
+            // Chosen sample's omega is below our horizon — fall back to the
+            // path's own value (which was sampled via BRDF importance, so it
+            // never went below horizon).
+            indirectContrib = r.indirect_light;
+        }
+    } else {
+        // No reservoir contribution available — use the path's natural value.
+        // Common when bounce 1 missed (skybox-on-miss path).
+        indirectContrib = r.indirect_light;
+    }
+
+    // (5) Write back the TEMPORAL-only reservoir (no spatial samples). See the
+    //     SNAPSHOT comment above for why this isn't `res`. Empty reservoirs
+    //     aren't worth saving.
+    if (resTemporal.M > 0u) {
+        rGIStore(primaryVid, resTemporal);
+    }
+
+    // (6) Deposit. r.direct_light is the ReSTIR-DI-resolved direct term;
+    //     indirectContrib is whatever we resolved above.
+    depositSampleDual(r.primary_voxel_id, r.direct_light, indirectContrib);
+}
+
 // ---------------- main --------------------------------------------------------
 
 void main() {
@@ -557,7 +1012,7 @@ void main() {
     // corner cases and also belong in indirect.)
     if (r.hit_voxel_id == 0u) {
         r.indirect_light += texture(skybox, r.direction).rgb * r.throughput;
-        depositSampleDual(r.primary_voxel_id, r.direct_light, r.indirect_light);
+        depositGIThenSampleDual(r);
         r.bounce_idx = MAX_BOUNCES;  // mark dead; no survivor append
         rays[slot] = r;
         return;
@@ -572,6 +1027,26 @@ void main() {
     uvec3 hitPos    = uvec3(r.origin);
     uint  hitSize   = uint(r._pad0);
     vec3  normal    = lookupNormal(r.hit_voxel_id, r.direction);
+
+    // ReSTIR GI: cache primary-hit info into the Ray on bounce 0 (so the
+    // termination shade — which can fire at any bounce N — can still evaluate
+    // BRDF at the primary). On bounce 1, the (hitPos, normal) we just computed
+    // IS the secondary hit y; capture it as the GI sample's geometric anchor.
+    if (r.bounce_idx == 0u) {
+        r.primaryHitPos      = vec3(hitPos);
+        r.primaryHitSize     = hitSize;
+        r.primaryHitNormal   = normal;
+        r.primaryHitMaterial = r.hit_material;
+        // Cache the camera ray direction (= V for EvaluateBRDF) BEFORE the
+        // BRDF sample at the end of bounce 0 overwrites r.direction. Without
+        // this, deposit-time BRDF eval has to fall back to V = -normal which
+        // collapses the spec lobe — metals lose their reflections.
+        r.primaryViewDir     = r.direction;
+    } else if (r.bounce_idx == 1u && r.firstBounceHitVid == 0u) {
+        r.firstBounceHitPos    = vec3(hitPos);
+        r.firstBounceHitNormal = normal;
+        r.firstBounceHitVid    = r.hit_voxel_id;   // non-zero ⇒ GI sample valid
+    }
 
     if (mat.emissive) {
         // Standard direct-on-hit emissive contribution. Firefly-clamped so a
@@ -838,7 +1313,7 @@ void main() {
     // If we're at the last bounce we'd allow, no need to build a survivor.
     // Just deposit what we have and kill the ray.
     if (r.bounce_idx + 1u >= MAX_BOUNCES) {
-        depositSampleDual(r.primary_voxel_id, r.direct_light, r.indirect_light);
+        depositGIThenSampleDual(r);
         r.bounce_idx = MAX_BOUNCES;
         rays[slot] = r;
         return;
@@ -872,6 +1347,17 @@ void main() {
     }
     r.rng_state = rng;
 
+    // ReSTIR GI: at the end of bounce-0 BRDF sampling we know the
+    // first-bounce direction and the per-sample BRDF×cos/pdf factor. Save
+    // both into the Ray so termination can build the GI candidate as
+    //   ω = firstBounceDir,  L_out = indirect_light / firstBounceThroughput.
+    // Captured BEFORE Russian roulette so RR's 1/p compensation doesn't
+    // contaminate the throughput we attribute to "the first bounce alone".
+    if (r.bounce_idx == 0u) {
+        r.firstBounceDir        = sampleDir;
+        r.firstBounceThroughput = brdfThroughput;
+    }
+
     vec3 newThroughput = r.throughput * brdfThroughput;
 
     // Russian roulette. Before RR_START we always survive; past it we kill with
@@ -880,7 +1366,7 @@ void main() {
         float p = clamp(max(newThroughput.r, max(newThroughput.g, newThroughput.b)), 0.05, 0.95);
         float xi = rand(r.rng_state);
         if (xi > p) {
-            depositSampleDual(r.primary_voxel_id, r.direct_light, r.indirect_light);
+            depositGIThenSampleDual(r);
             r.bounce_idx = MAX_BOUNCES;
             rays[slot] = r;
             return;

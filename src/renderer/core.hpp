@@ -100,7 +100,7 @@ struct FrameConfig {
     // RIS so the cap stays low for responsive lighting changes; indirect
     // is high-variance GI so the cap stays high to average over many bounces.
     int        sampleCapDirect       = 16;
-    int        sampleCapIndirect     = 64;
+    int        sampleCapIndirect     = 8;
 
     // Importance-aware scheduling weights (rank.comp).
     float weightPixels   = 0.1f;
@@ -143,6 +143,24 @@ struct FrameConfig {
     float restirSpatialRadius    = 2.75f;
     int   restirMaxM             = 24;
 
+    // ReSTIR GI knobs (shade.comp::depositGIThenSampleDual). Per-voxel
+    // reservoirs over (ω, y, N(y), L_out) GI samples. The path naturally
+    // produces one fresh sample per termination; reservoirs accumulate them
+    // over time + space and replace the path's r.indirect_light at deposit.
+    //
+    //   restirGIEnabled            : master switch (off = path-traced indirect)
+    //   restirGITemporalEnabled    : combine with this voxel's prev-frame reservoir
+    //   restirGISpatialEnabled     : combine with neighbour voxels' reservoirs
+    //   restirGISpatialNeighbors   : how many neighbours to probe (0..6)
+    //   restirGISpatialRadius      : neighbour offset, in units of primary voxel size
+    //   restirGIMaxM               : M-cap on history (smaller = more responsive)
+    bool  restirGIEnabled          = true;
+    bool  restirGITemporalEnabled  = true;
+    bool  restirGISpatialEnabled   = true;
+    int   restirGISpatialNeighbors = 6;
+    float restirGISpatialRadius    = 4.0f;
+    int   restirGIMaxM             = 36;
+
     // Firefly clamp (shade.comp::depositSampleDual). When a depositing sample's
     // luma exceeds K × the running per-channel mean, it is rescaled to that
     // threshold before going into the EMA. Eliminates the persistent-bright-
@@ -174,6 +192,7 @@ struct FrameStats {
     uint32_t scene_mem      = 0;
     uint32_t lBuffer_mem    = 0;
     uint32_t rBuffer_mem    = 0;
+    uint32_t rBufferGI_mem  = 0;
     uint32_t nBuffer_mem    = 0;
     uint32_t rayRing_mem    = 0;
     uint32_t shadeList_mem  = 0;

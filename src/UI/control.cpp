@@ -83,6 +83,20 @@ void Control::DrawLightingControl(){
     ImGui::SliderInt ("restir max M (history cap)",&(frameConfig->restirMaxM), 4, 64);
 
     ImGui::Separator();
+    // ---- ReSTIR GI (per-voxel, shade.comp::depositGIThenSampleDual) --------
+    // Same reservoir family as DI but the sample is a (ω, y, N(y), L_out)
+    // tuple — the path's first-bounce hit + its outgoing radiance back at
+    // the primary. Reservoirs accumulate one fresh sample per terminating
+    // path and replace the path-traced indirect_light at deposit.
+    ImGui::Text("ReSTIR GI (per-voxel reservoirs):");
+    ImGui::Checkbox  ("restir GI enabled",            &(frameConfig->restirGIEnabled));
+    ImGui::Checkbox  ("restir GI temporal reuse",     &(frameConfig->restirGITemporalEnabled));
+    ImGui::Checkbox  ("restir GI spatial reuse",      &(frameConfig->restirGISpatialEnabled));
+    ImGui::SliderInt ("restir GI spatial neighbors", &(frameConfig->restirGISpatialNeighbors), 0, 6);
+    ImGui::SliderFloat("restir GI spatial radius",   &(frameConfig->restirGISpatialRadius), 0.5f, 4.0f);
+    ImGui::SliderInt ("restir GI max M (history cap)",&(frameConfig->restirGIMaxM), 4, 64);
+
+    ImGui::Separator();
     // ---- Firefly clamp (shade.comp::depositSampleDual) ---------------------
     // Per-channel relative luma clamp on incoming samples. Eliminates the
     // bright-stuck-voxel artifact from single low-PDF NEE / RIS spikes.
