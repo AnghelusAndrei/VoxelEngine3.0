@@ -630,6 +630,10 @@ void Renderer::runWavefrontFrame(core::FrameConfig *frameConfig) {
                          frameConfig->restirGISpatialRadius);
             glUniform1i (glGetUniformLocation(shadePass.program, "restirGIMaxM"),
                          frameConfig->restirGIMaxM);
+            glUniform1f (glGetUniformLocation(shadePass.program, "restirGIkFireflyT"),
+                         frameConfig->restirGIkFireflyT);
+            glUniform1f (glGetUniformLocation(shadePass.program, "restirGIReservoirMixClamp"),
+                         frameConfig->restirGIReservoirMixClamp);
 
             profiler.shadeStart(chunkIdx, (int)bounce);
             glDispatchCompute((windowSize + 63u) / 64u, 1, 1);

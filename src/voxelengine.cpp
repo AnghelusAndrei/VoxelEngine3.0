@@ -86,7 +86,7 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
         .specular = 0.03f,
         .metallic = 0.2f,
         .emissive = true,
-        .emissiveIntensity = 10.0f
+        .emissiveIntensity = 6.0f
     };
     Material red_m = {
         .color = glm::vec4(1.0f, 0.0f, 0.0f, 0.0f),
@@ -115,7 +115,7 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
     Material metallic_m = {
         .color = glm::vec4(0.8f, 0.8f, 0.8f, 0.0f),
         .specularColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f),
-        .roughness = 0.15f, .specular = 1.0f, .metallic = 0.7f,
+        .roughness = 0.08f, .specular = 1.0f, .metallic = 0.85f,
         .emissive = false, .emissiveIntensity = 0.0f
     };
 

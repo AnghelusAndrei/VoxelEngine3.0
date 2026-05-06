@@ -139,9 +139,9 @@ struct FrameConfig {
     int   restirM                = 4;
     bool  restirTemporalEnabled  = true;
     bool  restirSpatialEnabled   = true;
-    int   restirSpatialNeighbors = 1;
-    float restirSpatialRadius    = 2.75f;
-    int   restirMaxM             = 24;
+    int   restirSpatialNeighbors = 2;
+    float restirSpatialRadius    = 4.0f;
+    int   restirMaxM             = 12;
 
     // ReSTIR GI knobs (shade.comp::depositGIThenSampleDual). Per-voxel
     // reservoirs over (ω, y, N(y), L_out) GI samples. The path naturally
@@ -157,9 +157,11 @@ struct FrameConfig {
     bool  restirGIEnabled          = true;
     bool  restirGITemporalEnabled  = true;
     bool  restirGISpatialEnabled   = true;
-    int   restirGISpatialNeighbors = 6;
+    int   restirGISpatialNeighbors = 2;
     float restirGISpatialRadius    = 4.0f;
-    int   restirGIMaxM             = 36;
+    int   restirGIMaxM             = 8;
+    float restirGIkFireflyT            = 32.0f; // GI sample firefly clamp threshold (see shade.comp)
+    float restirGIReservoirMixClamp    = 6.7f; // GI reservoir mix weight clamp (see shade.comp)
 
     // Firefly clamp (shade.comp::depositSampleDual). When a depositing sample's
     // luma exceeds K × the running per-channel mean, it is rescaled to that

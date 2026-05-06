@@ -95,6 +95,8 @@ void Control::DrawLightingControl(){
     ImGui::SliderInt ("restir GI spatial neighbors", &(frameConfig->restirGISpatialNeighbors), 0, 6);
     ImGui::SliderFloat("restir GI spatial radius",   &(frameConfig->restirGISpatialRadius), 0.5f, 4.0f);
     ImGui::SliderInt ("restir GI max M (history cap)",&(frameConfig->restirGIMaxM), 4, 64);
+    ImGui::SliderFloat("restir GI firefly clamp K", &(frameConfig->restirGIkFireflyT), 0.1f, 32.0f);
+    ImGui::SliderFloat("restir GI mix clamp (w)",   &(frameConfig->restirGIReservoirMixClamp), 0.1f, 32.0f);
 
     ImGui::Separator();
     // ---- Firefly clamp (shade.comp::depositSampleDual) ---------------------
