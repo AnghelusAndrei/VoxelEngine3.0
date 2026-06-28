@@ -98,117 +98,120 @@ void Info::DrawLog(){
     ImGui::EndChild();
 }
 
-void Info::SetProfilerData(core::DebugInfo *data_){
-    data = data_;
+void Info::setData(const Profiler *profiler, const core::FrameStats *stats) {
+    profiler_ = profiler;
+    stats_    = stats;
 }
 
 void Info::DrawProfiler(){
-    ImGuiTreeNodeFlags flags;
-
-    double avg_ms;
-
-    {
-        if (ms_plot.size() >= max_samples) {
-            accum_ms-=ms_plot[0];
-            ms_plot.erase(ms_plot.begin());
-        }
-        ms_plot.push_back(data->end_ms - data->start_ms);
-        accum_ms+=data->end_ms - data->start_ms;
-
-        avg_ms = accum_ms/ms_plot.size();
-
-        max_ms = *std::max_element(ms_plot.begin(), ms_plot.end());
-
-        ImGui::PlotLines("", ms_plot.data(), ms_plot.size(), 0, nullptr, 0, max_ms, ImVec2(0, 80));
+    const ProfilerResults *pr = profiler_ ? profiler_->getResults() : nullptr;
+    if (!pr) {
+        ImGui::TextDisabled("Waiting for profiler data...");
+        return;
     }
 
-    ImGui::Text("Average FPS: %2f", (1000.0/(avg_ms)));
-    ImGui::Text("Average ms/f: %2f", (avg_ms));
+    ImGuiTreeNodeFlags flags;
+    double avg_ms;
+
+    // ---- Frame time plot (CPU wall clock) -----------------------------------
+    {
+        if (ms_plot.size() >= (size_t)max_samples) {
+            accum_ms -= ms_plot[0];
+            ms_plot.erase(ms_plot.begin());
+        }
+        ms_plot.push_back((float)pr->CPU_ms);
+        accum_ms += pr->CPU_ms;
+
+        avg_ms = accum_ms / ms_plot.size();
+        max_ms = *std::max_element(ms_plot.begin(), ms_plot.end());
+
+        ImGui::PlotLines("", ms_plot.data(), (int)ms_plot.size(), 0, nullptr, 0.0f,
+                         (float)max_ms, ImVec2(0, 80));
+    }
+
+    ImGui::Text("Average FPS: %.2f", 1000.0 / avg_ms);
+    ImGui::Text("Average ms/f: %.2f", avg_ms);
 
     ImGui::Separator();
 
+    // ---- GPU section --------------------------------------------------------
     ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(150,100,200,255));
     flags = ImGuiTreeNodeFlags_DefaultOpen;
     if (ImGui::TreeNodeEx("GPU", flags))
     {
         double gpu_avg_ms;
         {
-            if (gpu_ms_plot.size() >= max_samples) {
-                gpu_accum_ms-=gpu_ms_plot[0];
+            if (gpu_ms_plot.size() >= (size_t)max_samples) {
+                gpu_accum_ms -= gpu_ms_plot[0];
                 gpu_ms_plot.erase(gpu_ms_plot.begin());
             }
-            gpu_ms_plot.push_back(data->gpu_end_ms - data->gpu_start_ms);
-            gpu_accum_ms+=data->gpu_end_ms - data->gpu_start_ms;
+            gpu_ms_plot.push_back((float)pr->GPU_ms);
+            gpu_accum_ms += pr->GPU_ms;
+            gpu_avg_ms = gpu_accum_ms / gpu_ms_plot.size();
 
-            gpu_avg_ms = gpu_accum_ms/gpu_ms_plot.size();
-
-            ImGui::PlotLines("", gpu_ms_plot.data(), gpu_ms_plot.size(), 0, nullptr, 0, max_ms, ImVec2(0, 80));
+            ImGui::PlotLines("", gpu_ms_plot.data(), (int)gpu_ms_plot.size(), 0, nullptr, 0.0f,
+                             (float)max_ms, ImVec2(0, 80));
         }
 
         ImGui::Text("%i%%", (int)((gpu_avg_ms / avg_ms) * 100.0));
-        ImGui::Text("Average ms/f: %2f", gpu_avg_ms);
+        ImGui::Text("Average ms/f: %.2f", gpu_avg_ms);
 
         flags = ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_Leaf;
         char label[128];
-        snprintf(label, sizeof(label), "shader recompilation: %.2f", (data->gpu_shaderCompilation_ms - data->gpu_start_ms));
-        if (ImGui::TreeNodeEx(label, flags)) ImGui::TreePop();
 
-        snprintf(label, sizeof(label), "framebuffer resize: %2f", (data->gpu_framebufferResize_ms - data->gpu_shaderCompilation_ms));
-        if (ImGui::TreeNodeEx(label, flags)) ImGui::TreePop();
-
-        snprintf(label, sizeof(label), "pass1: %2f", (data->gpu_pass1_ms - data->gpu_framebufferResize_ms));
-        if (ImGui::TreeNodeEx(label, flags)) ImGui::TreePop();
-
-        snprintf(label, sizeof(label), "pass2: %2f", (data->gpu_pass2_ms - data->gpu_pass1_ms));
-        if (ImGui::TreeNodeEx(label, flags)) ImGui::TreePop();
-
-        snprintf(label, sizeof(label), "pass3: %2f", (data->gpu_pass3_ms - data->gpu_pass2_ms));
-        if (ImGui::TreeNodeEx(label, flags)) ImGui::TreePop();
-
-        snprintf(label, sizeof(label), "pass4: %2f", (data->gpu_end_ms - data->gpu_pass3_ms));
-        if (ImGui::TreeNodeEx(label, flags)) ImGui::TreePop();
-
+        for (auto& kv : pr->passes) {
+            snprintf(label, sizeof(label), (kv.first + std::string(": %.3f ms")).c_str(), kv.second);
+            if (ImGui::TreeNodeEx(label, flags)) ImGui::TreePop();
+        }
+        
         ImGui::TreePop();
-    }  
+    }
     ImGui::PopStyleColor();
     ImGui::Separator();
 
+    // ---- CPU section --------------------------------------------------------
     ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(200,200,150,255));
     flags = ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_Leaf;
     if (ImGui::TreeNodeEx("CPU", flags))
     {
         double cpu_avg_ms;
         {
-            if (cpu_ms_plot.size() >= max_samples) {
-                cpu_accum_ms-=cpu_ms_plot[0];
+            if (cpu_ms_plot.size() >= (size_t)max_samples) {
+                cpu_accum_ms -= cpu_ms_plot[0];
                 cpu_ms_plot.erase(cpu_ms_plot.begin());
             }
-            cpu_ms_plot.push_back(data->cpu_end_ms - data->cpu_start_ms);
-            cpu_accum_ms+=data->cpu_end_ms - data->cpu_start_ms;
+            cpu_ms_plot.push_back((float)pr->CPU_ms);
+            cpu_accum_ms += pr->CPU_ms;
+            cpu_avg_ms = cpu_accum_ms / cpu_ms_plot.size();
 
-            cpu_avg_ms = cpu_accum_ms/cpu_ms_plot.size();
-
-            ImGui::PlotLines("", cpu_ms_plot.data(), cpu_ms_plot.size(), 0, nullptr, 0, max_ms, ImVec2(0, 80));
+            ImGui::PlotLines("", cpu_ms_plot.data(), (int)cpu_ms_plot.size(), 0, nullptr, 0.0f,
+                             (float)max_ms, ImVec2(0, 80));
         }
 
-        ImGui::Text("%i%%", (int)((cpu_avg_ms / avg_ms) * 100.0));
-        ImGui::Text("ms/f: %2f", cpu_avg_ms);
+        ImGui::Text("frame ms/f: %.2f", cpu_avg_ms);
 
         ImGui::TreePop();
-    }  
+    }
     ImGui::PopStyleColor();
 }
 
 void Info::DrawMemUsage(){
-    ImGui::Text("volume memory: %f mb", (double)data->scene_mem / (1000.0*1000.0));
-    ImGui::Text("volume capacity: %f mb", (double)data->scene_capacity / (1000.0*1000.0));
-    ImGui::Text("lBuffer memory: %f mb", (double)data->lBuffer_mem / (1000.0*1000.0));
+    if (!stats_) { ImGui::TextDisabled("No stats available."); return; }
+    constexpr double MB = 1000.0 * 1000.0;
+    double total_mem = (double)(stats_->scene_mem + stats_->lBuffer_mem) / MB;
+    ImGui::Text("total memory allocated: %.3f mb", total_mem);
+    ImGui::Text("volume memory: %.3f mb",    (double)stats_->scene_mem    / MB);
+    ImGui::Text("volume capacity: %.3f mb",  (double)stats_->scene_capacity / MB);
+    ImGui::Text("lBuffer memory: %.3f mb",   (double)stats_->lBuffer_mem  / MB);
 }
 
 void Info::DrawSceneData(){
-    ImGui::Text("num voxels: %u", data->voxels_num);
-    ImGui::Text("cam position:  \n     x:%f \n     y:%f \n     z:%f", data->cam_position.x, data->cam_position.y, data->cam_position.z);
-    ImGui::Text("cam direction: \n     x:%f \n     y:%f \n     z:%f", data->cam_direction.x, data->cam_direction.y, data->cam_direction.z);
+    if (!stats_) { ImGui::TextDisabled("No stats available."); return; }
+    ImGui::Text("num voxels: %u",         stats_->voxels_num);
+    ImGui::Text("cam position:  \n     x:%f \n     y:%f \n     z:%f",
+                stats_->cam_position.x, stats_->cam_position.y, stats_->cam_position.z);
+    ImGui::Text("cam direction: \n     x:%f \n     y:%f \n     z:%f",
+                stats_->cam_direction.x, stats_->cam_direction.y, stats_->cam_direction.z);
 }
 
 void Info::Draw()
@@ -221,9 +224,9 @@ void Info::Draw()
 
     if(ImGui::CollapsingHeader("profiler", ImGuiTreeNodeFlags_DefaultOpen))
         DrawProfiler();
-    if(ImGui::CollapsingHeader("scene data"))
+    if(ImGui::CollapsingHeader("scene data", ImGuiTreeNodeFlags_DefaultOpen))
         DrawSceneData();
-    if(ImGui::CollapsingHeader("memory usage"))
+    if(ImGui::CollapsingHeader("memory usage", ImGuiTreeNodeFlags_DefaultOpen))
         DrawMemUsage();
     if(ImGui::CollapsingHeader("logger", ImGuiTreeNodeFlags_DefaultOpen))
         DrawLog();

@@ -20,7 +20,6 @@ public:
     void Draw() override;
 
 private:
-    bool c[5] = {false, false, false, false, false};
     core::RendererConfig *rendererConfig;
     core::FrameConfig *frameConfig;
     FPCamera::ControllerConfig *fpconfig;

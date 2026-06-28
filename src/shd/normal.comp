@@ -1,0 +1,196 @@
+#version 460 core
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Per-voxel normal generation. Dispatched over uniqueVoxelList; each thread owns
+// one visible voxel, reads its claimedSlot, and — only if NormalUpdateFlag is set
+// (fresh claim or edit-invalidated) — computes a normal, then writes it packed
+// into lBuffer DWORD3 with the flag cleared. Already-current voxels are skipped.
+//
+// PROTOTYPE TOGGLE — two normal estimators live side by side for A/B comparison:
+//
+//   NORMAL_MULTISCALE 0  (baseline) — weighted binary occupancy gradient over a
+//        sphere of radius `normalPrecision`, sampled at the voxel's own size.
+//        Faceting on large balls is intrinsic (binary, single-scale, ang.res ~1/R).
+//
+//   NORMAL_MULTISCALE 1  (hierarchical wide LOCAL kernel) — the chosen design.
+//        A FIXED, NON-ADAPTIVE sum over ALL octree levels k = 0..KMAX (own level
+//        down to own-level−KMAX). Each level contributes its coverage-gradient
+//        DIRECTION with a fixed weight; a fixed smoothstep magnitude-gate drops a
+//        level whose gradient is "washed" (the feature is smaller than that level's
+//        cell), so a thin wall falls back to the fine levels while a large smooth
+//        surface uses every level. Because the weights are fixed (not chosen per
+//        voxel from agreement), every voxel on a flat wall gets the SAME normal —
+//        walls stay consistent instead of reading as a gradient.
+//
+//        This is a wide LOCAL kernel (compact support ≈ 1.5·2^KMAX voxels), made
+//        cheap by sampling fine near / coarse far through the tree. Per the
+//        impossibility result it is capped: balls up to ~support smooth; balls
+//        larger than that (e.g. radius-60 in a 256³ world) still facet — that is
+//        the accepted trade for wall consistency + one structural parameter.
+//        Stores no derived state (reads childmask), so it is free on the edit path.
+//
+//        KMAX is the single structural knob (support width). It MUST stay in sync
+//        with renderer.cpp's editExpandRadius (currently 28 ⊇ 1.5·2^4) or edits
+//        leave a stale seam. WEIGHT_FALLOFF is the smooth↔sharp dial: 1.0 = equal
+//        weight; <1 favours fine levels (sharper, rougher balls — the "same-level
+//        highest" instinct); >1 favours coarse (smoother, softer edges).
+//
+// Flip the #define and recompile to switch estimators. Revert the whole prototype
+// with: git checkout src/shd/normal.comp
+#define NORMAL_MULTISCALE 0
+
+#define KMAX           5u     // coarsest level offset (support ≈ 1.5·2^KMAX voxels)
+#define WEIGHT_FALLOFF 1.0    // per-level weight ratio: 1=equal, <1 sharper, >1 smoother
+#define GATE_LO        0.02   // |grad| below this → level fully dropped (washed)
+#define GATE_HI        0.95   // |grad| above this → level fully counted
+
+#include "lbuffer.glsl"
+
+layout(std430, binding = 0) readonly buffer OctreeBuffer { uvec2 nodes[]; } octree;
+layout(std430, binding = 3) readonly buffer UniqueList { uvec4 entries[]; } uniqueList;
+layout(std430, binding = 4) readonly buffer UniqueCnt  { uint uniqueCount; };
+
+uniform uint octreeDepth;
+uniform uint normalPrecision;   // baseline mode only: sphere radius R (unused when multiscale)
+
+#if NORMAL_MULTISCALE
+
+// Gray occupancy coverage at integer lattice position `sp`, evaluated at octree
+// level `lev`:  0 = empty space, 1 = solid leaf reached at/above `lev`, and
+// popcount(childmask)/8 for an internal node reached exactly at `lev` — the octree's
+// built-in anti-aliased coverage (an octant counts as touched if any voxel in it is
+// set, so this is a crude 9-level proxy, not a true volume fraction).
+float coverage(ivec3 sp, uint lev, uint L){
+    if (any(lessThan(sp, ivec3(0))) || any(greaterThanEqual(sp, ivec3(int(L)))))
+        return 0.0;
+    uvec3 u = uvec3(sp);
+
+    uvec2 root = octree.nodes[0];
+    if ((root.x & 1u) == 0u)                                   // degenerate leaf root
+        return (((root.x >> 1u) & 0x7Fu) != 0u) ? 1.0 : 0.0;
+
+    uint block = root.y;
+    for (uint d = 1u; d <= lev; d++){
+        uint p2  = L >> d;
+        uint idx = (uint(bool(u.x & p2)) << 2u)
+                 | (uint(bool(u.y & p2)) << 1u)
+                 |  uint(bool(u.z & p2));
+        uvec2 n = octree.nodes[block + idx];
+        if (n.x == 0u && n.y == 0u) return 0.0;                // empty octant
+        if ((n.x & 1u) == 0u)                                   // leaf above target level
+            return (((n.x >> 1u) & 0x7Fu) != 0u) ? 1.0 : 0.0;
+        if (d == lev)                                           // internal node AT target level
+            return float(bitCount((n.x >> 8u) & 0xFFu)) / 8.0;
+        block = n.y;
+    }
+    return 0.0;
+}
+
+// Trilinearly-interpolated coverage at continuous lattice position `x`, sampling the
+// node grid at level `lev` (cell size H, node centres at (i+0.5)*H). C0-continuous,
+// so adjacent fine voxels each get a distinct, smoothly varying value.
+float Fsample(vec3 x, uint lev, uint L){
+    float H = float(L >> lev);
+    vec3  g = x / H - 0.5;
+    vec3  f = floor(g);
+    vec3  t = g - f;
+    float c000 = coverage(ivec3((f + vec3(0,0,0) + 0.5) * H), lev, L);
+    float c100 = coverage(ivec3((f + vec3(1,0,0) + 0.5) * H), lev, L);
+    float c010 = coverage(ivec3((f + vec3(0,1,0) + 0.5) * H), lev, L);
+    float c110 = coverage(ivec3((f + vec3(1,1,0) + 0.5) * H), lev, L);
+    float c001 = coverage(ivec3((f + vec3(0,0,1) + 0.5) * H), lev, L);
+    float c101 = coverage(ivec3((f + vec3(1,0,1) + 0.5) * H), lev, L);
+    float c011 = coverage(ivec3((f + vec3(0,1,1) + 0.5) * H), lev, L);
+    float c111 = coverage(ivec3((f + vec3(1,1,1) + 0.5) * H), lev, L);
+    float c00 = mix(c000, c100, t.x);
+    float c10 = mix(c010, c110, t.x);
+    float c01 = mix(c001, c101, t.x);
+    float c11 = mix(c011, c111, t.x);
+    return mix(mix(c00, c10, t.y), mix(c01, c11, t.y), t.z);
+}
+
+// Central-difference gradient of the trilinear coverage field at level `lev`.
+// 6 trilinear taps = 48 coverage descents; the wide stencil averages across the
+// per-cell C1 discontinuities that a raw analytic trilinear gradient would band on.
+vec3 gradAtScale(vec3 p, uint lev, uint L){
+    float h = float(L >> lev) * 0.5;
+    return vec3(
+        Fsample(p + vec3(h,0,0), lev, L) - Fsample(p - vec3(h,0,0), lev, L),
+        Fsample(p + vec3(0,h,0), lev, L) - Fsample(p - vec3(0,h,0), lev, L),
+        Fsample(p + vec3(0,0,h), lev, L) - Fsample(p - vec3(0,0,h), lev, L)
+    );
+}
+
+#endif // NORMAL_MULTISCALE
+
+void main(){
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= uniqueCount) return;
+
+    uvec4 entry = uniqueList.entries[gid];
+    uint  slot  = entry.z;
+    if (slot == LB_NO_SLOT) return;                  // never seated this frame
+    uint sb = linearSlotToBase(slot);
+    if ((lbuf.data[sb + 3u] & NORMAL_UPDATE_BIT) == 0u) return;   // already current
+
+    uvec2 key   = uvec2(entry.x, entry.y);
+    uvec3 pos   = uvec3(key.x & 0xFFFFu, key.x >> 16u, key.y & 0xFFFFu);
+    uint  level = (key.y >> 16u) & 0xFFu;
+    uint  vsize = 1u << (octreeDepth - level);       // voxel edge size
+    uint  L     = 1u << octreeDepth;
+
+    vec3 normal;
+
+#if NORMAL_MULTISCALE
+    // Fixed-weight, gated sum of per-level coverage-gradient directions (see header).
+    vec3  pc  = vec3(pos) + float(vsize) * 0.5;       // voxel centre
+    vec3  acc = vec3(0.0);
+    float w   = 1.0;                                  // level weight (× WEIGHT_FALLOFF per step)
+    for (uint k = 0u; k <= KMAX; k++){
+        uint  lev = (level > k) ? (level - k) : 1u;
+        vec3  g   = gradAtScale(pc, lev, L);
+        float m   = length(g);
+        float gate = smoothstep(GATE_LO, GATE_HI, m); // washed level → 0, clear → 1
+        if (m > 1e-9) acc += (g / m) * (w * gate);    // equal vote per active level, ×weight
+        w *= WEIGHT_FALLOFF;
+    }
+    normal = (dot(acc, acc) > 1e-12) ? -normalize(acc) : vec3(0.0, 1.0, 0.0);
+#else
+    // Baseline: weighted binary occupancy gradient over a sphere of radius
+    // `normalPrecision`, sampled at the voxel's own size.
+    int   R     = int(normalPrecision);
+    int   r2max = R * R;
+    vec3  grad  = vec3(0.0);
+
+    for (int dz = -R; dz <= R; dz++)
+    for (int dy = -R; dy <= R; dy++)
+    for (int dx = -R; dx <= R; dx++){
+        int r2 = dx*dx + dy*dy + dz*dz;
+        if (r2 == 0 || r2 > r2max) continue;
+        ivec3 spi = ivec3(pos) + ivec3(dx, dy, dz) * int(vsize);
+        if (spi.x < 0 || spi.y < 0 || spi.z < 0) continue;
+        uvec3 sp = uvec3(spi);
+        if (sp.x >= L || sp.y >= L || sp.z >= L) continue;
+
+        uint block = octree.nodes[0].y;
+        bool occ = false;
+        for (uint lev = 1u; lev <= level; lev++){
+            uint p2  = L >> lev;
+            uint idx = (uint(bool(sp.x & p2)) << 2u)
+                     | (uint(bool(sp.y & p2)) << 1u)
+                     |  uint(bool(sp.z & p2));
+            uvec2 n = octree.nodes[block + idx];
+            if (n.x == 0u && n.y == 0u)  { occ = false; break; }
+            if ((n.x & 1u) == 0u)        { occ = ((n.x >> 1u) & 0x7Fu) != 0u; break; }
+            if (lev == level)            { occ = true; break; }
+            block = n.y;
+        }
+
+        if (occ) grad += vec3(dx, dy, dz) / float(r2);   // 1/r² weight
+    }
+    normal = (dot(grad, grad) > 1e-8) ? normalize(-grad) : vec3(0.0, 1.0, 0.0);
+#endif
+
+    lbuf.data[sb + 3u] = PackNormal(normal);         // flag bit 0 cleared → "valid"
+}

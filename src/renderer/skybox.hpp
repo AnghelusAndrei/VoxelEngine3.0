@@ -1,6 +1,6 @@
 #pragma once
 
-#include "renderer.hpp"
+#include "core.hpp"
 
 class Skybox{
     public:
@@ -14,7 +14,20 @@ class Skybox{
         
         ~Skybox();
 
+        void BindUniforms(GLuint program_, uint8_t &texturesBound);
+
     private:
         std::string fileNames[6];
         GLuint gl_ID;
+        
+        struct BMPHeader {
+            uint32_t width;
+            uint32_t height;
+            uint32_t dataOffset;
+        };
+        
+        bool loadBMP(const std::string& filename, unsigned char** data, uint32_t& width, uint32_t& height);
+        void freeBMPData(unsigned char* data);
+        
+        friend class Renderer;
 };

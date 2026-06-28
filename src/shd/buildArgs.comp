@@ -1,0 +1,15 @@
+#version 460 core
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+// Builds the per-voxel dispatch-indirect args from uniqueCount. The claim, normal, and
+// avg passes all dispatch over uniqueVoxelList with local_size = `localSize`, so one
+// call after primary.comp suffices for all three.
+layout(std430, binding = 4) readonly buffer UniqueCount  { uint uniqueCount; };
+layout(std430, binding = 8) writeonly buffer IndirectArg { uvec4 args[]; };
+
+uniform uint localSize;     // per-voxel pass local_size_x (64)
+
+void main(){
+    args[0] = uvec4((uniqueCount + localSize - 1u) / localSize, 1u, 1u, 0u);
+}

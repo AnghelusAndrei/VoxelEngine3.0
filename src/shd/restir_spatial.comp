@@ -1,0 +1,140 @@
+#version 460 core
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ReSTIR DI spatial reuse (architecture/RESTIR.md §E1). Per-voxel (over uniqueVoxelList). Reads the
+// TEMPORAL reservoirs (slot D14/D15) of self + `spatialSamples` world-neighbours as a RACE-FREE SNAPSHOT:
+// restir.comp finished behind a barrier, and this pass writes ONLY the parallel resvSp buffer, never the
+// slot — so no thread ever reads another's spatial output, and neighbour M is never inflated.
+// Bitterli-unbiased Z-combine (Z = Σ M_i·[p̂_i(y)>0]), stored to resvSp[slot] → read by shade AND folded
+// into next frame's temporal merge (the spatiotemporal feedback loop = the real ReSTIR accelerator).
+// The loop adds a small BOUNDED correlation bias (q→neighbour→q across frames), capped by restirMCap —
+// standard ReSTIR, a §1D responsiveness tradeoff, not a correctness slider. Neighbours are tangent-plane
+// for now (curvature handled next increment).
+
+layout(std430, binding = 0) readonly buffer OctreeBuffer { uvec2 nodes[]; } octree;
+layout(std430, binding = 3) readonly buffer UniqueList   { uvec4 entries[]; } uniqueList;
+layout(std430, binding = 4) readonly buffer UniqueCnt    { uint  uniqueCount; };
+
+uniform uint octreeDepth;
+uniform uint frameIndex;
+uniform uint spatialSamples;     // world-neighbours Z-combined per voxel (0 = temporal only)
+
+struct Material {
+    vec4 color, specularColor;
+    float roughness, specular, metallic;
+    bool emissive;
+    float emissiveIntensity;
+};
+layout(std140, binding = 1) uniform MaterialUniform { Material material[127]; };
+
+#include "lbuffer.glsl"
+#include "lighttree.glsl"
+#include "nee.glsl"
+
+#define RESTIR_K_MAX  6
+#define RESTIR_RADIUS 24.0
+
+uint  pcg(inout uint s){ s = s*747796405u + 2891336453u; uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u; return (w >> 22u) ^ w; }
+float rnd(inout uint s){ return float(pcg(s)) * (1.0 / 4294967296.0); }
+
+// Octree leaf at p → material (0 if air) + version; false if no solid leaf. The neighbour's lBuffer key
+// needs its version, which only the octree holds.
+bool octLeafAt(uvec3 p, out uint mat, out uint ver){
+    mat = 0u; ver = 0u;
+    uvec2 root = octree.nodes[0];
+    if ((root.x & 1u) == 0u){ mat = (root.x >> 1u) & 0x7Fu; ver = (root.x >> 16u) & 0xFFu; return mat != 0u; }
+    uint L = 1u << octreeDepth, block = root.y;
+    for (uint d = 1u; d <= octreeDepth; d++){
+        uint p2  = L >> d;
+        uint idx = (uint(bool(p.x & p2)) << 2u) | (uint(bool(p.y & p2)) << 1u) | uint(bool(p.z & p2));
+        uvec2 n = octree.nodes[block + idx];
+        if (n.x == 0u && n.y == 0u) return false;
+        if ((n.x & 1u) == 0u){ mat = (n.x >> 1u) & 0x7Fu; ver = (n.x >> 16u) & 0xFFu; return mat != 0u; }
+        block = n.y;
+    }
+    return false;
+}
+
+void main(){
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= uniqueCount) return;
+
+    uvec4 entry = uniqueList.entries[gid];
+    uint  slot  = entry.z;
+    if (slot == LB_NO_SLOT) return;
+    uint sb = linearSlotToBase(slot);
+    uint rb = resvSpBase(slot);
+
+    uvec2 key   = uvec2(entry.x, entry.y);
+    uvec3 pos   = uvec3(key.x & 0xFFFFu, key.x >> 16u, key.y & 0xFFFFu);
+    uint  level = (key.y >> 16u) & 0xFFu;
+
+    uint d3 = lbuf.data[sb + LB_NORMAL];
+    if ((d3 & NORMAL_UPDATE_BIT) != 0u){ resvSp.data[rb] = 0u; resvSp.data[rb + 1u] = 0u; return; }   // normal not ready
+    uint vsize  = 1u << (octreeDepth - level);
+    vec3 center = vec3(pos) + float(vsize) * 0.5;
+    vec3 N      = normalize(UnpackNormal(d3));
+
+    uint rng = lb_hash(pos.x ^ lb_hash(pos.y ^ lb_hash(pos.z ^ lb_hash(frameIndex ^ 0x9E3779B9u)))) | 1u;
+
+    float wSum = 0.0; uvec3 yPos = uvec3(0u); float yPhatQ = 0.0;
+    uint  sMq  = 0u;                                             // self confidence, for Z
+    vec3  nbC[RESTIR_K_MAX]; vec3 nbN[RESTIR_K_MAX]; uint nbM[RESTIR_K_MAX]; int nNb = 0;
+
+    // self (slot D14/D15 = this frame's TEMPORAL reservoir) — streamed first
+    {
+        uint d14 = lbuf.data[sb + LB_RESV_LIGHT]; sMq = unpackResvM(d14);
+        if (sMq > 0u){
+            uvec3 yq = unpackResvPos(d14); float Wq = uintBitsToFloat(lbuf.data[sb + LB_RESV_W]);
+            float pdf; uint lmat = lightLeafLookup(yq, pdf);
+            if (lmat != 0u){
+                float ph = targetPhat(center, N, yq, 1u, lmat);
+                wSum += ph * Wq * float(sMq);
+                if (wSum > 0.0){ yPos = yq; yPhatQ = ph; }
+            }
+        }
+    }
+
+    // tangent-plane neighbours (curvature handled next increment)
+    uint K  = min(spatialSamples, uint(RESTIR_K_MAX));
+    vec3 tx = abs(N.x) > 0.5 ? vec3(0,1,0) : vec3(1,0,0);
+    vec3 ty = normalize(cross(N, tx)); tx = cross(ty, N);
+    int  L1 = int(1u << octreeDepth);
+    for (uint j = 0u; j < K; j++){
+        float ang = rnd(rng) * 6.2831853;
+        float rr  = (0.35 + 0.65 * rnd(rng)) * RESTIR_RADIUS;
+        ivec3 np  = ivec3(pos) + ivec3(round((tx * cos(ang) + ty * sin(ang)) * rr));
+        if (any(lessThan(np, ivec3(0))) || any(greaterThanEqual(np, ivec3(L1)))) continue;
+        uint nmat, nver;
+        if (!octLeafAt(uvec3(np), nmat, nver)) continue;                    // air / no leaf there
+        uint nslot = probeLBuffer(uvec3(np), level, nver);
+        if (nslot == LB_NO_SLOT) continue;
+        uint nbase = linearSlotToBase(nslot);
+        uint nd14 = lbuf.data[nbase + LB_RESV_LIGHT]; uint nM = unpackResvM(nd14);
+        if (nM == 0u) continue;
+        uvec3 nY = unpackResvPos(nd14); float nW = uintBitsToFloat(lbuf.data[nbase + LB_RESV_W]);
+        float pdf; uint lmat = lightLeafLookup(nY, pdf);
+        if (lmat == 0u) continue;                                          // that light no longer exists
+        nbC[nNb] = vec3(np) + 0.5; nbN[nNb] = normalize(UnpackNormal(lbuf.data[nbase + LB_NORMAL])); nbM[nNb] = nM; nNb++;
+        float ph = targetPhat(center, N, nY, 1u, lmat);                    // neighbour's light, target at q
+        float w  = ph * nW * float(nM);
+        wSum += w;
+        if (w > 0.0 && rnd(rng) * wSum < w){ yPos = nY; yPhatQ = ph; }
+    }
+
+    // unbiased normalisation: Z = Σ M_i over participants whose OWN surface faces the chosen light.
+    // M_out = Σ M_i (total confidence, for next frame's temporal); both clamped to the 5-bit field.
+    float W = 0.0; uint Mout = 0u;
+    if (yPhatQ > 0.0 && wSum > 0.0){
+        float pdfY; uint matY = lightLeafLookup(yPos, pdfY);
+        float Z = float(sMq); Mout = sMq;
+        for (int j = 0; j < nNb; j++){
+            if (targetPhat(nbC[j], nbN[j], yPos, 1u, matY) > 0.0) Z += float(nbM[j]);
+            Mout += nbM[j];
+        }
+        W = (Z > 0.0) ? wSum / (Z * yPhatQ) : 0.0;
+    }
+    resvSp.data[rb]      = (W > 0.0) ? packResvLight(yPos, min(Mout, 31u)) : 0u;
+    resvSp.data[rb + 1u] = floatBitsToUint(W);
+}

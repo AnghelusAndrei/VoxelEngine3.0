@@ -1,0 +1,8 @@
+CLAUDE.md
+.graphifyignore
+src/graphify-out
+build/
+bin/
+.claude/
+.vscode/
+graphify-out/

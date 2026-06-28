@@ -1,0 +1,50 @@
+#version 460 core
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+// Edit invalidation. Dispatched (3D) over one padded EditRegion AABB per frame.
+// For each lattice position, descends the octree to the resident leaf, builds its
+// lBuffer key (pos, level, version) and — if the voxel is cached — re-sets its
+// NormalUpdateFlag so normal.comp recomputes the (now stale) occupancy-derived
+// normal. This covers neighbours of an edit whose own version did not change.
+
+#include "lbuffer.glsl"
+
+layout(std430, binding = 0) readonly buffer OctreeBuffer { uvec2 nodes[]; } octree;
+
+uniform uint  octreeDepth;
+uniform uvec3 regionMin;
+uniform uvec3 regionMax;
+
+void main(){
+    uvec3 p = regionMin + gl_GlobalInvocationID.xyz;
+    if (p.x > regionMax.x || p.y > regionMax.y || p.z > regionMax.z) return;
+    uint L = 1u << octreeDepth;
+    if (p.x >= L || p.y >= L || p.z >= L) return;
+
+    // Descend to the resident leaf at p → its level + version.
+    uint block = octree.nodes[0].y;
+    uint level = 0u, version = 0u;
+    bool found = false;
+    for (uint lev = 1u; lev <= octreeDepth; lev++){
+        uint p2  = L >> lev;
+        uint idx = (uint(bool(p.x & p2)) << 2u)
+                 | (uint(bool(p.y & p2)) << 1u)
+                 |  uint(bool(p.z & p2));
+        uvec2 n = octree.nodes[block + idx];
+        if (n.x == 0u && n.y == 0u) return;                 // empty cell
+        if ((n.x & 1u) == 0u){                               // leaf
+            if (((n.x >> 1u) & 0x7Fu) == 0u) return;         // empty material
+            level = lev; version = (n.x >> 16u) & 0xFFu; found = true; break;
+        }
+        if (lev == octreeDepth) return;
+        block = n.y;
+    }
+    if (!found) return;
+
+    uint  vsize = L >> level;
+    uvec3 vpos  = p & ~uvec3(vsize - 1u);                    // voxel origin = key position
+    uint  slot  = probeLBuffer(vpos, level, version);
+    if (slot == LB_NO_SLOT) return;                          // not cached → nothing to flag
+    atomicOr(lbuf.data[linearSlotToBase(slot) + 3u], NORMAL_UPDATE_BIT);
+}

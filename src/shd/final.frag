@@ -1,14 +1,13 @@
-#version 330 core
+#version 430 core
 out vec4 FragColor;
 
 in vec2 TexCoords;
 
-uniform sampler2D screenTexture;
+uniform sampler2D screenTexture;   // resolveTexture (RGBA32F, linear color)
 
 uniform ivec2 screenResolution;
 
 void main()
 {
-    vec4 col = texture(screenTexture, TexCoords).rgba;
-    FragColor = vec4(col.xyz, 1.0);
-} 
+    FragColor = vec4(texture(screenTexture, TexCoords).rgb, 1.0);
+}

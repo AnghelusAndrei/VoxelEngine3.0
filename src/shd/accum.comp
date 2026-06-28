@@ -1,109 +1,39 @@
-#version 430 core
+#version 460 core
 
-layout (local_size_x = 8, local_size_y = 8) in;
+layout(local_size_x = 8, local_size_y = 8) in;
 
-layout (binding = 0, rgba32f) readonly uniform image2D inputColorBuffer;
+// B1.3 — per-virtual-pixel atomic scatter of shaded radiance into the per-voxel slot
+// accumulators. Each virtual pixel finds its primary voxel's lBuffer slot and adds its
+// (firefly-clamped, HDR fixed-point) diffuse + specular sample plus 1 to the pixel
+// count. avg.comp then reduces these per voxel into the temporal channels.
+layout(binding = 0, rgba32ui) readonly uniform uimage2D virtualGBuffer;
+layout(binding = 1, rgba32f)  readonly uniform image2D  virtualDiffuse;
+layout(binding = 2, rgba32f)  readonly uniform image2D  virtualSpecular;
 
-// Accumulated color and count per voxel
-layout (binding = 1, r32ui) coherent uniform uimage2D voxelColorAccumulationBuffer;
+uniform ivec2 virtualSize;
 
-uniform int slots;
-uniform int size;
-uniform int stride;
-uniform int instruction;
-#define ADDLEFT 1
-#define ADDRIGHT 2
-#define ADDCLEARLEFT 3
-#define ADDCLEARRIGHT 4
-
-uniform uint time;
-uniform uint updateTime;
-
-uniform ivec2 screenResolution;
+#include "gbuffer.glsl"
+#include "lbuffer.glsl"
 
 void main() {
-    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
-    if (pixelCoord.x >= screenResolution.x || pixelCoord.y >= screenResolution.y) {
-        return;
-    }
+    ivec2 vp = ivec2(gl_GlobalInvocationID.xy);
+    if (vp.x >= virtualSize.x || vp.y >= virtualSize.y) return;
 
-    // Use imageLoad instead of texelFetch for image2D
-    vec4 data = imageLoad(inputColorBuffer, pixelCoord).xyzw;
-    uint voxelID = uint(data.w);
-    uint voxelHash = voxelID % uint(size - 1) + uint(1);
+    GBuffer gb = UnpackGBuffer(imageLoad(virtualGBuffer, vp));
+    if (!gb.hit) return;
 
-    if(voxelHash > 0){
-        uvec3 udata = uvec3(
-            uint(data.x * 255.0),
-            uint(data.y * 255.0),
-            uint(data.z * 255.0)
-        );
+    uint slot = probeLBuffer(gb.pos, gb.level, gb.version);   // overflow voxels → skip
+    if (slot == LB_NO_SLOT) return;
+    uint sb = linearSlotToBase(slot);
 
-        uvec3 candidate = uvec3(time, uint(0), uint(0));
-        for(int i = 0; i < stride * slots; i+=stride){
-            imageAtomicCompSwap(voxelColorAccumulationBuffer, ivec2(voxelHash, i), 0, voxelID);
-            memoryBarrierImage();
-            barrier();
-            uint id = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i)).r;
-            uint voxelAccesTime = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i+9)).r;
-            if(id != voxelID){
-                if(voxelAccesTime < candidate.x && voxelAccesTime > 0)
-                    candidate = uvec3(voxelAccesTime, id, uint(i));
-                continue;
-            }
-            if(voxelAccesTime < time - updateTime){
-                imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+1), uint(1));
-                imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+2), udata.x);
-                imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+3), udata.y);
-                imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+4), udata.z);
-                imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+5), uint(1));
-                imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+6), udata.x);
-                imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+7), udata.y);
-                imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+8), udata.z);
-                imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+9), time);
-                return;
-            }
-            // Atomic add operations for accumulating color and count
-            switch(instruction){
-                case ADDLEFT:
-                    imageAtomicAdd(voxelColorAccumulationBuffer, ivec2(voxelHash, i+1), uint(1));
-                    imageAtomicAdd(voxelColorAccumulationBuffer, ivec2(voxelHash, i+2), udata.x);
-                    imageAtomicAdd(voxelColorAccumulationBuffer, ivec2(voxelHash, i+3), udata.y);
-                    imageAtomicAdd(voxelColorAccumulationBuffer, ivec2(voxelHash, i+4), udata.z);
-                    break;
-                case ADDRIGHT:
-                    imageAtomicAdd(voxelColorAccumulationBuffer, ivec2(voxelHash, i+5), uint(1));
-                    imageAtomicAdd(voxelColorAccumulationBuffer, ivec2(voxelHash, i+6), udata.x);
-                    imageAtomicAdd(voxelColorAccumulationBuffer, ivec2(voxelHash, i+7), udata.y);
-                    imageAtomicAdd(voxelColorAccumulationBuffer, ivec2(voxelHash, i+8), udata.z);
-                    break;
-                case ADDCLEARLEFT:
-                    imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+1), uint(1));
-                    imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+2), udata.x);
-                    imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+3), udata.y);
-                    imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+4), udata.z);
-                    break;
-                case ADDCLEARRIGHT:
-                    imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+5), uint(1));
-                    imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+6), udata.x);
-                    imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+7), udata.y);
-                    imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+8), udata.z);
-                    break;
-            }
-            imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+9), time);
-            return;
-        }
-        uint id = candidate.y;
-        int i = int(candidate.z);
-        imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i), voxelID);
-        imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+1), uint(1));
-        imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+2), udata.x);
-        imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+3), udata.y);
-        imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+4), udata.z);
-        imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+5), uint(1));
-        imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+6), udata.x);
-        imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+7), udata.y);
-        imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+8), udata.z);
-        imageAtomicExchange(voxelColorAccumulationBuffer, ivec2(voxelHash, i+9), time);
-    }
+    vec3 d = clamp(imageLoad(virtualDiffuse,  vp).rgb, 0.0, FIREFLY_CLAMP);
+    vec3 s = clamp(imageLoad(virtualSpecular, vp).rgb, 0.0, FIREFLY_CLAMP);
+
+    atomicAdd(lbuf.data[sb + LB_PIXELS], 1u);
+    atomicAdd(lbuf.data[sb + LB_DIFF_ACC + 0u], uint(d.r * ACCUM_SCALE));
+    atomicAdd(lbuf.data[sb + LB_DIFF_ACC + 1u], uint(d.g * ACCUM_SCALE));
+    atomicAdd(lbuf.data[sb + LB_DIFF_ACC + 2u], uint(d.b * ACCUM_SCALE));
+    atomicAdd(lbuf.data[sb + LB_SPEC_ACC + 0u], uint(s.r * ACCUM_SCALE));
+    atomicAdd(lbuf.data[sb + LB_SPEC_ACC + 1u], uint(s.g * ACCUM_SCALE));
+    atomicAdd(lbuf.data[sb + LB_SPEC_ACC + 2u], uint(s.b * ACCUM_SCALE));
 }

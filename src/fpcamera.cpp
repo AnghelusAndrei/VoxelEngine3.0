@@ -16,7 +16,6 @@ FPCamera::FPCamera(Camera::Config *config_, ControllerConfig *controllerConfig) 
 }
 
 FPCamera::~FPCamera(){
-    delete config;
 }
 
 void FPCamera::defaultKeyMap(){

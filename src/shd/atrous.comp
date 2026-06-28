@@ -1,0 +1,89 @@
+#version 460 core
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Edge-stopping à-trous wavelet filter (Dammertz 2010) on the virtual-res **specular**
+// radiance only, BEFORE accum — so the denoised estimate feeds the per-voxel specular EMA.
+// Diffuse is NOT filtered here: it is denoised by NEE/RIS + the long temporal EMA (and, later,
+// ReSTIR spatial reservoir reuse), and it is the only channel fed back, so filtering it pre-accum
+// would compound bias. Specular is the orphan — no NEE, no reservoir reuse, deliberately short
+// EMA — so spatial filtering is its only variance lever, and it is never fed back (no bias).
+//
+// ADAPTIVE BY ROUGHNESS: the per-pixel iteration budget scales with roughness — sharp mirrors
+// filter for 1 iteration (minimal dilation, no significant smear), glossy surfaces for up to
+// `maxIters`. Every specular pixel gets ≥1 iteration (all noise reduced); no per-scene threshold.
+// The CPU dispatches `maxIters` passes (stride 1,2,4,…); a pixel past its budget passes through.
+layout(binding = 0, rgba32ui) readonly  uniform uimage2D virtualGBuffer;   // pos/level/material
+layout(binding = 1, rgba32f)  readonly  uniform image2D  virtualNormal;    // xyz = normal, w = roughness
+layout(binding = 2, rgba32f)  readonly  uniform image2D  inSpecular;
+layout(binding = 3, rgba32f)  writeonly uniform image2D  outSpecular;
+
+uniform ivec2 virtualSize;
+uniform int   iter;        // current iteration index (0-based); stride = 1<<iter
+uniform int   maxIters;    // glossiest budget; per-pixel budget = 1 + round(roughness*(maxIters-1))
+uniform uint  octreeDepth;
+uniform float sigmaN;      // normal edge-stop exponent (higher = sharper)
+uniform float sigmaP;      // position edge-stop falloff, in center-voxel-size units
+
+#include "gbuffer.glsl"
+
+vec3 worldCenter(GBuffer g){
+    uint vsize = 1u << (octreeDepth - g.level);
+    return vec3(g.pos) + float(vsize) * 0.5;
+}
+
+void main(){
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= virtualSize.x || p.y >= virtualSize.y) return;
+
+    GBuffer gc = UnpackGBuffer(imageLoad(virtualGBuffer, p));
+    if (!gc.hit){
+        imageStore(outSpecular, p, vec4(0.0));
+        return;
+    }
+
+    vec4  nr       = imageLoad(virtualNormal, p);
+    vec3  Nc       = nr.xyz;
+    float roughC   = nr.w;
+
+    // Roughness → per-pixel iteration budget. Mirrors (rough≈0) get 1; glossy (rough≈1) get maxIters.
+    int budget = 1 + int(floor(roughC * float(max(maxIters - 1, 0)) + 0.5));
+    budget = clamp(budget, 1, max(maxIters, 1));
+    if (iter >= budget){                                   // past this pixel's budget → freeze
+        imageStore(outSpecular, p, imageLoad(inSpecular, p));
+        return;
+    }
+
+    int   stride  = 1 << iter;
+    vec3  Pc      = worldCenter(gc);
+    float vsizeC  = float(1u << (octreeDepth - gc.level));
+
+    const float k[5] = float[5](0.0625, 0.25, 0.375, 0.25, 0.0625);   // B3-spline row
+
+    vec3  sumS = vec3(0.0);
+    float wsum = 0.0;
+
+    for (int dy = -2; dy <= 2; dy++)
+    for (int dx = -2; dx <= 2; dx++){
+        ivec2 q = p + ivec2(dx, dy) * stride;
+        if (q.x < 0 || q.y < 0 || q.x >= virtualSize.x || q.y >= virtualSize.y) continue;
+
+        GBuffer gn = UnpackGBuffer(imageLoad(virtualGBuffer, q));
+        if (!gn.hit) continue;
+
+        vec3 Nn = imageLoad(virtualNormal, q).xyz;
+        vec3 Pn = worldCenter(gn);
+
+        float wK = k[dx + 2] * k[dy + 2];                                  // kernel
+        float wN = pow(max(dot(Nc, Nn), 0.0), sigmaN);                     // normal
+        float wP = exp(-distance(Pc, Pn) / (sigmaP * vsizeC));             // world position (LOD-scaled)
+        float wM = (gn.material == gc.material) ? 1.0 : 0.3;               // material
+        float w  = wK * wN * wP * wM;
+
+        sumS += imageLoad(inSpecular, q).rgb * w;
+        wsum += w;
+    }
+
+    vec3 outS = (wsum > 1e-6) ? sumS / wsum : imageLoad(inSpecular, p).rgb;
+    imageStore(outSpecular, p, vec4(outS, 1.0));
+}

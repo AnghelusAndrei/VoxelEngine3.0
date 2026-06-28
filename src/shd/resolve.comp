@@ -1,0 +1,157 @@
+#version 460 core
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Per-pixel compositor. Reads the gbuffer and writes the final color by render
+// mode. (Increment 1: OCTREE / MATERIAL / VERSION are real from the gbuffer;
+// NORMAL / CLAIM_AGE / LRU_OCCUPANCY become real once the lBuffer is populated.)
+layout(binding = 0, rgba32ui) readonly  uniform uimage2D  gbufferTexture;
+layout(binding = 1, rgba32f)  writeonly uniform image2D   resolveTexture;
+layout(binding = 2, rgba32ui) readonly  uniform uimage2D  virtualGBuffer;    // downscaled (debug)
+layout(binding = 3, rgba32f)  readonly  uniform image2D   virtualDiffuse;    // shade output (debug)
+layout(binding = 4, rgba32f)  readonly  uniform image2D   virtualSpecular;   // shade output (debug)
+
+uniform uint  octreeDepth;
+uniform ivec2 screenResolution;
+uniform uint  renderMode;   // core::RenderType
+uniform uint  frameStamp;   // monotonic per-frame stamp (== lBuffer timestamp units)
+uniform uint  virtualScale;
+uniform uint  primaryRaystop;   // max DDA steps, normalizes the STEPS heatmap
+
+layout(std140, binding = 0) uniform CameraUniform {
+    vec4 position;
+    vec4 cameraPlane, cameraPlaneRight, cameraPlaneUp;
+} camera;
+
+struct Material {
+    vec4 color, specularColor;
+    float roughness, specular, metallic;
+    bool emissive;
+    float emissiveIntensity;
+};
+layout(std140, binding = 1) uniform MaterialUniform {
+    Material material[127];
+};
+
+uniform samplerCube skybox;
+
+#include "gbuffer.glsl"
+#include "lbuffer.glsl"
+#include "lighttree.glsl"
+
+// Render modes — keep in sync with core::RenderType.
+const uint MODE_OCTREE = 0u, MODE_MATERIAL = 1u, MODE_NORMAL = 2u,
+           MODE_VERSION = 3u, MODE_CLAIM_AGE = 4u, MODE_LRU = 5u, MODE_VIRTUAL = 6u,
+           MODE_SHADE = 7u, MODE_SHADING = 8u, MODE_SAMPLES = 9u, MODE_STEPS = 10u,
+           MODE_LIGHTTREE = 11u;
+
+// jet-style ramp (blue→cyan→yellow→red) for the per-ray DDA step heatmap.
+vec3 heat(float t){
+    return clamp(vec3(1.5 - abs(4.0*t - 3.0),
+                      1.5 - abs(4.0*t - 2.0),
+                      1.5 - abs(4.0*t - 1.0)), 0.0, 1.0);
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= screenResolution.x || pix.y >= screenResolution.y) return;
+
+    GBuffer gb = UnpackGBuffer(imageLoad(gbufferTexture, pix));
+
+    // STEPS heatmap: per-ray DDA traversal cost (hits AND misses) — diagnostic for where
+    // primary.comp spends time. Bypasses the miss→skybox path so far misses show too.
+    if (renderMode == MODE_STEPS) {
+        float t = clamp(float(gb.steps) / float(max(primaryRaystop, 1u)), 0.0, 1.0);
+        imageStore(resolveTexture, pix, vec4(heat(t), 1.0));
+        return;
+    }
+
+    vec3 col;
+    if (!gb.hit) {
+        // Miss → skybox (recompute the primary ray for this pixel).
+        vec2 ndc = vec2(
+            (float(pix.x) + 0.5) / float(screenResolution.x) * 2.0 - 1.0,
+            (float(pix.y) + 0.5) / float(screenResolution.y) * 2.0 - 1.0
+        );
+        vec3 dir = normalize(
+            camera.cameraPlane.xyz
+            + ndc.x * camera.cameraPlaneRight.xyz
+            - ndc.y * camera.cameraPlaneUp.xyz
+        );
+        col = texture(skybox, dir).rgb;
+    } else if (renderMode == MODE_MATERIAL) {
+        col = material[gb.material].color.rgb;
+    } else if (renderMode == MODE_OCTREE) {
+        col = vec3(float(gb.level) / float(octreeDepth));
+    } else if (renderMode == MODE_VERSION) {
+        col = vec3(float(gb.version) / 255.0);
+    } else if (renderMode == MODE_CLAIM_AGE) {
+        uint slot = probeLBuffer(gb.pos, gb.level, gb.version);
+        if (slot == LB_NO_SLOT) col = vec3(1.0, 0.0, 1.0);          // magenta = not cached
+        else {
+            uint age = frameStamp - lbuf.data[linearSlotToBase(slot) + 2u];
+            col = vec3(1.0 / (1.0 + float(age) * 0.1));             // bright = freshly claimed
+        }
+    } else if (renderMode == MODE_LRU) {
+        uint slot = probeLBuffer(gb.pos, gb.level, gb.version);
+        col = (slot == LB_NO_SLOT) ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);  // red miss / green cached
+    } else if (renderMode == MODE_VIRTUAL) {
+        // Downscaled material from the jittered virtual gbuffer (blocky + per-frame
+        // jitter confirms downscale.comp). Miss in the virtual sample → magenta.
+        GBuffer vg = UnpackGBuffer(imageLoad(virtualGBuffer, pix / int(virtualScale)));
+        col = vg.hit ? material[vg.material].color.rgb : vec3(1.0, 0.0, 1.0);
+    } else if (renderMode == MODE_SHADE) {
+        // Raw 1-spp path-traced preview (noisy, no temporal accumulation yet):
+        // albedo·diffuse(E/π) + specular, straight from the virtual radiance images.
+        ivec2 vp = pix / int(virtualScale);
+        GBuffer vg = UnpackGBuffer(imageLoad(virtualGBuffer, vp));
+        if (!vg.hit) col = vec3(0.0);
+        else {
+            Material mm = material[vg.material];
+            vec3 d = imageLoad(virtualDiffuse,  vp).rgb;
+            vec3 s = imageLoad(virtualSpecular, vp).rgb;
+            col = (1.0 - mm.metallic) * mm.color.rgb * d + s;   // diffuse weighted by (1-metallic)
+            if (mm.emissive) col += mm.color.rgb * mm.emissiveIntensity;   // self-emission (view-independent)
+        }
+    } else if (renderMode == MODE_SHADING) {
+        // Final lit composite from the denoised per-voxel cache (avg.comp output).
+        Material mm = material[gb.material];
+        uint slot = probeLBuffer(gb.pos, gb.level, gb.version);
+        if (slot == LB_NO_SLOT) {
+            col = mm.color.rgb;                              // overflow voxel → flat albedo fallback
+        } else {
+            uint sb  = linearSlotToBase(slot);
+            vec3 dch = unpackRGB9E5(lbuf.data[sb + LB_DIFFUSE]);
+            vec3 sch = unpackRGB9E5(lbuf.data[sb + LB_SPECULAR]);
+            col = (1.0 - mm.metallic) * mm.color.rgb * dch + sch;
+        }
+        if (mm.emissive) col += mm.color.rgb * mm.emissiveIntensity;   // self-emission
+    } else if (renderMode == MODE_SAMPLES) {
+        // Per-voxel diffuse EMA sample count: black=0, white=1024 (converged). If the
+        // streak pattern shows up here as LOW counts, it's undersampling, not the sampler.
+        uint slot = probeLBuffer(gb.pos, gb.level, gb.version);
+        if (slot == LB_NO_SLOT) col = vec3(1.0, 0.0, 1.0);
+        else col = vec3(float(lbuf.data[linearSlotToBase(slot) + LB_SAMPLES] & 0xFFFFu) / 1024.0);
+    } else if (renderMode == MODE_LIGHTTREE) {
+        // B2.0 debug: descend the light SVO for this voxel; show the direction to the sampled
+        // light (per-pixel rng → noisy, but the mean direction must point at the emissive slab;
+        // magenta = no lights). Verifies descent + leaf positions before NEE rides on top.
+        uint vsize = 1u << (octreeDepth - gb.level);
+        vec3 vc    = vec3(gb.pos) + float(vsize) * 0.5;
+        uint rng   = (uint(pix.x) * 73856093u) ^ (uint(pix.y) * 19349663u) ^ (frameStamp * 83492791u);
+        rng |= 1u;
+        LightSample ls = sampleLightTree(rng);
+        col = ls.valid ? (normalize(ls.center - vc) * 0.5 + 0.5) : vec3(1.0, 0.0, 1.0);
+    } else {   // MODE_NORMAL
+        uint slot = probeLBuffer(gb.pos, gb.level, gb.version);
+        if (slot == LB_NO_SLOT) col = vec3(0.5);                 // not cached → neutral
+        else {
+            uint d3 = lbuf.data[linearSlotToBase(slot) + 3u];
+            col = ((d3 & NORMAL_UPDATE_BIT) != 0u)
+                ? vec3(0.5)                                      // not computed yet
+                : UnpackNormal(d3) * 0.5 + 0.5;                  // [-1,1] → [0,1]
+        }
+    }
+
+    imageStore(resolveTexture, pix, vec4(col, 1.0));
+}

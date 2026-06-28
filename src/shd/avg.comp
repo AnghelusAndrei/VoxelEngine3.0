@@ -1,56 +1,69 @@
-#version 430 core
+#version 460 core
 
-layout (local_size_x = 8, local_size_y = 8) in;
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-layout (binding = 0, r32ui) readonly uniform uimage2D voxelColorAccumulationBuffer;
-layout (binding = 1, rgba32f) readonly uniform image2D inputColorBuffer;
-layout (binding = 2, rgba32f) writeonly uniform image2D outputColorBuffer;
+// B1.3 — per-voxel temporal reduction. Dispatched indirect over uniqueVoxelList (same
+// args as normal.comp). For each visible voxel it averages this frame's scattered
+// samples (accum.comp) and blends them into the persistent diffuse/specular channels
+// via a sample-capped running average (EMA): the diffuse window is long (denoise hard),
+// the specular window is short (view-dependent → forget fast). Then it clears the
+// per-frame accumulators. Voxels not sampled this frame keep their cached radiance.
+//
+// Blend weights this frame's mean by its sample count `pixels` (coverage-proportional
+// convergence). Once the sample count reaches its cap it behaves as an EMA with that
+// window. This is what feeds the irradiance-cache feedback in shade.comp.
 
-uniform int slots;
-uniform int stride;
-uniform int size;
+#include "lbuffer.glsl"
 
-uniform ivec2 screenResolution;
+layout(std430, binding = 3) readonly buffer UniqueList { uvec4 entries[]; } uniqueList;
+layout(std430, binding = 4) readonly buffer UniqueCnt  { uint uniqueCount; };
+
+uniform uint nDiffMax;   // diffuse temporal window (long)
+uniform uint nSpecMax;   // specular temporal window (short)
 
 void main() {
-    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
-    if (pixelCoord.x >= screenResolution.x || pixelCoord.y >= screenResolution.y) {
-        return;
-    }
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= uniqueCount) return;
 
-    vec4 data = imageLoad(inputColorBuffer, pixelCoord).xyzw;
-    uint voxelID = uint(data.w);
-    if(voxelID == 0){
-        imageStore(outputColorBuffer, pixelCoord, vec4(data.xyz, 1));
-        return;
-    }
-    uint voxelHash = voxelID % uint(size - 1) + uint(1);
-    uvec3 accumulatedColor1, accumulatedColor2;
-    uint count1, count2, id;
-    int i = 0;
-    for(; i < stride * slots; i+=stride){
-        id = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i)).r;
-        if(id == voxelID)
-            break;
-    }
-    
-    if (id == voxelID) {
-        count1 = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i+1)).r;
-        count2 = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i+5)).r;
-        accumulatedColor1.x = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i+2)).r;
-        accumulatedColor1.y = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i+3)).r;
-        accumulatedColor1.z = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i+4)).r;
-        accumulatedColor2.x = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i+6)).r;
-        accumulatedColor2.y = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i+7)).r;
-        accumulatedColor2.z = imageLoad(voxelColorAccumulationBuffer, ivec2(voxelHash, i+8)).r;
-        vec3 col = vec3(
-            float(accumulatedColor1.x + accumulatedColor2.x),
-            float(accumulatedColor1.y + accumulatedColor2.y),
-            float(accumulatedColor1.z + accumulatedColor2.z)
-        );
-        vec4 averageColor = vec4((col.xyz / float(count1 + count2)) / 255.0, 1);
-        imageStore(outputColorBuffer, pixelCoord, averageColor);
-    } else {
-        imageStore(outputColorBuffer, pixelCoord, vec4(data.xyz, 1));
-    }
+    uint slot = uniqueList.entries[gid].z;
+    if (slot == LB_NO_SLOT) return;
+    uint sb = linearSlotToBase(slot);
+
+    uint pixels = lbuf.data[sb + LB_PIXELS];
+    if (pixels == 0u) return;                       // not sampled this frame → keep history
+
+    float inv = 1.0 / (float(pixels) * ACCUM_SCALE);
+    vec3 dframe = vec3(lbuf.data[sb + LB_DIFF_ACC + 0u],
+                       lbuf.data[sb + LB_DIFF_ACC + 1u],
+                       lbuf.data[sb + LB_DIFF_ACC + 2u]) * inv;
+    vec3 sframe = vec3(lbuf.data[sb + LB_SPEC_ACC + 0u],
+                       lbuf.data[sb + LB_SPEC_ACC + 1u],
+                       lbuf.data[sb + LB_SPEC_ACC + 2u]) * inv;
+
+    uint samples = lbuf.data[sb + LB_SAMPLES];
+    float nd = float(samples & 0xFFFFu);
+    float ns = float(samples >> 16u);
+    float pf = float(pixels);
+
+    vec3 dch = unpackRGB9E5(lbuf.data[sb + LB_DIFFUSE]);
+    vec3 sch = unpackRGB9E5(lbuf.data[sb + LB_SPECULAR]);
+
+    dch = (dch * nd + dframe * pf) / (nd + pf);     // sample-capped running average
+    sch = (sch * ns + sframe * pf) / (ns + pf);
+
+    uint ndNew = min((samples & 0xFFFFu) + pixels, nDiffMax);
+    uint nsNew = min((samples >> 16u)   + pixels, nSpecMax);
+
+    lbuf.data[sb + LB_DIFFUSE]  = packRGB9E5(dch);
+    lbuf.data[sb + LB_SPECULAR] = packRGB9E5(sch);
+    lbuf.data[sb + LB_SAMPLES]  = (ndNew & 0xFFFFu) | (nsNew << 16u);
+
+    // clear per-frame accumulators for next frame
+    lbuf.data[sb + LB_PIXELS]        = 0u;
+    lbuf.data[sb + LB_DIFF_ACC + 0u] = 0u;
+    lbuf.data[sb + LB_DIFF_ACC + 1u] = 0u;
+    lbuf.data[sb + LB_DIFF_ACC + 2u] = 0u;
+    lbuf.data[sb + LB_SPEC_ACC + 0u] = 0u;
+    lbuf.data[sb + LB_SPEC_ACC + 1u] = 0u;
+    lbuf.data[sb + LB_SPEC_ACC + 2u] = 0u;
 }

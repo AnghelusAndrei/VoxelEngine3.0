@@ -6,6 +6,7 @@ Interface::Interface(GLFWwindow *window_, const char* glsl_version_) : window(wi
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;      // Enable Gamepad Controls
 
     ImGui::StyleColorsDark();
+    io.FontGlobalScale = 1.5f;
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init(glsl_version);

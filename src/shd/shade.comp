@@ -1,0 +1,272 @@
+#version 460 core
+
+layout(local_size_x = 8, local_size_y = 8) in;   // 64 threads → matches internal.glsl gs_stack[*][64]
+
+// B1.2 megakernel path tracer over the virtual framebuffer. One thread per virtual
+// pixel:
+//   1. read the (jittered, downscaled) primary voxel from the virtual gbuffer
+//   2. resolve its normal: cached lBuffer normal if present, else a small occupancy
+//      kernel (voxelNormal)
+//   3. cast 1 cosine-weighted diffuse ray + 1 GGX-VNDF specular ray, each ONE bounce
+//      with irradiance-cache feedback — a bounce that hits a cached voxel reads its
+//      diffuse radiosity (albedo·diffuseChannel) ≈ all further bounces; sky + emissive
+//      voxels are the only direct light. Uncached non-emissive hit contributes 0.
+//   4. write incident diffuse (E/π) and specular outgoing radiance to the virtual
+//      images. accum.comp reduces them per-voxel; resolve composites albedo·diffuse+spec.
+//
+// Diffuse channel convention: it stores the cosine-sampled incoming radiance, i.e.
+// E/π, so Lambertian outgoing = albedo·channel and cache feedback = albedo_W·channel_W
+// (no stray π anywhere). Specular channel stores the throughput-weighted outgoing
+// radiance directly (view-dependent — never fed back).
+
+layout(binding = 0, rgba32ui) readonly  uniform uimage2D virtualGBuffer;
+layout(binding = 1, rgba32f)  writeonly uniform image2D  virtualDiffuse;
+layout(binding = 2, rgba32f)  writeonly uniform image2D  virtualSpecular;
+layout(binding = 3, rgba32f)  writeonly uniform image2D  virtualNormal;   // xyz=normal · w=roughness (à-trous)
+
+layout(std430, binding = 0) readonly buffer OctreeBuffer { uvec2 nodes[]; } octree;
+
+uniform uint  octreeDepth;
+uniform uint  primary_raystop;
+uniform uint  frameIndex;         // monotonic frame counter — RNG decorrelation seed
+uniform ivec2 virtualSize;
+
+layout(std140, binding = 0) uniform CameraUniform {
+    vec4 position;
+    vec4 cameraPlane, cameraPlaneRight, cameraPlaneUp;
+} camera;
+
+struct Material {
+    vec4 color, specularColor;
+    float roughness, specular, metallic;
+    bool emissive;
+    float emissiveIntensity;
+};
+layout(std140, binding = 1) uniform MaterialUniform { Material material[127]; };
+
+uniform samplerCube skybox;
+
+#include "gbuffer.glsl"
+#include "lbuffer.glsl"
+#include "internal.glsl"
+#include "lighttree.glsl"
+
+#define RIS_M 8   // NEE/RIS candidate count: draw M lights, weighted-resample to 1, one shadow ray
+
+// ---- RNG (PCG hash) ----
+uint pcg(inout uint s){ s = s*747796405u + 2891336453u; uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u; return (w >> 22u) ^ w; }
+float rnd(inout uint s){ return float(pcg(s)) * (1.0 / 4294967296.0); }
+
+// ---- GGX VNDF importance sampling (Heitz 2018) ----
+float smithG1GGX(float NdotX, float a){ float a2 = a*a; return 2.0*NdotX / (NdotX + sqrt(a2 + (1.0 - a2)*NdotX*NdotX)); }
+
+vec3 sampleGGXVNDF(vec3 N, vec3 V, float roughness, inout uint st){
+    float a = max(roughness*roughness, 0.001);
+    vec3 up = abs(N.z) < 0.999 ? vec3(0,0,1) : vec3(1,0,0);
+    vec3 T  = normalize(cross(up, N));
+    vec3 B  = cross(N, T);
+    vec3 Vl = vec3(dot(V,T), dot(V,B), dot(V,N));
+    vec3 Vh = normalize(vec3(a*Vl.x, a*Vl.y, Vl.z));
+    float lensq = Vh.x*Vh.x + Vh.y*Vh.y;
+    vec3 T1 = lensq > 0.0 ? vec3(-Vh.y, Vh.x, 0.0) * inversesqrt(lensq) : vec3(1,0,0);
+    vec3 T2 = cross(Vh, T1);
+    float r1 = rnd(st), r2 = rnd(st);
+    float r = sqrt(r1), phi = 6.2831853 * r2;
+    float t1 = r*cos(phi), t2 = r*sin(phi);
+    float s = 0.5*(1.0 + Vh.z);
+    t2 = (1.0 - s)*sqrt(max(1.0 - t1*t1, 0.0)) + s*t2;
+    vec3 Nh = t1*T1 + t2*T2 + sqrt(max(0.0, 1.0 - t1*t1 - t2*t2))*Vh;
+    vec3 Hl = normalize(vec3(a*Nh.x, a*Nh.y, max(0.0, Nh.z)));
+    return normalize(Hl.x*T + Hl.y*B + Hl.z*N);
+}
+
+// VNDF throughput = BRDF·NdotL / pdf(L) = F·G1(L) (D, G1(V), 4·NdotV·NdotL cancel).
+vec3 ggxThroughput(vec3 N, vec3 V, vec3 L, vec3 H, float roughness, vec3 F0){
+    float NdotL = max(dot(N, L), 0.001);
+    float VdotH = max(dot(V, H), 0.001);
+    vec3  F = F0 + (vec3(1.0) - F0) * pow(1.0 - VdotH, 5.0);
+    return F * smithG1GGX(NdotL, roughness*roughness);
+}
+
+// Cosine-weighted hemisphere sample around N (pdf = cos/π → Lambertian throughput = albedo).
+vec3 cosineHemisphere(vec3 N, inout uint st){
+    float r1 = rnd(st), r2 = rnd(st);
+    float phi = 6.2831853 * r1;
+    float ct  = sqrt(1.0 - r2);     // cos θ
+    float sth = sqrt(r2);
+    vec3 up = abs(N.z) < 0.999 ? vec3(0,0,1) : vec3(1,0,0);
+    vec3 T  = normalize(cross(up, N));
+    vec3 B  = cross(N, T);
+    return normalize(T*(sth*cos(phi)) + B*(sth*sin(phi)) + N*ct);
+}
+
+vec3 sampleSky(vec3 d){ return texture(skybox, d).rgb; }
+
+// Solid-angle pdf the NEE light-sampler assigns to the leaf at (lightPos,lightSize): the discrete
+// leaf-selection prob × the area→solid-angle Jacobian d²/(A·cosLight), using the voxel CENTRE +
+// dominant face. Used IDENTICALLY for the NEE winner and a BSDF-ray hit so the two MIS weights
+// partition to 1 (Veach) → unbiased. cosLight floored to avoid a divide blow-up at grazing.
+float lightSolidAnglePdf(vec3 shadingCenter, uvec3 lightPos, uint lightSize, float pdfDisc){
+    vec3  lc = vec3(lightPos) + float(lightSize) * 0.5;
+    vec3  d  = shadingCenter - lc;                       // light → shading point
+    float d2 = max(dot(d, d), 1e-8);
+    float cosLight = max(dot(dominantFaceNormal(d), d * inversesqrt(d2)), 1e-4);
+    float A  = float(lightSize) * float(lightSize);
+    return pdfDisc * d2 / (A * cosLight);
+}
+
+// ---- occupancy fallback normal (rare: primary voxel not cached / overflow) ----
+bool occAt(ivec3 sp, uint lev, uint Lng){
+    if (any(lessThan(sp, ivec3(0))) || any(greaterThanEqual(sp, ivec3(int(Lng))))) return false;
+    uvec3 u = uvec3(sp);
+    if ((octree.nodes[0].x & 1u) == 0u) return ((octree.nodes[0].x >> 1u) & 0x7Fu) != 0u;
+    uint block = octree.nodes[0].y;
+    for (uint d = 1u; d <= lev; d++){
+        uint p2  = Lng >> d;
+        uint idx = (uint(bool(u.x & p2)) << 2u) | (uint(bool(u.y & p2)) << 1u) | uint(bool(u.z & p2));
+        uvec2 n = octree.nodes[block + idx];
+        if (n.x == 0u && n.y == 0u) return false;
+        if ((n.x & 1u) == 0u)       return ((n.x >> 1u) & 0x7Fu) != 0u;
+        if (d == lev)               return true;
+        block = n.y;
+    }
+    return false;
+}
+vec3 kernelNormal(uvec3 pos, uint level, uint vsize, uint Lng){
+    vec3 g = vec3(0.0);
+    for (int dz = -2; dz <= 2; dz++)
+    for (int dy = -2; dy <= 2; dy++)
+    for (int dx = -2; dx <= 2; dx++){
+        int r2 = dx*dx + dy*dy + dz*dz; if (r2 == 0) continue;
+        if (occAt(ivec3(pos) + ivec3(dx,dy,dz)*int(vsize), level, Lng))
+            g += vec3(dx,dy,dz) / float(r2);
+    }
+    return (dot(g,g) > 1e-8) ? normalize(-g) : vec3(0,1,0);
+}
+
+vec3 voxelNormal(uvec3 pos, uint level, uint version, uint vsize, uint Lng){
+    uint slot = probeLBuffer(pos, level, version);
+    if (slot != LB_NO_SLOT){
+        uint d3 = lbuf.data[linearSlotToBase(slot) + LB_NORMAL];
+        if ((d3 & NORMAL_UPDATE_BIT) == 0u) return normalize(UnpackNormal(d3));
+    }
+    return kernelNormal(pos, level, vsize, Lng);   // cache miss → approximate
+}
+
+// One bounce + irradiance-cache feedback. Returns incoming radiance along `dir`, split into:
+//   • DIRECT emission (if the hit is a light): MIS-weighted by the BSDF-side power heuristic when
+//     `misEmission` — so a bounce that lands on a light is COMBINED with NEE, not double-counted.
+//   • cached-diffuse FEEDBACK (the hit voxel's reflected indirect): NEVER weighted — NEE estimates
+//     direct only, and the neighbour's cached E already holds its own direct (the double-count rule).
+// `misEmission`=false (specular bounce) keeps emission unweighted (no NEE on specular). `shadingN`,
+// `shadingCenter` give the BSDF pdf (cosθ/π) and the NEE pdf for the MIS weight.
+vec3 traceRadiance(vec3 origin, vec3 dir, bool includeEmission, vec3 shadingCenter, vec3 shadingN, bool misEmission){
+    ray_t r; r.origin = origin; r.direction = dir; r.inverted_direction = 1.0 / dir;
+    hit_t h = Raycast(r, octreeDepth, primary_raystop, 0.0, true);   // bounce: coarse far-geom on exhaustion
+    if (!h.hit) return sampleSky(dir);                     // escaped to sky
+    Material m = material[h.material];
+
+    vec3 emission = vec3(0.0);
+    if (includeEmission && m.emissive){
+        emission = m.color.rgb * m.emissiveIntensity;
+        if (misEmission){                                  // power heuristic: w_bsdf = p_bsdf²/(p_bsdf²+p_nee²)
+            float pBsdf = max(dot(shadingN, dir), 1e-4) * (1.0 / 3.14159265);   // cosine-bounce pdf
+            float pNee  = lightSolidAnglePdf(shadingCenter, h.position, h.size, lightTreePdf(h.position));
+            emission   *= (pBsdf * pBsdf) / (pBsdf * pBsdf + pNee * pNee);
+        }
+    }
+
+    vec3 feedback = vec3(0.0);
+    uint wlev = max(1u, octreeDepth - uint(findMSB(h.size)));
+    uint slot = probeLBuffer(h.position, wlev, h.version);
+    if (slot != LB_NO_SLOT)                                // cached → its diffuse radiosity (indirect)
+        feedback = (1.0 - m.metallic) * m.color.rgb * unpackRGB9E5(lbuf.data[linearSlotToBase(slot) + LB_DIFFUSE]);
+    return emission + feedback;
+}
+
+void main(){
+    ivec2 vp = ivec2(gl_GlobalInvocationID.xy);
+    if (vp.x >= virtualSize.x || vp.y >= virtualSize.y) return;
+
+    octreeLength = 1u << octreeDepth;
+
+    GBuffer gb = UnpackGBuffer(imageLoad(virtualGBuffer, vp));
+    if (!gb.hit){
+        imageStore(virtualDiffuse,  vp, vec4(0.0));
+        imageStore(virtualSpecular, vp, vec4(0.0));
+        imageStore(virtualNormal,   vp, vec4(0.0));
+        return;
+    }
+
+    uint vsize  = 1u << (octreeDepth - gb.level);
+    vec3 center = vec3(gb.pos) + float(vsize) * 0.5;
+    vec3 N      = voxelNormal(gb.pos, gb.level, gb.version, vsize, octreeLength);
+    vec3 Vd     = normalize(camera.position.xyz - center);   // toward viewer
+    Material m  = material[gb.material];
+
+    // Seed by WORLD voxel identity (gb.pos), not screen pixel. Seeding by vp keys each
+    // voxel's finite sample-direction set to its screen position with period = virtualScale,
+    // baking a screen-periodic deterministic error into the world cache → moiré. World-keyed
+    // seeding decorrelates adjacent voxels regardless of screen position. vp is mixed in only
+    // as a secondary term so several virtual pixels on one large voxel decorrelate per frame.
+    uint rng = lb_hash(gb.pos.x ^ lb_hash(gb.pos.y ^ lb_hash(gb.pos.z ^
+               lb_hash(frameIndex ^ lb_hash(uint(vp.x) ^ lb_hash(uint(vp.y))))))) | 1u;
+    vec3 origin = center + N * (0.87 * float(vsize) + 0.5); // clear the cube (√3/2·size) along the normal
+
+    // diffuse: cosine sample → E/π estimate. Emission is MIS-weighted (BSDF technique) and combined
+    // with NEE below — the bounce supplies sky, indirect feedback, AND the direct-emission faces NEE
+    // under-samples; the power heuristic splits the direct term so it is not double-counted.
+    vec3 Ld      = cosineHemisphere(N, rng);
+    vec3 diffuse = min(traceRadiance(origin, Ld, true, center, N, true), vec3(FIREFLY_CLAMP));
+
+    // specular: GGX-VNDF sample, throughput F·G1(L)·specular. Emission UNweighted (no NEE on specular,
+    // so the slab must stay full in reflections).
+    vec3 specular = vec3(0.0);
+    if (m.specular > 0.01){
+        vec3 H  = sampleGGXVNDF(N, Vd, m.roughness, rng);
+        vec3 Ls = reflect(-Vd, H);
+        if (dot(Ls, N) > 0.0){
+            vec3 F0  = mix(vec3(0.04), m.color.rgb, m.metallic);
+            vec3 thr = ggxThroughput(N, Vd, Ls, H, m.roughness, F0) * m.specular;
+            specular = min(traceRadiance(origin, Ls, true, center, N, false) * thr, vec3(FIREFLY_CLAMP));
+        }
+    }
+
+    // ---- ReSTIR DI: read this voxel's SPATIOTEMPORAL reservoir (built by restir.comp + restir_spatial.comp
+    // into the parallel resvSp buffer) and shade it at the light CENTRE — geometry matches targetPhat so
+    // f·W cancels p̂ exactly (no geometry-ratio fireflies). Per-pixel shadow ray = visibility. Skip metals.
+    if (m.metallic < 0.99){
+        uint slot = probeLBuffer(gb.pos, gb.level, gb.version);
+        uint d14  = (slot != LB_NO_SLOT) ? resvSp.data[resvSpBase(slot)] : 0u;
+        if (unpackResvM(d14) > 0u){
+            float W = uintBitsToFloat(resvSp.data[resvSpBase(slot) + 1u]);
+            if (W > 0.0){
+                uvec3 yPos = unpackResvPos(d14);
+                vec3  lc  = vec3(yPos) + 0.5;
+                vec3  toL = lc - center;
+                float d2  = max(dot(toL, toL), 1e-8);
+                vec3  wL  = toL * inversesqrt(d2);
+                float cosSurf  = max(dot(N, wL), 0.0);
+                float cosLight = max(dot(dominantFaceNormal(-toL), -wL), 0.0);
+                if (cosSurf > 0.0 && cosLight > 0.0){
+                    vec3  sdir = normalize(lc - origin);
+                    ray_t sr; sr.origin = origin; sr.direction = sdir; sr.inverted_direction = 1.0 / sdir;
+                    hit_t sh = Raycast(sr, octreeDepth, primary_raystop, 0.0, false);   // occlusion: clean miss on exhaust
+                    if (sh.hit && all(equal(sh.position, yPos))){
+                        // f_centre·W cancels p̂_centre exactly → unbiased, no geometry-ratio fireflies.
+                        vec3  fC = material[sh.material].color.rgb * material[sh.material].emissiveIntensity
+                                 * (cosSurf * cosLight / (3.14159265 * d2));
+                        float pBsdf = max(cosSurf, 1e-4) * (1.0 / 3.14159265);
+                        float pNee  = lightSolidAnglePdf(center, yPos, 1u, lightTreePdf(yPos));
+                        float wNee  = (pNee * pNee) / (pNee * pNee + pBsdf * pBsdf);
+                        diffuse += min(fC * W * wNee, vec3(FIREFLY_CLAMP));
+                    }
+                }
+            }
+        }
+    }
+
+    imageStore(virtualDiffuse,  vp, vec4(diffuse,  1.0));
+    imageStore(virtualSpecular, vp, vec4(specular, 1.0));
+    imageStore(virtualNormal,   vp, vec4(N, m.roughness));   // .w = roughness → à-trous adaptive budget
+}

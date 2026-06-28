@@ -45,7 +45,7 @@ class Camera{
     float aspect_ratio;
 
     private:
-    void GenUBO(GLuint program_);
+    void GenUBO();
     void freeVRAM();
 
     GLuint gl_ID;   

@@ -12,69 +12,37 @@ void Control::SetConfigs(core::RendererConfig *rendererConfig_, core::FrameConfi
 }
 
 void Control::DrawSceneControl(){
-    ImGui::SliderFloat("fpcam speed", &(fpconfig->speed), 0.0f, 500.0f);
+    ImGui::SliderFloat("fpcam speed",       &(fpconfig->speed),       0.0f, 500.0f);
     ImGui::SliderFloat("fpcam sensitivity", &(fpconfig->sensitivity), 0.0f, 3.0f);
 }
 
 void Control::DrawShaderControl(){
-    ImGui::Text("View Types: ");
+    static const char* modes[] = {
+        "OCTREE", "MATERIAL", "NORMAL", "VERSION", "CLAIM_AGE", "LRU_OCCUPANCY",
+        "VIRTUAL", "SHADE", "SHADING", "SAMPLES", "STEPS", "LIGHTTREE"
+    };
+    int mode = (int)frameConfig->renderType;
+    if(ImGui::Combo("render mode", &mode, modes, IM_ARRAYSIZE(modes)))
+        frameConfig->renderType = (core::RenderType)mode;
 
-    bool DEFAULT_b = frameConfig->renderType == core::RenderType::DEFAULT;
-    bool STRUCTURE_b = frameConfig->renderType == core::RenderType::STRUCTURE;
-    bool ALBEDO_b = frameConfig->renderType == core::RenderType::ALBEDO;
-    bool NORMAL_b = frameConfig->renderType == core::RenderType::NORMAL;
-    bool VOXELID_b = frameConfig->renderType == core::RenderType::VOXELID;
+    ImGui::SliderInt("normal precision", &frameConfig->normalPrecision, 1, 10);
+    ImGui::SliderInt("virtual scale", &frameConfig->virtualScale, 1, 12);
 
-    if (ImGui::Checkbox("DEFAULT", &DEFAULT_b))
-    {
-        if (DEFAULT_b) frameConfig->renderType = core::RenderType::DEFAULT;
-        else frameConfig->renderType = core::RenderType::DEFAULT;
-    }
-
-    if (ImGui::Checkbox("STRUCTURE", &STRUCTURE_b))
-    {
-        if (STRUCTURE_b) frameConfig->renderType = core::RenderType::STRUCTURE;
-        else frameConfig->renderType = core::RenderType::STRUCTURE;
-    }
-
-    if (ImGui::Checkbox("ALBEDO", &ALBEDO_b))
-    {
-        if (ALBEDO_b) frameConfig->renderType = core::RenderType::ALBEDO;
-        else frameConfig->renderType = core::RenderType::ALBEDO;
-    }
-
-    if (ImGui::Checkbox("NORMAL", &NORMAL_b))
-    {
-        if (NORMAL_b) frameConfig->renderType = core::RenderType::NORMAL;
-        else frameConfig->renderType = core::RenderType::NORMAL;
-    }
-
-    if (ImGui::Checkbox("VOXELID", &VOXELID_b))
-    {
-        if (VOXELID_b) frameConfig->renderType = core::RenderType::VOXELID;
-        else frameConfig->renderType = core::RenderType::VOXELID;
-    }
-
-    // Reset all other options when one is selected
-    if (DEFAULT_b) STRUCTURE_b = ALBEDO_b = NORMAL_b = VOXELID_b = false;
-    if (STRUCTURE_b) DEFAULT_b = ALBEDO_b = NORMAL_b = VOXELID_b = false;
-    if (ALBEDO_b) DEFAULT_b = STRUCTURE_b = NORMAL_b = VOXELID_b = false;
-    if (NORMAL_b) DEFAULT_b = STRUCTURE_b = ALBEDO_b = VOXELID_b = false;
-    if (VOXELID_b) DEFAULT_b = STRUCTURE_b = ALBEDO_b = NORMAL_b = false;
-
-    ImGui::Separator();
     if(ImGui::Button("Recompile shaders"))
         frameConfig->shaderRecompilation = true;
 }
 
 void Control::DrawLightingControl(){
-    ImGui::Text("pipeline specific:");
-    ImGui::SliderFloat("lBufferSwapSec", &(frameConfig->lBufferSwapSeconds), 0.0f, 0.5f);
-    ImGui::Separator();
-    ImGui::Text("raytracing:");
-    ImGui::SliderInt("spp", &(frameConfig->spp), 1, 10);
-    ImGui::SliderInt("bounces", &(frameConfig->bounces), 1, 10);
-    ImGui::SliderInt("max checks", &(frameConfig->controlchecks), 1, 300);
+    ImGui::Text("temporal accumulation (EMA sample caps):");
+    ImGui::SliderInt("diffuse window",  &frameConfig->emaDiffuse,  1, 1024);
+    ImGui::SliderInt("specular window", &frameConfig->emaSpecular, 1, 64);
+    ImGui::Text("a-trous specular filter (adaptive by roughness; 0=off):");
+    ImGui::SliderInt  ("spec atrous max iters", &frameConfig->atrousIters,  0, 5);
+    ImGui::SliderFloat("atrous sigmaN", &frameConfig->atrousSigmaN, 1.0f, 256.0f);
+    ImGui::SliderFloat("atrous sigmaP", &frameConfig->atrousSigmaP, 0.25f, 16.0f);
+    ImGui::SliderInt  ("stale frames", &frameConfig->staleFrames, 0, 240);
+    ImGui::SliderInt  ("restir M cap", &frameConfig->restirMCap, 0, 23);
+    ImGui::SliderInt  ("restir spatial", &frameConfig->restirSpatial, 0, 6);
 }
 
 void Control::Draw(){

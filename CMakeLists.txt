@@ -3,7 +3,7 @@ project(VoxelEngine3.0 VERSION 1.0)
 set(CMAKE_CXX_STANDARD 17)
 include(FetchContent)
 
-set(CMAKE_BUILD_TYPE Debug)
+set(CMAKE_BUILD_TYPE RelWithDebInfo)
 if ( ${CMAKE_SOURCE_DIR} STREQUAL ${CMAKE_BINARY_DIR} )
     message( FATAL_ERROR "In-source builds not allowed. Please make a new directory (called a build directory) and run CMake from there. You may need to remove CMakeCache.txt." )
 endif()
@@ -23,7 +23,7 @@ set(CMAKE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
 set(GLAD_OUT_DIR        "${CMAKE_CURRENT_BINARY_DIR}" CACHE STRING "Output directory" FORCE)
 set(GLAD_PROFILE        "core" CACHE STRING "OpenGL profile" FORCE)
-set(GLAD_API            "gl=4.3" CACHE STRING "API type/version pairs, like \"gl=3.2,gles=\", no version means latest" FORCE)
+set(GLAD_API            "gl=4.6" CACHE STRING "API type/version pairs, like \"gl=3.2,gles=\", no version means latest" FORCE)
 set(GLAD_GENERATOR      "c" CACHE STRING "Language to generate the binding for" FORCE)
 set(GLAD_EXTENSIONS     "" CACHE STRING "Path to extensions file or comma separated list of extensions, if missing all extensions are included" FORCE)
 set(GLAD_SPEC           "gl" CACHE STRING "Name of the spec" FORCE)
@@ -97,7 +97,15 @@ file(
     DESTINATION ${OUTPUT_DIR}
 )
 
-# Handle shaders
-
-file(GLOB_RECURSE shaders "*.glsl" "*.hlsl" "*.frag" "*.vert" "*.comp")
+# Handle shaders — glob ONLY the source shader dir. A project-wide GLOB_RECURSE also matches
+# this script's own prior copies in bin/<config>/shd and build/shd, whose filenames collide on
+# copy (last-writer-wins, non-deterministic) — and a frozen stale config dir then overwrites the
+# fresh shaders. Restricting to src/shd/ makes the source the single, authoritative origin.
+file(GLOB_RECURSE shaders
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/shd/*.glsl"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/shd/*.hlsl"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/shd/*.frag"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/shd/*.vert"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/shd/*.comp")
 file(COPY ${shaders} DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/shd)
+file(COPY ${shaders} DESTINATION ${OUTPUT_DIR}/shd)
