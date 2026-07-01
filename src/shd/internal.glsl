@@ -33,7 +33,6 @@ uint locate(uvec3 pos, uint p2) {
     return (uint(bool(pos.x & p2)) << 2u) | (uint(bool(pos.y & p2)) << 1u) | uint(bool(pos.z & p2));
 }
 
-// Bounding box intersection used for initial SVO entry
 vec4 intersect(ray_t r, vec3 box_min, vec3 box_max) {
     vec3 t1 = (box_min - r.origin + 0.001) * r.inverted_direction;
     vec3 t2 = (box_max - r.origin - 0.001) * r.inverted_direction;
@@ -52,11 +51,7 @@ vec4 intersect(ray_t r, vec3 box_min, vec3 box_max) {
 // on the walk-up without a re-fetch.
 shared uvec2 gs_stack[MAXDEPTH][64];
 
-// coarseOnExhaust: on step-budget exhaustion, return the last (coarse) node as a hit. TRUE for
-// primary / bounce rays (a plausible far-geometry stand-in). FALSE for occlusion (shadow) rays —
-// they must report a clean MISS on exhaustion, never fabricate a hit at a coarse position, which
-// would otherwise let the strict `hit.position == lightVoxel` test spuriously pass/fail.
-hit_t Raycast(ray_t ray, uint maxDepth, uint maxSteps, float originOffset, bool coarseOnExhaust) {
+hit_t Raycast(ray_t ray, uint maxDepth, uint maxSteps, float originOffset) {
     uint effDepth = (maxDepth < octreeDepth) ? maxDepth : octreeDepth;
     uint threadIdx = gl_LocalInvocationIndex;
 
@@ -64,9 +59,7 @@ hit_t Raycast(ray_t ray, uint maxDepth, uint maxSteps, float originOffset, bool 
     // 1.0 if direction is positive, 0.0 if negative
     vec3 ray_step_mask = step(vec3(0.0), ray.direction);
 
-    // Advance the origin along the ray before traversal. Primary rays pass a few
-    // units (cheap near-clip from the camera); surface-origin bounce rays pass 0 so
-    // they cannot skip nearby occluders (light leak) — they pre-offset off the face.
+    // cheap near-clip from the camera
     ray.origin += ray.direction * originOffset;
 
     vec3 r_pos;
@@ -146,7 +139,7 @@ hit_t Raycast(ray_t ray, uint maxDepth, uint maxSteps, float originOffset, bool 
             gs_stack[d][threadIdx] = raw;
             offset = node.next;
         }
-        if (coarseOnExhaust && q == maxSteps-1u) { // Early exit if maxSteps reached, return last coarse node since material representative is stored.
+        if (q == maxSteps-1u) { // Early exit if maxSteps reached, return last coarse node since material representative is stored.
             if (node.material != 0u)
                 return hit_t(true, slot, node.material, uvec3(target_pos), target_size, node.version, q);
         }
@@ -162,10 +155,6 @@ hit_t Raycast(ray_t ray, uint maxDepth, uint maxSteps, float originOffset, bool 
         float t_next = min(min(t_exit.x, t_exit.y), t_exit.z);
 
         // Step to the exit plane, then nudge axis-aligned past the face.
-        // Axis-aligned nudge avoids the grazing-ray precision failure of
-        // direction-scaled stepping: for a nearly-parallel ray (direction[i] ≈ 0),
-        // direction * epsilon contributes < ULP(r_pos[i]) in the crossing axis,
-        // leaving r_pos.i on the wrong side of the integer boundary.
         // Scaling by target_size keeps accuracy consistent at every octree depth.
         r_pos += ray.direction * t_next;
         bvec3 is_exit = lessThanEqual(t_exit, vec3(t_next) * (1.0 + 1e-4) + 1e-5);

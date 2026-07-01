@@ -2,13 +2,6 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-// B1.3 — per-voxel temporal reduction. Dispatched indirect over uniqueVoxelList (same
-// args as normal.comp). For each visible voxel it averages this frame's scattered
-// samples (accum.comp) and blends them into the persistent diffuse/specular channels
-// via a sample-capped running average (EMA): the diffuse window is long (denoise hard),
-// the specular window is short (view-dependent → forget fast). Then it clears the
-// per-frame accumulators. Voxels not sampled this frame keep their cached radiance.
-//
 // Blend weights this frame's mean by its sample count `pixels` (coverage-proportional
 // convergence). Once the sample count reaches its cap it behaves as an EMA with that
 // window. This is what feeds the irradiance-cache feedback in shade.comp.

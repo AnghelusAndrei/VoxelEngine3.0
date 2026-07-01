@@ -37,15 +37,13 @@ uniform samplerCube skybox;
 
 #include "gbuffer.glsl"
 #include "lbuffer.glsl"
-#include "lighttree.glsl"
 
 // Render modes — keep in sync with core::RenderType.
 const uint MODE_OCTREE = 0u, MODE_MATERIAL = 1u, MODE_NORMAL = 2u,
            MODE_VERSION = 3u, MODE_CLAIM_AGE = 4u, MODE_LRU = 5u, MODE_VIRTUAL = 6u,
-           MODE_SHADE = 7u, MODE_SHADING = 8u, MODE_SAMPLES = 9u, MODE_STEPS = 10u,
-           MODE_LIGHTTREE = 11u;
+           MODE_SHADE = 7u, MODE_SHADING = 8u, MODE_SAMPLES = 9u, MODE_STEPS = 10u;
 
-// jet-style ramp (blue→cyan→yellow→red) for the per-ray DDA step heatmap.
+// jet-style ramp (blue=>cyan=>yellow=>red) for the per-ray DDA step heatmap.
 vec3 heat(float t){
     return clamp(vec3(1.5 - abs(4.0*t - 3.0),
                       1.5 - abs(4.0*t - 2.0),
@@ -59,7 +57,7 @@ void main() {
     GBuffer gb = UnpackGBuffer(imageLoad(gbufferTexture, pix));
 
     // STEPS heatmap: per-ray DDA traversal cost (hits AND misses) — diagnostic for where
-    // primary.comp spends time. Bypasses the miss→skybox path so far misses show too.
+    // primary.comp spends time. Bypasses the miss=>skybox path so far misses show too.
     if (renderMode == MODE_STEPS) {
         float t = clamp(float(gb.steps) / float(max(primaryRaystop, 1u)), 0.0, 1.0);
         imageStore(resolveTexture, pix, vec4(heat(t), 1.0));
@@ -68,7 +66,7 @@ void main() {
 
     vec3 col;
     if (!gb.hit) {
-        // Miss → skybox (recompute the primary ray for this pixel).
+        // Miss => skybox (recompute the primary ray for this pixel).
         vec2 ndc = vec2(
             (float(pix.x) + 0.5) / float(screenResolution.x) * 2.0 - 1.0,
             (float(pix.y) + 0.5) / float(screenResolution.y) * 2.0 - 1.0
@@ -97,7 +95,7 @@ void main() {
         col = (slot == LB_NO_SLOT) ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);  // red miss / green cached
     } else if (renderMode == MODE_VIRTUAL) {
         // Downscaled material from the jittered virtual gbuffer (blocky + per-frame
-        // jitter confirms downscale.comp). Miss in the virtual sample → magenta.
+        // jitter confirms downscale.comp). Miss in the virtual sample => magenta.
         GBuffer vg = UnpackGBuffer(imageLoad(virtualGBuffer, pix / int(virtualScale)));
         col = vg.hit ? material[vg.material].color.rgb : vec3(1.0, 0.0, 1.0);
     } else if (renderMode == MODE_SHADE) {
@@ -118,7 +116,7 @@ void main() {
         Material mm = material[gb.material];
         uint slot = probeLBuffer(gb.pos, gb.level, gb.version);
         if (slot == LB_NO_SLOT) {
-            col = mm.color.rgb;                              // overflow voxel → flat albedo fallback
+            col = mm.color.rgb;                              // overflow voxel => flat albedo fallback
         } else {
             uint sb  = linearSlotToBase(slot);
             vec3 dch = unpackRGB9E5(lbuf.data[sb + LB_DIFFUSE]);
@@ -127,29 +125,17 @@ void main() {
         }
         if (mm.emissive) col += mm.color.rgb * mm.emissiveIntensity;   // self-emission
     } else if (renderMode == MODE_SAMPLES) {
-        // Per-voxel diffuse EMA sample count: black=0, white=1024 (converged). If the
-        // streak pattern shows up here as LOW counts, it's undersampling, not the sampler.
         uint slot = probeLBuffer(gb.pos, gb.level, gb.version);
         if (slot == LB_NO_SLOT) col = vec3(1.0, 0.0, 1.0);
         else col = vec3(float(lbuf.data[linearSlotToBase(slot) + LB_SAMPLES] & 0xFFFFu) / 1024.0);
-    } else if (renderMode == MODE_LIGHTTREE) {
-        // B2.0 debug: descend the light SVO for this voxel; show the direction to the sampled
-        // light (per-pixel rng → noisy, but the mean direction must point at the emissive slab;
-        // magenta = no lights). Verifies descent + leaf positions before NEE rides on top.
-        uint vsize = 1u << (octreeDepth - gb.level);
-        vec3 vc    = vec3(gb.pos) + float(vsize) * 0.5;
-        uint rng   = (uint(pix.x) * 73856093u) ^ (uint(pix.y) * 19349663u) ^ (frameStamp * 83492791u);
-        rng |= 1u;
-        LightSample ls = sampleLightTree(rng);
-        col = ls.valid ? (normalize(ls.center - vc) * 0.5 + 0.5) : vec3(1.0, 0.0, 1.0);
     } else {   // MODE_NORMAL
         uint slot = probeLBuffer(gb.pos, gb.level, gb.version);
-        if (slot == LB_NO_SLOT) col = vec3(0.5);                 // not cached → neutral
+        if (slot == LB_NO_SLOT) col = vec3(0.5);                 // not cached => neutral
         else {
             uint d3 = lbuf.data[linearSlotToBase(slot) + 3u];
             col = ((d3 & NORMAL_UPDATE_BIT) != 0u)
                 ? vec3(0.5)                                      // not computed yet
-                : UnpackNormal(d3) * 0.5 + 0.5;                  // [-1,1] → [0,1]
+                : UnpackNormal(d3) * 0.5 + 0.5;
         }
     }
 

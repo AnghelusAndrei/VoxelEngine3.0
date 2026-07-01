@@ -40,8 +40,6 @@ private:
     core::ComputePass claimPass;     // lbuffer_claim (Increment 2d)
     core::ComputePass normalPass;    // normal.comp (Increment 3)
     core::ComputePass editMarkPass;  // edit_mark.comp (Increment 3)
-    core::ComputePass restirPass;        // restir.comp (E1): per-voxel ReSTIR DI temporal reservoir
-    core::ComputePass restirSpatialPass; // restir_spatial.comp (E1.1): spatial Z-combine → spatiotemporal loop
     core::ComputePass downscalePass; // downscale.comp (B1.1): gbuffer → virtual gbuffer
     core::ComputePass shadePass;     // shade.comp (B1.2): per-virtual-pixel path tracer
     core::ComputePass accumPass;     // accum.comp (B1.3): scatter virtual radiance → slots
@@ -70,12 +68,6 @@ private:
         (GLsizeiptr)LBUFFER_SLOTS_TOTAL * LBUFFER_SLOT_DWORDS * (GLsizeiptr)sizeof(GLuint); // 256 MB
     static constexpr GLuint     NO_SLOT = 0xFFFFFFFFu;
     GLuint lBufferSSBO = 0;
-
-    // ReSTIR DI spatiotemporal reservoir — a parallel buffer (binding 6, 2 DWORDs/slot). Spatial pass
-    // writes here; shade + next-frame temporal read it → the feedback loop. See architecture/RESTIR.md §E1.
-    static constexpr GLsizeiptr RESV_SPATIAL_BYTES =
-        (GLsizeiptr)LBUFFER_SLOTS_TOTAL * 2 * (GLsizeiptr)sizeof(GLuint);   // 32 MB
-    GLuint resvSpatialSSBO = 0;
 
     // Per-frame dedup pipeline buffers. uniqueList is sized to the framebuffer pixel
     // count (worst case: every pixel a distinct voxel) and reallocated in framebufferEvent().

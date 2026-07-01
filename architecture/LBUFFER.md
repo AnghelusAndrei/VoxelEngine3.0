@@ -45,14 +45,7 @@ L2 line). The flat layout needs no inline lock word, so alignment is automatic.
 | 7–9 | diffuse accumulator R,G,B (u32 HDR fixed-point) | accum (add) / avg (clear) |
 | 10 | `pixelCount` (u32) | accum (add) / avg (clear) |
 | 11–13 | specular accumulator R,G,B (u32 HDR fixed-point) | accum (add) / avg (clear) |
-| 14 | **ReSTIR DI TEMPORAL reservoir** — light `pos.x[0:8]\|pos.y[9:17]\|pos.z[18:26]\|M[27:31]` (M==0 ⟹ none; depth ≤ 9) | restir |
-| 15 | **ReSTIR DI TEMPORAL reservoir** — `W` (fp32 contribution weight) | restir |
-
-> **Spatiotemporal reservoir is a *separate* parallel buffer (binding 6, 2 DWORDs/slot, 32 MB), not in
-> this 64 B slot.** D14/D15 hold the per-frame **temporal** output (read by `restir_spatial` as a
-> snapshot); the **spatial** pass writes the combined result to the parallel `resvSp[slot]`, which `shade`
-> reads and the next frame's temporal folds back in (the feedback loop). `resvSp[slot]` is zeroed in
-> `initSlot` alongside D4–D15. See [RESTIR.md](RESTIR.md) §E1.
+| 14–15 | **free** — reserved for the future ReSTIR GI reservoir (`{y, W, M}` — [RESTIR.md](RESTIR.md)) | — |
 
 - **Identity / key** = D0+D1. Empty slot = `D0==0 && D1==0` (a real leaf has `level≥1` so D1≠0).
 - **Diffuse channel = E/π** (the cosine-sampled incoming radiance estimate, **pre-albedo**). So `resolve` and the feedback term are both `albedo·channel` with no stray π, and albedo-demodulated accumulation keeps edges crisp.
@@ -84,16 +77,13 @@ wins per frame and losers advance the probe (no spin, no lock buffer, no CPU ret
 Eviction guard: only a slot with `D2 < frameStamp` is evictable (never one claimed this
 frame). `initSlot` writes `claimedSlot` back to `uniqueList[origIndex].z`.
 
-**Staleness decay (no extra storage):** on a MATCH re-claim the thread still holds the old
-`d2` in-register; if `frameStamp − d2 > staleFrames` it drops the sample count to 1 so new samples
-dominate fast. **B3 (settled): this reset now applies to BOTH the diffuse and specular counts,
-under one shared window knob.** Specular needed it for view-dependence; diffuse needs it for
-**dynamic** lighting (a removed light, or a geometry edit between a dark and a lit room — out-of-view
-voxels otherwise pop with seconds-old light on revisit). The channel *value* is untouched; only the
-EMA count drops, so a stale revisit re-converges fast with no pop-to-black. **No per-slot staleness
-DWORD** — which keeps **D14/D15 free for the ReSTIR reservoirs** ([RESTIR.md](RESTIR.md)). *Watch-point:*
-diffuse converges slower, so if the shared window churns diffuse, split into two windows later (a
-tradeoff knob, §1D-clean — not a correctness hack).
+**Staleness decay (no extra storage):** on a MATCH re-claim the thread still holds the old `d2`
+in-register; if `frameStamp − d2 > staleFrames` it drops **both** EMA counts (diffuse + specular,
+under one shared window) to ≤1 so new samples dominate fast. Specular needs it for view-dependence;
+diffuse needs it for **dynamic** lighting (a removed light, or a geometry edit between a dark and a lit
+room — out-of-view voxels otherwise return with seconds-old light). The channel *value* is untouched, so
+a stale revisit re-converges fast with no pop-to-black. *Watch-point:* diffuse converges slower, so if
+the shared window churns diffuse, split into two windows later (a §1D-clean tradeoff knob).
 
 ---
 
@@ -118,12 +108,10 @@ N         = min(N + pixels, cap);                            // cap = emaDiffuse
 Diffuse uses a long window (denoise hard); specular a short window (view-dependent →
 forget fast under camera motion). Past the cap this is a bounded EMA with that window.
 
-> **Why EMA, not double-buffer SWAP:** sampling is sparse and jittered, so a global
-> time-based A→B swap would strobe voxels whose A buffer is under-filled at swap time.
-> A per-voxel sample-capped EMA is adaptive per voxel and never strobes. Staleness control is
-> in-register: `lbuffer_claim.comp` reads the old timestamp and decays the sample count past
-> `specStaleFrames` (above) — *not* a return to double-buffering. It currently resets only
-> specular; extending it to diffuse for dynamic lighting (B3) needs no extra storage either.
+> **Why EMA, not double-buffer SWAP:** sampling is sparse and jittered, so a global time-based A→B
+> swap would strobe voxels whose A buffer is under-filled at swap time. A per-voxel sample-capped EMA
+> is adaptive per voxel and never strobes. Staleness control is in-register (`lbuffer_claim.comp` reads
+> the old timestamp and decays the sample counts past `staleFrames`) — *not* a return to double-buffering.
 
 ---
 
@@ -145,24 +133,10 @@ forget fast under camera motion). Past the cap this is a bounded EMA with that w
 does not resize (fixed `LBUFFER_SLOTS_TOTAL`). The old lock buffer (binding 9) and the
 retry/retryCount buffers (bindings 5/6/7) were deleted with B1.5 ([CLAIM.md](CLAIM.md)).
 
-## Reservoirs live in-slot (no second SSBO)
+## Future — the ReSTIR GI reservoir (D14/D15)
 
-ReSTIR reservoirs reuse the freed slot DWORDs rather than a parallel buffer — which would
-*add* VRAM (the lBuffer is already the memory pressure) and split one concept across two
-buffers. **DI** fits in D14+D15 (`{y,W,M}`; `p_hat` recomputed) — **both free and settled** now
-that B3 needs no per-slot staleness stamp (above). **GI** is reference-based (store the sample
-voxel's key + `W`+`M`; re-fetch its radiance/normal from that voxel's own slot) and fits in ~3
-DWORDs once D3 is oct-encoded (2×10-bit normal) and D6's sample counts are tightened (N_diff ≤10
-bits, N_spec ≤6) — a packing change, **no new buffer**.
-
-**Rejected/shelved for the reservoir budget (§1E):**
-- **Moving the accumulators (D7–D13) to a parallel SSBO.** Conceptually right (they're transient,
-  not persistent cache state), but indexed by **slot** the parallel buffer is the same `4M×7` DWORDs
-  → *net-zero* memory. The only version that saves VRAM indexes by **visible-count** (≤ peak-visible,
-  not slot total), which needs a slot→index back-reference DWORD *and* overflow handling. Real
-  complexity for a VRAM win not needed today (depth 9–10 fit VRAM). Keep as a future VRAM-reduction
-  refactor, not a reservoir-budget tool.
-- **Chroma-RG (luma + 2-chroma, drop a channel).** Trades HDR colour fidelity on saturated emitters
-  for bits RGB9E5 already packs into 32. Not worth it.
-
-Full design: [RESTIR.md](RESTIR.md).
+D14/D15 are free, sized for the planned GI reservoir. It is **reference-based** — store the bounce-hit
+voxel's key + `W` + `M`, and re-fetch its radiance/normal from *that voxel's own slot* at reuse (the
+world is voxels, so the sample's payload already lives in its slot — no second copy). If GI needs a
+third DWORD, reclaim one by oct-encoding the D3 normal (2×10-bit) and tightening D6's sample counts —
+a packing change, no new buffer. Full design: [RESTIR.md](RESTIR.md).

@@ -19,7 +19,7 @@ void Control::DrawSceneControl(){
 void Control::DrawShaderControl(){
     static const char* modes[] = {
         "OCTREE", "MATERIAL", "NORMAL", "VERSION", "CLAIM_AGE", "LRU_OCCUPANCY",
-        "VIRTUAL", "SHADE", "SHADING", "SAMPLES", "STEPS", "LIGHTTREE"
+        "VIRTUAL", "SHADE", "SHADING", "SAMPLES", "STEPS"
     };
     int mode = (int)frameConfig->renderType;
     if(ImGui::Combo("render mode", &mode, modes, IM_ARRAYSIZE(modes)))
@@ -41,8 +41,6 @@ void Control::DrawLightingControl(){
     ImGui::SliderFloat("atrous sigmaN", &frameConfig->atrousSigmaN, 1.0f, 256.0f);
     ImGui::SliderFloat("atrous sigmaP", &frameConfig->atrousSigmaP, 0.25f, 16.0f);
     ImGui::SliderInt  ("stale frames", &frameConfig->staleFrames, 0, 240);
-    ImGui::SliderInt  ("restir M cap", &frameConfig->restirMCap, 0, 23);
-    ImGui::SliderInt  ("restir spatial", &frameConfig->restirSpatial, 0, 6);
 }
 
 void Control::Draw(){

@@ -1,72 +1,64 @@
-# VoxelEngine3.0
+# VoxelEngine 3.0
 
-```
-This is my 3rd voxel engine, this one is made using OpenGL and GLFW and highly optimised for the GPU.
-Succesfully implements:
--Sparse Voxel Octrees
--A 4 pass raytracing rendering system:
+A real-time **GPU path tracer for sparse voxel octrees**, written in C++ and OpenGL 4.6 compute
+shaders. My third-generation voxel engine — it renders fully dynamic scenes of **tens of millions of
+voxels** with global illumination (soft shadows, color bleeding, glossy and mirror reflections) at
+**hundreds of frames per second**.
 
-  -RayPass (fragment):
-    -finds the intersection with the closest voxel (DDA on octrees optimised with bitwise operations)
-    -calculates the incoming light contribution (custom raytracing)
-    -repeats for every light bounce and sample
-    -stores a color image and a voxel ID image
+The core idea is a **per-voxel irradiance cache** (the *lBuffer*): shading is decoupled from screen
+resolution and accumulated in world space per voxel, so a single traced bounce plus cross-frame cache
+feedback converges to full multi-bounce global illumination.
 
-  -AccumPass (compute):
-    -Accumulates color for pixels sharing the same voxel ID in a spatial and temporal buffer using complex Atomic operations 
-    -stores the amount of pixels which hit the same voxel in the buffer for every pixel proccesed currently
-    -updates previous data from older frames
+## Highlights
 
-  -AvgPass (compute):
-    -Averages color for pixels sharing the same voxel ID (using Atomic Operations)
+- **23 million voxels @ 330+ FPS** (≈3 ms/frame on the GPU) — a depth-9 octree Cornell-box GI scene,
+  single NVIDIA GPU.
+- **Sparse Voxel Octree** — 64-bit AoS nodes in a single SSBO; branchless, bitwise DDA traversal.
+- **Per-voxel irradiance cache** — a flat, hash-indexed, **lock-free** open-addressed table
+  (claimed by a single-dispatch CAS on a timestamp word), LRU-evicted; world-space temporal accumulation.
+- **Megakernel path tracer** on a downscaled virtual framebuffer — cosine-weighted diffuse + GGX-VNDF
+  specular, one bounce + irradiance-cache feedback (≈ unbounded bounces over frames), per-voxel temporal
+  EMA + adaptive edge-stop à-trous denoising.
+- **Fully dynamic** — live voxel editing and dynamic lighting, with a staleness mechanism that
+  re-converges edited/relit regions fast.
+- **Sub-millisecond compute passes** — an 11-stage GPU pipeline (primary · claim · normal · downscale ·
+  shade · à-trous · accum · avg · resolve · …), each profiled live.
 
-  -RenderPass (vertex + fragment):
-    -renders the final image to the scene
+## Performance
 
--per voxel normals
--simple material system
-```
+*Measured on one NVIDIA GPU (OpenGL 4.6). Frame time is view-dependent — dominated by the primary-ray DDA.*
 
-## To do:
-```
--update structure to a more complex double tree mip-mapping cache system capable of LOD and loading huge amounts of voxels into RAM at runtime  
--Integrate ReSTIR with the current spatio-temporal Atomic buffer approach
--Object system(import, move and rotate voxel structures, textures and more)
-```
+| Octree depth | Voxels | FPS | GPU frame time | Memory |
+|---|---|---|---|---|
+| 8 | 3,540,952 | 208 | 4.69 ms | 302 MB |
+| 9 | 23,008,548 | 332 | 2.96 ms | 483 MB |
 
-# Images
-### Raytracing
-![image](https://github.com/user-attachments/assets/0b2da2ea-1eb6-4dfd-adfb-e517fd563a5d)
-### Structure
-![image](https://github.com/user-attachments/assets/7f2b0241-a7a2-4d2b-bf52-8a2d17f07a6e)
-### Albedo
-![image](https://github.com/user-attachments/assets/0eabc2e8-b4bd-4705-9486-b4e34ce7797a)
-### Normal
-![image](https://github.com/user-attachments/assets/1dd7b0a3-8eee-45f0-8f7c-d90cc333fca4)
-### Voxel ID
-![image](https://github.com/user-attachments/assets/3e0087e9-dcb2-4297-9dd4-77006ab3bf4e)
+## Images
 
+### Real-time global illumination — depth-9 octree, 23 M voxels
+![shading](README_includes/output1_depth9.png)
 
-### Extreme example (10.452.410 voxels in a scene)
-![image](https://github.com/user-attachments/assets/b2aafa31-d550-44fe-9f88-e9fee321ce05)
-![image](https://github.com/user-attachments/assets/a403150c-f39b-499a-b884-dd5a2aab2afd)
+The same view through the render pipeline — the raw single-sample signal, the per-voxel normals, and the
+accumulated + denoised output:
 
+| SHADE — raw 1 spp | NORMAL — per-voxel normals | SHADING — converged |
+|---|---|---|
+| ![shade](README_includes/vshade_depth8.png) | ![normal](README_includes/normal_depth8.png) | ![shading](README_includes/output1_depth8.png) |
 
-# Build:
+## Roadmap
 
-## Windows:
+- **ReSTIR GI** — spatiotemporal reservoir reuse of the bounce samples for near-instant convergence.
+- **Scene import** — `.obj` / mesh voxelization into the octree.
+- **LOD & out-of-core streaming** — distance-based coarsening; octree paging for scenes beyond VRAM.
 
-### Requires:
-```
--MinGW C++ compiler
--Cmake 3.11
-```
+## Build (Windows / MinGW)
+
+Requires the MinGW C++ compiler and CMake ≥ 3.11.
 
 ```
 git clone https://github.com/AnghelusAndrei/VoxelEngine3.0.git
 cd VoxelEngine3.0
-mkdir build
-cd build
+mkdir build && cd build
 cmake -G "MinGW Makefiles" ..
 cmake --build .
 ```

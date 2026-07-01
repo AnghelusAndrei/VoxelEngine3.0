@@ -5,10 +5,7 @@
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
-// Deferred gbuffer writer + per-voxel deduplication. DDA-traces the octree,
-// stores the hit voxel identity in the gbuffer, claims each visible octree slot
-// once (claim bitfield, atomicOr) and wave-compacts the unique hits into
-// uniqueVoxelList for the lbuffer_claim pass.
+
 layout(binding = 0, rgba32ui) writeonly uniform uimage2D gbufferTexture;
 
 layout(std430, binding = 0) readonly buffer OctreeBuffer { uvec2 nodes[]; } octree;
@@ -58,7 +55,7 @@ void main() {
         ray.direction = direction;
         ray.inverted_direction = 1.0 / direction;
 
-        hit_t voxel = Raycast(ray, octreeDepth, primary_raystop, 4.0, true);
+        hit_t voxel = Raycast(ray, octreeDepth, primary_raystop, 2.0);
 
         if (voxel.hit && voxel.material != 0u) {
             uint level = max(1u, octreeDepth - uint(findMSB(voxel.size)));

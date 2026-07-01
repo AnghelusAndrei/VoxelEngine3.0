@@ -2,10 +2,7 @@
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
-// B1.3 — per-virtual-pixel atomic scatter of shaded radiance into the per-voxel slot
-// accumulators. Each virtual pixel finds its primary voxel's lBuffer slot and adds its
-// (firefly-clamped, HDR fixed-point) diffuse + specular sample plus 1 to the pixel
-// count. avg.comp then reduces these per voxel into the temporal channels.
+
 layout(binding = 0, rgba32ui) readonly uniform uimage2D virtualGBuffer;
 layout(binding = 1, rgba32f)  readonly uniform image2D  virtualDiffuse;
 layout(binding = 2, rgba32f)  readonly uniform image2D  virtualSpecular;

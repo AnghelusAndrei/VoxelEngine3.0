@@ -30,7 +30,7 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
     };
 
     Octree::Config octreeConfig = {
-        .depth = 8
+        .depth = 9
     };
 
     controllerConfig = {
@@ -68,8 +68,6 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
                               "skyrender0005.bmp",
                               "skyrender0002.bmp");
     renderer = new Renderer(&rendererConfig, octree, camera, materialPool, skybox);
-    lightTree = new LightTree(octree, materialPool);
-    lightTree->attach();   // mirror emissive octree edits into the light tree (O(depth)/voxel)
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -109,8 +107,6 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
         .roughness = 0.4f, .specular = 0.0f, .metallic = 0.0f,
         .emissive = true,  .emissiveIntensity = 100.0f
     };
-    // NOTE: restored placeholder — your mid-edit had removed light_m while matLight (the emissive
-    // test plates, ~line 186) still used it, breaking the build. Tune colour/intensity to taste.
     Material light_m = {
         .color = glm::vec4(1.0f, 1.0f, 1.0f, 0.0f),
         .specularColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f),
@@ -176,30 +172,16 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
 
     octree->insertBox(glm::uvec3(0,   0,   0), glm::uvec3(L,   4,   L), matWhite);
     octree->insertBox(glm::uvec3(0,   0,   0), glm::uvec3(4,   L,   L), matGreen);
-    octree->insertBox(glm::uvec3(0,   0,   0), glm::uvec3(L,   L,   4), matBlue);
+    //octree->insertBox(glm::uvec3(0,   0,   0), glm::uvec3(L,   L,   4), matBlue);
     octree->insertBox(glm::uvec3(L-4, 0,   0), glm::uvec3(L,   L,   L), matRed);
     octree->insertBox(glm::uvec3(0,   0, L-4), glm::uvec3(L,   L,   L), matMetallic);
     octree->insertBox(glm::uvec3(0, L-4,   0), glm::uvec3(L,   L,   L), matWhite);
 
     octree->insertBox(glm::uvec3(L/4, L-8, L/4), glm::uvec3(L*3/4, L-4, L*3/4), emissive_mat2);  // original soft slab
-    // B2 test: 3×3 grid of THIN 1-voxel-thick emissive plates (zero interior — every emissive
-    // voxel is exposed/visible from below). This isolates whether NEE itself is sound, removing
-    // the solid-cluster interior-occlusion problem. (Solid spheres were pathological: most voxels
-    // interior → shadow rays die on the surface → wasted samples.) Revert: restore the slab line.
-    /*(void)emissive_mat2;
-    for (int gx = 0; gx < 3; gx++)
-    for (int gz = 0; gz < 3; gz++) {
-        uint32_t cx = (uint32_t)(L*0.2f) + gx*(uint32_t)(L*0.3f);
-        uint32_t cz = (uint32_t)(L*0.2f) + gz*(uint32_t)(L*0.3f);
-        octree->insertBox(glm::uvec3(cx, L-6u, cz), glm::uvec3(cx+8u, L-5u, cz+8u), matLight);
-    }*/
+
 
     octree->flushEdits();
     octree->editLoggingEnabled = true;
-
-    // The light tree was populated incrementally by onLeafChanged during the scene build
-    // above; just upload it (SSBO binding 5). Edits maintain it via the same hook + flushEdits.
-    lightTree->GenSSBO();
 
     insertionMat  = matEmissive;
     insertionSize = 0;
@@ -233,7 +215,6 @@ void VoxelEngine::run(){
                         octree->remove(glm::uvec3(vp));
                 }
                 octree->flushEdits();
-                lightTree->flushEdits();     // emissive removals already mirrored via onLeafChanged
             }
         }
 
@@ -253,7 +234,6 @@ void VoxelEngine::run(){
                 glm::ivec3 center = glm::ivec3(hit.position) + glm::ivec3(-camera->direction);
                 octree->insertSphere(center, insertionRadius, insertionMat, insertionSize);
                 octree->flushEdits();
-                lightTree->flushEdits();     // emissive inserts already mirrored via onLeafChanged
             }
         }
 
@@ -286,7 +266,6 @@ VoxelEngine::~VoxelEngine(){
     delete infoWidget;
     delete controlWidget;
     delete camera;
-    delete lightTree;
     delete octree;
     delete materialPool;
     delete skybox;

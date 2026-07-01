@@ -33,9 +33,9 @@ class MaterialPool{
         uint32_t addMaterial(Material *material);
         bool setMaterial(Material *material, uint32_t index);
 
-        // CPU mirror of the uploaded UBO, so subsystems (e.g. LightTree) can read a
-        // material's emissive/color/intensity by id without a GPU readback. Index 0 is
-        // the empty sentinel; valid ids are 1..length-1.
+        // CPU mirror of the uploaded UBO, so CPU-side code can read a material's
+        // emissive/color/intensity by id without a GPU readback. Index 0 is the
+        // empty sentinel; valid ids are 1..length-1.
         const Material& get(uint32_t id) const { return materials[id]; }
         bool isEmissive(uint32_t id) const { return id < materials.size() && materials[id].emissive != 0; }
 

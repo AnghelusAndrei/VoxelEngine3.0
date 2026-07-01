@@ -7,7 +7,6 @@
 #include "./UI/control.hpp"
 #include "./UI/viewportWidget.hpp"
 #include "./renderer/skybox.hpp"
-#include "./renderer/lighttree.hpp"
 #include "fpcamera.hpp"
 
 class VoxelEngine{
@@ -21,8 +20,6 @@ class VoxelEngine{
         VoxelEngine(const Config *windowConfig);
         ~VoxelEngine();
 
-        // Runs the main loop. Call once after construction; returns when the
-        // window is closed.
         void run();
 
         void setupContext(const Config *windowConfig);
@@ -34,7 +31,6 @@ class VoxelEngine{
         FPCamera     *camera       = nullptr;
         Octree       *octree       = nullptr;
         MaterialPool *materialPool = nullptr;
-        LightTree    *lightTree    = nullptr;
         Skybox       *skybox       = nullptr;
         Interface    *interface_   = nullptr;
 
@@ -51,7 +47,6 @@ class VoxelEngine{
         uint32_t insertionSize = 0;
         int insertionRadius = 0;
 
-        // Material IDs set during construction, referenced in run().
         uint32_t matEmissive  = 0;
         uint32_t matRed       = 0;
         uint32_t matGreen     = 0;

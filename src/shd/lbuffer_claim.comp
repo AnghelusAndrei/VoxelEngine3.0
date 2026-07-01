@@ -3,11 +3,8 @@
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 // Lock-free open-addressing claim (single dispatch over the deduped uniqueVoxelList).
-// One thread = one visible voxel. Linear-probe from the key's home slot; ownership of a
-// slot this frame is taken by atomicCompSwap on the TIMESTAMP word (D2) as a per-slot,
-// per-frame token — empty / match / evict all compete on that one word, so exactly one
-// thread wins a slot per frame and losers just advance the probe (no spin). See
-// architecture/CLAIM.md. Safety rests on two pipeline invariants:
+// One thread = one visible voxel. Linear-probe from the key's home slot;
+// See architecture/CLAIM.md. Safety rests on two pipeline invariants:
 //   1. uniqueVoxelList is deduplicated → one thread per key (no concurrent same-key insert)
 //   2. frameStamp ≥ 1, so D2==0 is an unambiguous pristine-empty sentinel.
 
@@ -16,15 +13,12 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(std430, binding = 3) buffer UniqueList { uvec4 entries[]; } uniqueList;
 layout(std430, binding = 4) readonly buffer UniqueCnt { uint uniqueCount; };
 
-uniform uint frameStamp;   // monotonic per-frame token (frameIdx+1, never 0)
-uniform uint staleFrames;  // re-visit gap (frames) past which a cached channel's EMA count is reset (0 = off)
+uniform uint frameStamp;   // frameIdx+1, never 0
+uniform uint staleFrames;  
 
-void initSlot(uint s){
-    uint sb = s * SLOT_DWORDS;
+void initSlot(uint sb){
     lbuf.data[sb + LB_NORMAL] = NORMAL_UPDATE_BIT;          // flag=1, normal=0 → normal.comp recomputes
     for (uint d = 4u; d < SLOT_DWORDS; d++) lbuf.data[sb + d] = 0u;  // channels / accumulators / samples
-    uint rb = resvSpBase(s);                               // clear the parallel spatiotemporal reservoir too —
-    resvSp.data[rb] = 0u; resvSp.data[rb + 1u] = 0u;        // else a reused slot serves a prior voxel's light
 }
 
 void main(){
@@ -49,31 +43,25 @@ void main(){
 
         if (lbuf.data[sb] == key.x && lbuf.data[sb + 1u] == key.y){          // MATCH
             if (atomicCompSwap(lbuf.data[sb + LB_TIMESTAMP], d2, frameStamp) == d2){
-                // Stale re-visit: a slot unseen for > staleFrames may hold light that no longer
-                // matches the scene (specular for an old view; diffuse after a removed light or a
-                // geometry edit between a dark and a lit room). Drop BOTH EMA counts (N_diff low
-                // 16 / N_spec high 16) to ≤1 so fresh samples dominate fast — the channel VALUES
-                // stay as a starting point, so no black flash; just fast re-convergence. (B3)
+                // Stale re-visit
                 if (staleFrames != 0u && (frameStamp - d2) > staleFrames){
                     uint sm = lbuf.data[sb + LB_SAMPLES];
-                    lbuf.data[sb + LB_SAMPLES]    = min(sm & 0xFFFFu, 1u) | (min(sm >> 16u, 1u) << 16u);
-                    lbuf.data[sb + LB_RESV_LIGHT] = 0u;        // drop the temporal reservoir (stale light no longer trusted)
-                    resvSp.data[resvSpBase(s)]    = 0u;        // and the spatiotemporal one (temporal reads it as prev)
+                    lbuf.data[sb + LB_SAMPLES] = min(sm & 0xFFFFu, 1u) | (min(sm >> 16u, 1u) << 16u);
                 }
                 claimed = s; break;
             }
-            continue;                                                         // evicted under us → keep probing
+            continue;
         }
-        if (d2 == 0u){                                                        // PRISTINE EMPTY
+        if (d2 == 0u){                                                        // EMPTY
             if (atomicCompSwap(lbuf.data[sb + LB_TIMESTAMP], 0u, frameStamp) == 0u){
-                lbuf.data[sb]      = key.x;                                   // commit identity (D2 already taken)
+                lbuf.data[sb]      = key.x;
                 lbuf.data[sb + 1u] = key.y;
-                initSlot(s);
+                initSlot(sb);
                 claimed = s; break;
             }
-            continue;                                                         // taken by another voxel → keep probing
+            continue;
         }
-        if (d2 < frameStamp && d2 < bestTs){ bestTs = d2; best = int(s); }    // stalest evictable victim
+        if (d2 < frameStamp && d2 < bestTs){ bestTs = d2; best = int(s); }
     }
 
     if (claimed == LB_NO_SLOT && best >= 0){                                  // EVICT stalest in the window
@@ -81,7 +69,7 @@ void main(){
         if (atomicCompSwap(lbuf.data[sb + LB_TIMESTAMP], bestTs, frameStamp) == bestTs){
             lbuf.data[sb]      = key.x;
             lbuf.data[sb + 1u] = key.y;
-            initSlot(uint(best));
+            initSlot(sb);
             claimed = uint(best);
         }
         // lost the eviction race → NO_SLOT (rare, only near full load)

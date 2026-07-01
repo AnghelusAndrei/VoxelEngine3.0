@@ -20,8 +20,6 @@ Renderer::Renderer(core::RendererConfig *config_, Octree *volume_, Camera *camer
     shader::linkCompute(claimPass,     "./shd/lbuffer_claim.comp", *config);
     shader::linkCompute(normalPass,    "./shd/normal.comp",        *config);
     shader::linkCompute(editMarkPass,  "./shd/edit_mark.comp",     *config);
-    shader::linkCompute(restirPass,    "./shd/restir.comp",        *config);
-    shader::linkCompute(restirSpatialPass, "./shd/restir_spatial.comp", *config);
     shader::linkCompute(downscalePass, "./shd/downscale.comp",     *config);
     shader::linkCompute(shadePass,     "./shd/shade.comp",         *config);
     shader::linkCompute(accumPass,     "./shd/accum.comp",         *config);
@@ -57,16 +55,6 @@ Renderer::Renderer(core::RendererConfig *config_, Octree *volume_, Camera *camer
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, core::SSBO_LBUFFER_BINDING, lBufferSSBO);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
     shader::checkGLError("lBuffer SSBO", success, *config);
-
-    // ReSTIR DI spatiotemporal reservoir — parallel buffer (binding 6, 2 DWORDs/slot, 32 MB). Zero =
-    // no reservoir; per-slot zeroed in lbuffer_claim's initSlot on claim/evict (architecture/RESTIR.md §E1).
-    glGenBuffers(1, &resvSpatialSSBO);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, resvSpatialSSBO);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, RESV_SPATIAL_BYTES, NULL, GL_DYNAMIC_DRAW);
-    glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, NULL);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, core::SSBO_RESV_SPATIAL_BINDING, resvSpatialSSBO);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-    shader::checkGLError("resvSpatial SSBO", success, *config);
 
     // Dedup pipeline buffers. uniqueList is sized in allocVoxelLists() (via
     // framebufferEvent); the small count / args are fixed-size and allocated here.
@@ -244,39 +232,6 @@ bool Renderer::run(core::FrameConfig *frameConfig){
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
     shader::checkGLError("normalPass", success, *config);
 
-    // ---------------- restir.comp : per-voxel ReSTIR DI reservoir (temporal reuse) ----------------
-    // Same indirect dispatch over uniqueVoxelList as normal/avg; octree (0), materials (1), lBuffer (2),
-    // uniqueList (3/4), light tree (5) are all bound persistently. Reservoir lands in slot D14/D15.
-    static bool s_restirDepthWarned = false;
-    if (!s_restirDepthWarned && volume->depth > 9) {
-        config->logMessage("[ReSTIR] WARNING: octree depth %u > 9 — reservoir light-position packing "
-                           "(9 bits/axis, lbuffer.glsl packResvLight) truncates; DI will misbehave.",
-                           (unsigned)volume->depth);
-        s_restirDepthWarned = true;
-    }
-    glUseProgram(restirPass.program);
-    glUniform1ui(glGetUniformLocation(restirPass.program, "octreeDepth"), (GLuint)volume->depth);
-    glUniform1ui(glGetUniformLocation(restirPass.program, "frameIndex"),  (GLuint)frameIdx);
-    glUniform1ui(glGetUniformLocation(restirPass.program, "restirMCap"),  (GLuint)frameConfig->restirMCap);
-    profiler.start("restir");
-    shader::dispatch(core::DispatchArgs::makeIndirect(indirectArgsSSBO, 0));
-    profiler.end("restir");
-    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-    shader::checkGLError("restirPass", success, *config);
-
-    // ---------------- restir_spatial.comp : spatial Z-combine → spatiotemporal reservoir (resvSp) ----------------
-    // Reads the slot D14/D15 temporal snapshot (stable post-restir barrier) of self + neighbours and writes
-    // the parallel resvSp buffer — race-free (reads slot, writes resvSp). architecture/RESTIR.md §E1.
-    glUseProgram(restirSpatialPass.program);
-    glUniform1ui(glGetUniformLocation(restirSpatialPass.program, "octreeDepth"),    (GLuint)volume->depth);
-    glUniform1ui(glGetUniformLocation(restirSpatialPass.program, "frameIndex"),     (GLuint)frameIdx);
-    glUniform1ui(glGetUniformLocation(restirSpatialPass.program, "spatialSamples"), (GLuint)frameConfig->restirSpatial);
-    profiler.start("restirSpatial");
-    shader::dispatch(core::DispatchArgs::makeIndirect(indirectArgsSSBO, 0));
-    profiler.end("restirSpatial");
-    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-    shader::checkGLError("restirSpatialPass", success, *config);
-
     // ---------------- downscale.comp : jittered gbuffer → virtual gbuffer ----------------
     glBindImageTexture(0, primaryPass.texture, 0, GL_FALSE, 0, GL_READ_ONLY,  GL_RGBA32UI);
     glBindImageTexture(1, virtualGBufferTex,   0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32UI);
@@ -442,7 +397,6 @@ Renderer::~Renderer(){
     glDeleteBuffers     (1, &finalPass.VBO);
 
     glDeleteBuffers(1, &lBufferSSBO);
-    glDeleteBuffers(1, &resvSpatialSSBO);
     glDeleteBuffers(1, &uniqueListSSBO);
     glDeleteBuffers(1, &uniqueCountSSBO);
     glDeleteBuffers(1, &indirectArgsSSBO);
@@ -464,8 +418,6 @@ Renderer::~Renderer(){
     glDeleteProgram(claimPass.program);
     glDeleteProgram(normalPass.program);
     glDeleteProgram(editMarkPass.program);
-    glDeleteProgram(restirPass.program);
-    glDeleteProgram(restirSpatialPass.program);
     glDeleteProgram(downscalePass.program);
     glDeleteProgram(shadePass.program);
     glDeleteProgram(accumPass.program);
@@ -581,8 +533,6 @@ void Renderer::handleShaderRecompilation(core::FrameConfig *frameConfig) {
     shader::relinkCompute(claimPass,     "./shd/lbuffer_claim.comp", *config);
     shader::relinkCompute(normalPass,    "./shd/normal.comp",        *config);
     shader::relinkCompute(editMarkPass,  "./shd/edit_mark.comp",     *config);
-    shader::relinkCompute(restirPass,    "./shd/restir.comp",        *config);
-    shader::relinkCompute(restirSpatialPass, "./shd/restir_spatial.comp", *config);
     shader::relinkCompute(downscalePass, "./shd/downscale.comp",     *config);
     shader::relinkCompute(shadePass,     "./shd/shade.comp",         *config);
     shader::relinkCompute(accumPass,     "./shd/accum.comp",         *config);

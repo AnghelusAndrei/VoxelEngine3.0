@@ -15,11 +15,11 @@
 //   7..9  : diffuse  accumulator R,G,B (u32, HDR fixed-point, atomicAdd in accum)
 //   10    : pixelCount                 (u32, atomicAdd in accum)
 //   11..13: specular accumulator R,G,B (u32, HDR fixed-point, atomicAdd in accum)
-//   14 : spare (prevTimestamp — dynamic-lighting increment)
+//   14 : spare (ReSTIR reservoir)
 //   15 : spare (ReSTIR reservoir)
 
 // Flat open-addressed table. N must be a power of two (so home = hash & (N-1)).
-// Size N ≈ 2× peak visible voxels (keep load factor ≤ 0.5 → ~1.5 avg probes).
+// Size N ≈ 2× peak visible voxels (keep load factor ≤ 0.5 => ~1.5 avg probes).
 #define LBUFFER_SLOTS_TOTAL 4194304u   // 2^22 slots × 64 B = 256 MB
 #define SLOT_DWORDS         16u
 #define LB_PROBE_LIMIT      32u        // max linear probe length
@@ -36,14 +36,9 @@
 #define LB_DIFF_ACC  7u    // R,G,B = 7,8,9
 #define LB_PIXELS    10u
 #define LB_SPEC_ACC  11u   // R,G,B = 11,12,13
-#define LB_RESV_LIGHT 14u  // ReSTIR DI reservoir: chosen light-tree leafIdx<<8 | M (0 ⟹ no reservoir)
-#define LB_RESV_W     15u  // ReSTIR DI reservoir: W (fp32 unbiased contribution weight)
+// DWORDs 14,15 are free (reserved for a future per-voxel illumination reservoir — see RESTIR.md).
 
-// HDR fixed-point scale for the u32 atomic accumulators. Per-sample radiance is
-// firefly-clamped (FIREFLY_CLAMP); max accumulated value per channel per frame is
-// FIREFLY_CLAMP * ACCUM_SCALE * pixelsPerVoxel. At the default virtualScale (≈130K
-// virtual pixels) a screen-filling voxel stays < 2^32; very low virtualScale + a
-// screen-filling clamped voxel can saturate (rare; radiance is ~[0,2] in practice).
+
 #define ACCUM_SCALE   1024.0
 #define FIREFLY_CLAMP 16.0
 
@@ -85,7 +80,7 @@ uint probeLBuffer(uvec3 pos, uint level, uint version){
         uint s  = (h + i) & (LBUFFER_SLOTS_TOTAL - 1u);
         uint sb = s * SLOT_DWORDS;
         if (lbuf.data[sb] == key.x && lbuf.data[sb + 1u] == key.y) return s;   // match
-        if (lbuf.data[sb + LB_TIMESTAMP] == 0u) return LB_NO_SLOT;             // pristine empty → absent
+        if (lbuf.data[sb + LB_TIMESTAMP] == 0u) return LB_NO_SLOT;             // pristine empty => absent
     }
     return LB_NO_SLOT;
 }
@@ -103,7 +98,7 @@ vec3 UnpackNormal(uint p) {
 }
 
 uint pkNormC(float c){ return uint(clamp((c + 1.0) * 511.0, 0.0, 1023.0)) & 0x3FFu; }
-// Packs into bits 2..31 (flag bit 0 left clear → "normal valid").
+// Packs into bits 2..31 (flag bit 0 left clear => "normal valid").
 uint PackNormal(vec3 n){
     return (pkNormC(n.x) << 22u) | (pkNormC(n.y) << 12u) | (pkNormC(n.z) << 2u);
 }
@@ -123,23 +118,3 @@ vec3 unpackRGB9E5(uint v){
     float scale = exp2(float(v >> 27u) - 15.0 - 9.0);
     return vec3(float(v & 0x1FFu), float((v >> 9u) & 0x1FFu), float((v >> 18u) & 0x1FFu)) * scale;
 }
-
-// ---- ReSTIR DI reservoir packing (LB_RESV_LIGHT=D14, LB_RESV_W=D15). architecture/RESTIR.md ----
-// D14 = lightPos.x[0:8] | lightPos.y[9:17] | lightPos.z[18:26] | M[27:31].  M==0 ⟹ NO reservoir.
-// Assumes octree depth ≤ 9 (each pos axis < 512 = 9 bits). renderer.cpp warns if depth > 9.
-// D15 = W (fp32 unbiased contribution weight).
-uint  packResvLight(uvec3 p, uint M){
-    return (p.x & 0x1FFu) | ((p.y & 0x1FFu) << 9u) | ((p.z & 0x1FFu) << 18u) | ((M & 0x1Fu) << 27u);
-}
-uvec3 unpackResvPos(uint d){ return uvec3(d & 0x1FFu, (d >> 9u) & 0x1FFu, (d >> 18u) & 0x1FFu); }
-uint  unpackResvM  (uint d){ return (d >> 27u) & 0x1Fu; }
-
-// ReSTIR DI spatiotemporal reservoir — a PARALLEL buffer (binding 6, 2 DWORDs/slot), separate from the
-// 64 B slot. Per-frame loop: temporal (restir.comp) → slot D14/D15, spatial (restir_spatial.comp) reads
-// the slot snapshot + writes HERE, shade reads HERE, next-frame temporal reads HERE as prev → the loop
-// COMPOUNDS (the real ReSTIR accelerator). Race-free (spatial reads slot, writes this — disjoint). MUST
-// be zeroed in initSlot on claim/evict (else a reused slot serves a prior voxel's reservoir → wrong light
-// on disocclusion). [0]=pos|M (packResvLight), [1]=W (fp32). architecture/RESTIR.md §E1.
-#define RESV_SP_DWORDS 2u
-layout(std430, binding = 6) buffer ResvSpatial { uint data[]; } resvSp;
-uint resvSpBase(uint slot){ return slot * RESV_SP_DWORDS; }

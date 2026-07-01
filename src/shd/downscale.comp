@@ -5,15 +5,15 @@ layout(local_size_x = 8, local_size_y = 8) in;
 // Jittered downscale of the full-res gbuffer into the virtual gbuffer. Each virtual
 // pixel samples ONE full-res gbuffer texel within its scale×scale tile, at a
 // PER-PIXEL random offset. A global per-frame offset (shared by all virtual pixels)
-// makes the grid sample coherently → each voxel is covered by a structured,
-// deterministic subset of samples → the per-voxel cache converges to a streaky
+// makes the grid sample coherently => each voxel is covered by a structured,
+// deterministic subset of samples => the per-voxel cache converges to a streaky
 // pattern that temporal averaging can't remove. Per-pixel random coverage turns that
 // structured error into ordinary noise the EMA cleans up.
-layout(binding = 0, rgba32ui) readonly  uniform uimage2D gbufferTexture;   // full-res
-layout(binding = 1, rgba32ui) writeonly uniform uimage2D virtualGBuffer;   // virtual-res
+layout(binding = 0, rgba32ui) readonly  uniform uimage2D gbufferTexture;
+layout(binding = 1, rgba32ui) writeonly uniform uimage2D virtualGBuffer;
 
-uniform ivec2 screenResolution;   // full-res framebuffer size
-uniform ivec2 virtualSize;        // virtual gbuffer size
+uniform ivec2 screenResolution;
+uniform ivec2 virtualSize;
 uniform uint  virtualScale;
 uniform uint  frameIndex;
 
@@ -23,10 +23,7 @@ void main() {
     ivec2 vp = ivec2(gl_GlobalInvocationID.xy);
     if (vp.x >= virtualSize.x || vp.y >= virtualSize.y) return;
 
-    // Per-pixel, per-frame random offset in [0, virtualScale). Salted (frameIndex
-    // mixed with a large odd constant) so it does NOT match shade.comp's direction
-    // seed — otherwise the chosen sub-pixel and the sampled ray direction would
-    // correlate and bring the structure back.
+    // Per-pixel, per-frame random offset in [0, virtualScale)
     uint h = lb_hash(uint(vp.x) ^ lb_hash(uint(vp.y) ^ lb_hash(frameIndex * 2654435761u + 1u)));
     ivec2 jit = ivec2(h % virtualScale, (h / virtualScale) % virtualScale);
 

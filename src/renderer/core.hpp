@@ -37,9 +37,8 @@ constexpr GLuint SSBO_CLAIM_BINDING        = 1;
 constexpr GLuint SSBO_LBUFFER_BINDING      = 2;   // flat open-addressed voxel hash (see CLAIM.md)
 constexpr GLuint SSBO_UNIQUE_LIST_BINDING  = 3;   // uvec4[] : {key.xy, claimedSlot, spare}
 constexpr GLuint SSBO_UNIQUE_COUNT_BINDING = 4;   // uint    : atomic append counter
-constexpr GLuint SSBO_LIGHTTREE_BINDING    = 5;   // uint[]  : emissive-voxel light SVO (see LIGHTTREE.md)
-constexpr GLuint SSBO_RESV_SPATIAL_BINDING = 6;   // uint[]  : ReSTIR DI spatiotemporal reservoir (2 DWORDs/slot)
 constexpr GLuint SSBO_INDIRECT_ARGS_BINDING = 8;  // uvec4[] : dispatch-indirect args
+// bindings 5/6 are free (were the emissive light SVO + ReSTIR reservoir — removed with the NEE path).
 // bindings 6/7 (ping-pong retry) and 9 (per-bucket lock) retired with the lock-free
 // open-addressing claim — slots are claimed by CAS on the timestamp word, single dispatch.
 
@@ -123,8 +122,7 @@ enum RenderType {
     SHADE         = 7,   // raw 1-spp path-traced virtual buffer (debug, B1.2)
     SHADING       = 8,   // final lit composite from the denoised cache (B1.3/B1.4)
     SAMPLES       = 9,   // per-voxel diffuse EMA sample count heatmap (debug)
-    STEPS         = 10,  // per-ray DDA step count heatmap (primary.comp cost, debug)
-    LIGHTTREE     = 11   // light-SVO descent result per voxel (debug, B2.0): dir-to-sampled-light
+    STEPS         = 10   // per-ray DDA step count heatmap (primary.comp cost, debug)
 };
 
 // -----------------------------------------------------------------------------
@@ -144,8 +142,6 @@ struct FrameConfig {
     float      atrousSigmaN        = 80.0f; // à-trous normal edge-stop exponent (higher = sharper)
     float      atrousSigmaP        = 2.0f;  // à-trous position edge-stop (center-voxel-size units)
     int        staleFrames         = 64;    // re-visit gap (frames) past which a cached channel's EMA count is reset (diffuse + specular; 0 = off)
-    int        restirMCap          = 20;    // ReSTIR DI temporal confidence cap (prev-frame reservoir M clamp; 0 = no temporal reuse)
-    int        restirSpatial       = 5;     // ReSTIR DI spatial neighbours Z-combined per pixel in shade (0 = temporal only)
 };
 
 // -----------------------------------------------------------------------------

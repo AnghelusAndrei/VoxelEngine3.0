@@ -12,39 +12,15 @@
 
 class Renderer;
 
-// Single, GPU-aligned octree. Stores the same flat 4 B-per-slot layout the
-// shaders read from texelFetch(), and runs edits directly against it — no
-// parallel pointer-tree on the CPU.  This was previously two classes
-// (OctreeCPU pointer tree + Octree linearised mirror); merging them cuts
-// CPU memory cost from ~80 B per tree node to 32 B per 8-slot block, which
-// is what unblocks running deeper than depth 8 without bad_alloc.
 class Octree {
 public:
     // 64-bit GPU node, stored AoS as two 32-bit words (lo, hi). Eight nodes form
     // one 8-slot block = 64 B = exactly one L2 cache line (blocks are 8-slot
-    // aligned — see allocBlock / the constructor). Replaces the old 32-bit union.
+    // aligned — see allocBlock / the constructor).
     //
     //   Lo word: [ isNode:1 | material:7 | childmask:8 | version:8 | reserved:8 ]
     //   Hi word: [ next:32 ]
-    //
-    // `version` (lo[16:23]) is an 8-bit per-voxel incarnation counter — the third
-    // component of the lBuffer cache key (pos, sizeLevel, version). It is stamped
-    // from a single global insert counter (Octree::versionCounter) on every
-    // makeLeaf, so a voxel modified off-screen and returned at the same
-    // (pos, size) gets a fresh key and does not reuse a stale cached entry.
-    //
-    // `material` occupies the same bits in leaves and internal nodes: a leaf
-    // stores its own material; an internal node stores the propagated *majority*
-    // material of its non-empty children (recomputeMaterial). The uniform bit
-    // position lets the DDA / LOD read a node's representative material without
-    // branching on node type. Internal nodes carry the full 32-bit `next` in the
-    // hi word, retiring the old 23-bit pointer limit. Leaves leave hi == 0 (the
-    // per-voxel normal now lives in the lBuffer, not the node).
-    //
-    // We use explicit shift/mask helpers rather than C++ bitfields: bitfield bit
-    // ordering is implementation-defined, and the GLSL side reads these words by
-    // hand — keeping both sides on the same explicit masks avoids relying on the
-    // compiler's packing happening to match.
+
     struct Node {
         uint32_t lo = 0;
         uint32_t hi = 0;
@@ -97,17 +73,7 @@ public:
     // Zero the claim bitfield — call once per frame before primary.comp's dedup TAS.
     void     clearClaimBitfield();
 
-    // ---- Edits ----
-    // Each edit mutates `data[]` directly and extends the dirty range.
-    // Call flushEdits() once after a batch of edits to push to GPU.
-    //
-    // `leafDepth` (Phase 3): if non-zero and ≤ depth, place the leaf at that
-    // level — a *coarse leaf* covering a (octreeLength >> leafDepth)^3 region.
-    // 0 (default) means full depth = current behaviour. insert frees any
-    // existing finer subtree at the target slot (via freeSubtree) so coarsening
-    // does not leak blocks. remove descends and removes the first leaf it
-    // finds along the path, so coarse leaves at any depth are handled
-    // correctly. `insertBox` / `Sphere` / `Function` keep using full depth.
+    // ---- Write ----
     void insert(glm::uvec3 pos, uint32_t material, uint32_t leafDepth = 0);
     void remove(glm::uvec3 pos, uint32_t leafDepth = 0);
     void insertBox(glm::uvec3 min, glm::uvec3 max, uint32_t material, uint32_t leafDepth = 0);
@@ -151,10 +117,11 @@ public:
     bool editLoggingEnabled = false;        // off during the initial scene build
     int  editExpandRadius   = 6;            // AABB padding; kept in sync w/ normalPrecision
 
-    // Per-voxel hook fired when a leaf is placed (insert) or cleared (remove):
-    // onLeafChanged(pos, level, oldMaterial, newMaterial); newMaterial==0 ⟹ removed. Lets a
-    // materials-aware subsystem (LightTree) mirror emissive edits in O(depth) without
-    // coupling the octree to materials — it only reports the structural change.
+    // Generic per-voxel hook fired when a leaf is placed (insert) or cleared (remove):
+    // onLeafChanged(pos, level, oldMaterial, newMaterial); newMaterial==0 => removed. Lets a
+    // materials-aware subsystem mirror edits in O(depth) without coupling the octree to
+    // materials — it only reports the structural change. (Currently unused; kept as an
+    // extension point.)
     std::function<void(glm::uvec3, uint32_t, uint32_t, uint32_t)> onLeafChanged = nullptr;
 
     friend class Renderer;
@@ -164,17 +131,10 @@ private:
     GLuint program = 0;
     uint32_t gpuBufferSize = 0;
 
-    // Claim bitfield — one bit per octree slot, packed 32 slots/uint. Allocated
-    // and resized in lockstep with the node buffer so slot N always has a backing
-    // bit. Zero-initialised. Reserved for the next stage: primary.comp will claim
-    // each visible voxel exactly once via atomicOr(word, bit) and a later pass
-    // will clear it. Nothing reads or writes it this stage.
+
     GLuint   claimBuffer_ID    = 0;
     uint32_t claimCapacityWords = 0;   // (capacity + 31) / 32
 
-    // Global insert counter → per-voxel `version` (wraps mod 256). Incremented
-    // once per makeLeaf so each newly created/overwritten leaf gets a distinct
-    // 8-bit incarnation tag (see Node::version).
     uint32_t versionCounter = 0;
 
     // Free 8-slot blocks waiting to be reused (from removes).
@@ -187,7 +147,6 @@ private:
     uint32_t utils_p2r[maxDepth + 1];
     uint32_t locate(glm::uvec3 position, uint32_t depth_) const;
 
-    // Phase 2 edit-region helpers (see editRegions above).
     void logEdit(glm::uvec3 pos);           // register one occupancy-changing edit
     void addEditRegion(EditRegion box);     // merge a region into editRegions
 
@@ -195,18 +154,13 @@ private:
     uint32_t allocBlock();        // returns a fresh or recycled 8-slot block
     void     freeBlock(uint32_t block);
     bool     blockIsEmpty(uint32_t block) const;
-    // Recursively free a block and every descendant. Called by insert when a
-    // coarse leaf is placed over an existing internal subtree.
     void     freeSubtree(uint32_t blockSlot);
     void     markDirty(uint32_t slot, uint32_t count = 1);
     void     setChildBit(uint32_t internalSlot, uint32_t childIdx);
 
     // Recompute one internal node's representative material as the majority over
-    // its non-empty direct children (ties → lowest id). Returns true iff the
+    // its non-empty direct children (ties => lowest id). Returns true iff the
     // node's stored material changed.
     bool     recomputeMaterial(uint32_t internalSlot);
-    // Walk pathSlot[fromLevel..0] bottom-up, recomputing representative materials.
-    // Skips freed/empty ancestors; stops at the first surviving node whose
-    // material is unchanged (a parent's majority can only shift if a child's did).
     void     propagateMaterialUp(const uint32_t* pathSlot, int fromLevel);
 };

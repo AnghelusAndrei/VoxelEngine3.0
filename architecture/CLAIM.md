@@ -72,9 +72,8 @@ claim(key):                         // key=(pos,level,version); h=hash(key)&(N-1
       if (data[s].D0 == key0 && data[s].D1 == key1) {        // MATCH
           if (atomicCompSwap(data[s].D2, d2, frameStamp) == d2) {
               if (staleFrames != 0 && frameStamp - d2 > staleFrames)
-                  drop specular sample count → 1;             // stale view-dependent specular
-                  // B3 (next): drop the DIFFUSE count too, same shared window — handles dynamic
-                  // lighting (removed light / geometry edit) with no per-slot stamp (LBUFFER.md).
+                  drop BOTH EMA counts (diffuse + specular) → ≤1;   // stale: dynamic lighting /
+                                                                    // old view → fresh samples dominate
               return s;                                       // keep radiance, refresh LRU
           }
           continue;                                           // evicted under us → keep probing
@@ -99,7 +98,7 @@ flowchart TD
   P --> R["read D0,D1,D2"]
   R --> M{"D0==key0 && D1==key1?"}
   M -->|yes| MC{"CAS(D2,d2,frameStamp)?"}
-  MC -->|won| DONE["stale? decay specular · claimedSlot=s · DONE"]
+  MC -->|won| DONE["stale? decay both EMA counts · claimedSlot=s · DONE"]
   MC -->|lost| NX["i++"]
   M -->|no| E{"D2==0 empty?"}
   E -->|yes| EC{"CAS(D2,0,frameStamp)?"}
