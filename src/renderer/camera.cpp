@@ -10,12 +10,6 @@ Camera::Camera(Config *config){
     FOV          = &config->FOV;
 }
 
-void Camera::setProgram(GLuint program_){
-    program = program_;
-    GLuint camera_index = glGetUniformBlockIndex(program, "CameraUniform");
-    glUniformBlockBinding(program, camera_index, 0);
-}
-
 void Camera::GenUBO(){
     glGenBuffers(1, &gl_ID);
     glBindBuffer(GL_UNIFORM_BUFFER, gl_ID);

@@ -29,7 +29,7 @@ Choose a rendering technique by what the SCENE contains and what the engine ALRE
 A. Concurrency & Deadlock Avoidance
 ZERO SPINLOCKS: Do not write while(locked) or spin-loops inside compute shaders. Threads sharing a wave/warp share an instruction pointer; spinlocks will cause instant Intra-Warp Deadlocks and trigger Windows TDR/GPU crashes.
 
-TRY-CLAIM, DON'T SPIN: a contended atomic claim must resolve in a single pass — CAS on a per-slot token (the shipped claim uses the timestamp word), and on failure advance to the next candidate slot and exit; never loop waiting on a slot. The lock-free open-addressed claim does exactly this (see CLAIM.md); the earlier RetryBuffer + CPU-orchestrated DispatchIndirect scheme was abandoned as unnecessary.
+TRY-CLAIM, DON'T SPIN: a contended atomic claim must resolve in a single pass — CAS on a per-slot token (the shipped claim uses the timestamp word), and on failure advance to the next candidate slot and exit; never loop waiting on a slot. The lock-free open-addressed claim does exactly this (see LBUFFER.md); the earlier RetryBuffer + CPU-orchestrated DispatchIndirect scheme was abandoned as unnecessary.
 
 B. Wave-Level Optimization
 Prioritize wave-intrinsics and Wave Compaction over global atomics when aggregating data across screen tiles, wavefront queues, or active pixel slots.

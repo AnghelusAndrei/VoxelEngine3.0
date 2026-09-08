@@ -3,6 +3,7 @@
 #include <vector>
 #include <glm/common.hpp>
 #include "./Noise/FractalNoise.h"
+#include "scene.hpp"
 
 
 VoxelEngine::VoxelEngine(const Config *windowConfig){
@@ -11,9 +12,9 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
     infoWidget    = new Info("info");
     controlWidget = new Control("control");
 
-    auto logMessage = [this](const char* format, va_list args) {
-        infoWidget->vAddLog(format, args);
-        vprintf(format, args);
+    auto logMessage = [this](const char* message) {
+        infoWidget->AddLog("%s", message);
+        fputs(message, stdout);
     };
 
     auto fbSize = [this](){
@@ -30,11 +31,11 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
     };
 
     Octree::Config octreeConfig = {
-        .depth = 9
+        .depth = 10
     };
 
     controllerConfig = {
-        .speed       = 40.0f,
+        .speed       = 100.0f,
         .sensitivity = 0.7f,
         .rotation    = glm::vec2(90, 0)
     };
@@ -53,8 +54,7 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
         .shaderRecompilation = false,
         .renderToTexture     = false,
         .primary_raystop     = 100,
-        .normalPrecision     = 6,
-        .lbuffer_retries     = 6
+        .normalPrecision     = 6
     };
 
     octree       = new Octree(&octreeConfig);
@@ -78,110 +78,47 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
     controlWidget->SetConfigs(&rendererConfig, &frameConfig, &controllerConfig, &cameraConfig);
 
 
-    // -------------------------------------------------------------------------
-    // Material definitions
-    // -------------------------------------------------------------------------
-    Material emissive_m = {
-        .color = glm::vec4(1.0f, 1.0f, 1.0f, 0.0f),
-        .specularColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f),
-        .roughness = 0.4f, .specular = 0.0f, .metallic = 0.0f,
-        .emissive = true,  .emissiveIntensity = 2.0f
-    };
-    Material emissive_m2 = {
-        .color = glm::vec4(0.6f + 0.4f*(rand()%100)/100.0f,
-                           0.6f + 0.4f*(rand()%100)/100.0f,
-                           0.6f + 0.4f*(rand()%100)/100.0f, 0.0f),
-        .specularColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f),
-        .roughness = 0.4f, .specular = 0.0f, .metallic = 0.0f,
-        .emissive = true,  .emissiveIntensity = 2.0f
-    };
-    Material emissive_m3 = {
-        .color = glm::vec4(0.5f, 0.5f, 1.0f, 0.0f),
-        .specularColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f),
-        .roughness = 0.4f, .specular = 0.0f, .metallic = 0.0f,
-        .emissive = true,  .emissiveIntensity = 2.0f
-    };
-    Material emissive_m4 = {
-        .color = glm::vec4(0.8f, 0.5f, 0.8f, 0.0f),
-        .specularColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f),
-        .roughness = 0.4f, .specular = 0.0f, .metallic = 0.0f,
-        .emissive = true,  .emissiveIntensity = 100.0f
-    };
-    Material light_m = {
-        .color = glm::vec4(1.0f, 1.0f, 1.0f, 0.0f),
-        .specularColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f),
-        .roughness = 0.4f, .specular = 0.0f, .metallic = 0.0f,
-        .emissive = true,  .emissiveIntensity = 60.0f
-    };
-    Material red_m = {
-        .color = glm::vec4(1.0f, 0.0f, 0.0f, 0.0f),
-        .specularColor = glm::vec4(0.8f, 0.1f, 0.1f, 1.0f),
-        .roughness = 0.1f, .specular = 0.5f, .metallic = 0.1f,
-        .emissive = false, .emissiveIntensity = 0.0f
-    };
-    Material green_m = {
-        .color = glm::vec4(0.0f, 1.0f, 0.0f, 0.0f),
-        .specularColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f),
-        .roughness = 0.8f, .specular = 0.0f, .metallic = 0.0f,
-        .emissive = false, .emissiveIntensity = 0.0f
-    };
-    Material blue_m = {
-        .color = glm::vec4(0.0f, 0.0f, 1.0f, 0.0f),
-        .specularColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f),
-        .roughness = 0.8f, .specular = 0.0f, .metallic = 0.0f,
-        .emissive = false, .emissiveIntensity = 0.0f
-    };
-    Material white_m = {
-        .color = glm::vec4(1.0f, 1.0f, 1.0f, 0.0f),
-        .specularColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f),
-        .roughness = 0.6f, .specular = 0.0f, .metallic = 0.0f,
-        .emissive = false, .emissiveIntensity = 0.0f
-    };
-    Material metallic_m = {
-        .color = glm::vec4(0.8f, 0.8f, 0.8f, 0.0f),
-        .specularColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f),
-        .roughness = 0.1f, .specular = 0.95f, .metallic = 0.85f,
-        .emissive = false, .emissiveIntensity = 0.0f
-    };
+    const uint32_t L = 1u << octreeConfig.depth;
 
+    scene::Model sponza = scene::load("./assets/models/sponza/sponza.obj",
+                                      /*resolution*/ 1000,
+                                      /*solid*/      false,
+                                      /*thickness*/  3);
+    if (sponza.ok()) {
+        sponza.finish("floor",      0.35f, 0.25f, 0.0f);
+        sponza.finish("Material__57", 0.30f, 0.30f, 0.0f);
+        sponza.finish("fabric_a",   0.85f, 0.02f, 0.0f);
+        sponza.finish("fabric_c",   0.85f, 0.02f, 0.0f);
+        sponza.finish("fabric_e",   0.85f, 0.02f, 0.0f);
+        sponza.finish("leaf",       0.90f, 0.00f, 0.0f);
+        sponza.finish("chain",      0.30f, 0.60f, 0.9f);
 
-    uint32_t emissive_mat2 = materialPool->addMaterial(&emissive_m2);
-    matEmissive            = materialPool->addMaterial(&emissive_m);
-    uint32_t emissive_mat3 = materialPool->addMaterial(&emissive_m3);
-    emissive_mat4 = materialPool->addMaterial(&emissive_m4);
-    matRed                 = materialPool->addMaterial(&red_m);
-    matGreen               = materialPool->addMaterial(&green_m);
-    matWhite               = materialPool->addMaterial(&white_m);
-    matMetallic            = materialPool->addMaterial(&metallic_m);
-    matBlue                = materialPool->addMaterial(&blue_m);
-    uint32_t matLight      = materialPool->addMaterial(&light_m);
+        const glm::ivec3 origin(0, 0, 0);
+        scene::place(sponza, *octree, *materialPool, origin);
+        sponzaCentre = origin + sponza.dim / 2;
+    } else {
+        printf("[scene] sponza import failed: %s\n", sponza.error.c_str());
+        sponzaCentre = glm::ivec3((int)L / 2);
+    }
 
-    uint32_t L = 1u << octreeConfig.depth;
-
-
-    FractalNoise noiseGen = FractalNoise();
-    noiseGen.setOctaves(1);
-    noiseGen.setPersistence(0.4f);
-    noiseGen.setLacunarity(2.0f);
-    noiseGen.setBaseFrequency(0.1f);
-    noiseGen.setBaseAmplitude(1.0f);
-
-
-    octree->insertSphere(glm::vec3(L/3.0f, L/3.0f - 5.0f, L/2.0f), L/4.0f, matMetallic);
-    octree->insertSphere(glm::vec3(L*3.0f/4.0f - 5.0f, L*3.0f/4.0f - 15.0f, L*3.0f/4.0f - 5.0f), L/4.0f, matWhite);
-
-    octree->insertBox(glm::uvec3(0,   0,   0), glm::uvec3(L,   4,   L), matWhite);
-    octree->insertBox(glm::uvec3(0,   0,   0), glm::uvec3(4,   L,   L), matGreen);
-    //octree->insertBox(glm::uvec3(0,   0,   0), glm::uvec3(L,   L,   4), matBlue);
-    octree->insertBox(glm::uvec3(L-4, 0,   0), glm::uvec3(L,   L,   L), matRed);
-    octree->insertBox(glm::uvec3(0,   0, L-4), glm::uvec3(L,   L,   L), matMetallic);
-    octree->insertBox(glm::uvec3(0, L-4,   0), glm::uvec3(L,   L,   L), matWhite);
-
-    octree->insertBox(glm::uvec3(L/4, L-8, L/4), glm::uvec3(L*3/4, L-4, L*3/4), emissive_mat2);  // original soft slab
-
+    matRed      = materialPool->addMaterial({1.0f, 0.1f, 0.1f, 0.0f}, {0.8f, 0.1f, 0.1f, 1.0f}, 0.1f, 0.5f, 0.1f, false, 0.0f, "brush.red");
+    matGreen    = materialPool->addMaterial({0.1f, 1.0f, 0.1f, 0.0f}, {0.1f, 0.8f, 0.1f, 1.0f}, 0.1f, 0.0f, 0.0f, false, 0.0f, "brush.green");
+    matBlue     = materialPool->addMaterial({0.1f, 0.1f, 1.0f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, 0.8f, 0.0f, 0.0f, false, 0.0f, "brush.blue");
+    matWhite    = materialPool->addMaterial({1.0f, 1.0f, 1.0f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, 0.6f, 0.0f, 0.0f, false, 0.0f, "brush.white");
+    matMetallic = materialPool->addMaterial({0.8f, 0.8f, 0.8f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, 0.1f, 0.95f, 0.85f, false, 0.0f, "brush.metal");
+    matEmissive = materialPool->addMaterial({1.0f, 0.95f, 0.85f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, 0.4f, 0.0f, 0.0f, true, 40.0f, "brush.emissive");
+    octree->insertSphere(glm::vec3(sponzaCentre), (float)L / 40.0f, matEmissive);
+    octree->insertSphere(glm::vec3(sponzaCentre) + glm::vec3(0, sponza.dim.y / 3, 0), (float)L / 40.0f, matMetallic);
 
     octree->flushEdits();
     octree->editLoggingEnabled = true;
+
+    printf("[scene] %s built in %.2fs: %lu voxels, %u/%u material slots, "
+           "octree %u nodes = %.0f MB (x2, CPU + VRAM)\n",
+           "sponza", glfwGetTime(), (unsigned long)octree->numVoxels,
+           materialPool->length, materialPool->capacity,
+           octree->capacity,
+           (double)octree->capacity * sizeof(Octree::Node) / 1048576.0);
 
     insertionMat  = matEmissive;
     insertionSize = 0;
@@ -190,13 +127,10 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
 }
 
 void VoxelEngine::run(){
+    int esc_key_delay = 200; // frames to wait before allowing ESC to toggle UI again
+    int esc_key_timer = 0;
     while(!glfwWindowShouldClose(window)){
         glfwPollEvents();
-
-        if(glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS){
-            ui_active = true;
-            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
-        }
 
         bool currLeft  = (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT)  == GLFW_PRESS);
         bool currRight = (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS);
@@ -224,7 +158,7 @@ void VoxelEngine::run(){
         else if(glfwGetKey(window, GLFW_KEY_4) == GLFW_PRESS){ insertionMat = matWhite; insertionRadius = 14; }
         else if(glfwGetKey(window, GLFW_KEY_5) == GLFW_PRESS){ insertionMat = matMetallic; insertionRadius = 14; }
         else if(glfwGetKey(window, GLFW_KEY_6) == GLFW_PRESS){ insertionMat = matBlue; insertionRadius = 14; }
-        else if(glfwGetKey(window, GLFW_KEY_7) == GLFW_PRESS){ insertionMat = emissive_mat4; insertionRadius = 2; }
+        else if(glfwGetKey(window, GLFW_KEY_7) == GLFW_PRESS){ insertionMat = matWhite; insertionSize = 8; insertionRadius = 14; }
         else if(glfwGetKey(window, GLFW_KEY_8) == GLFW_PRESS){ insertionMat = matWhite; insertionSize = 7; insertionRadius = 14; }
         else if(glfwGetKey(window, GLFW_KEY_9) == GLFW_PRESS){ insertionMat = matWhite; insertionSize = 6; insertionRadius = 14; }
 
@@ -237,10 +171,16 @@ void VoxelEngine::run(){
             }
         }
 
-        if(currLeft && !interface_->io.WantCaptureMouse && !interface_->io.WantCaptureKeyboard && ui_active){
+        esc_key_timer = std::max(0, esc_key_timer - 1);
+        if(((currLeft && !interface_->io.WantCaptureMouse && !interface_->io.WantCaptureKeyboard) || (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS && esc_key_timer <= 0)) && ui_active){
             ui_active = false;
+            esc_key_timer = esc_key_delay;
             camera->firstFrame = true;
             glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+        }else if((glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS && esc_key_timer <= 0) && !ui_active){
+            ui_active = true;
+            esc_key_timer = esc_key_delay;
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
         }
 
         if(!ui_active)

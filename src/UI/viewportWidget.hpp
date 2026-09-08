@@ -6,12 +6,12 @@ class ViewportWidget : public Widget{
     public:
         ViewportWidget(const char* name_, glm::vec2 size_, glm::ivec2 fbsize_, float aspect_ratio_);
         void Draw() override;
-        bool getDrawID(GLuint gl_ID_);
+        void setDrawID(GLuint gl_ID_);
 
         ImVec2 avail_size;
 
     private:
-        GLuint gl_ID;
+        GLuint gl_ID = 0;
         glm::vec2 size;
         glm::ivec2 fbsize;
         float aspect_ratio;

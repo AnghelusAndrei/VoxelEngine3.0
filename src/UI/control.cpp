@@ -19,7 +19,7 @@ void Control::DrawSceneControl(){
 void Control::DrawShaderControl(){
     static const char* modes[] = {
         "OCTREE", "MATERIAL", "NORMAL", "VERSION", "CLAIM_AGE", "LRU_OCCUPANCY",
-        "VIRTUAL", "SHADE", "SHADING", "SAMPLES", "STEPS"
+        "VIRTUAL", "SHADE", "SHADING", "SAMPLES", "HOLES", "LUMINANCE", "VARIANCE"
     };
     int mode = (int)frameConfig->renderType;
     if(ImGui::Combo("render mode", &mode, modes, IM_ARRAYSIZE(modes)))
@@ -36,11 +36,8 @@ void Control::DrawLightingControl(){
     ImGui::Text("temporal accumulation (EMA sample caps):");
     ImGui::SliderInt("diffuse window",  &frameConfig->emaDiffuse,  1, 1024);
     ImGui::SliderInt("specular window", &frameConfig->emaSpecular, 1, 64);
-    ImGui::Text("a-trous specular filter (adaptive by roughness; 0=off):");
-    ImGui::SliderInt  ("spec atrous max iters", &frameConfig->atrousIters,  0, 5);
-    ImGui::SliderFloat("atrous sigmaN", &frameConfig->atrousSigmaN, 1.0f, 256.0f);
-    ImGui::SliderFloat("atrous sigmaP", &frameConfig->atrousSigmaP, 0.25f, 16.0f);
-    ImGui::SliderInt  ("stale frames", &frameConfig->staleFrames, 0, 240);
+    ImGui::SliderInt  ("stale view independent", &frameConfig->staleViewIndep, 0, 1e8);
+    ImGui::SliderInt  ("stale view dependent", &frameConfig->staleViewDep, 0, 64);
 }
 
 void Control::Draw(){

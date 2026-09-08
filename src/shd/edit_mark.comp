@@ -1,5 +1,4 @@
 #version 460 core
-
 layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 
 // Edit invalidation. Dispatched (3D) over one padded EditRegion AABB per frame.
@@ -10,7 +9,7 @@ layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 
 #include "lbuffer.glsl"
 
-layout(std430, binding = 0) readonly buffer OctreeBuffer { uvec2 nodes[]; } octree;
+layout(std430, binding = SSBO_OCTREE_BINDING) readonly buffer OctreeBuffer { uvec2 nodes[]; } octree;
 
 uniform uint  octreeDepth;
 uniform uvec3 regionMin;
@@ -24,7 +23,7 @@ void main(){
 
     // Descend to the resident leaf at p → its level + version.
     uint block = octree.nodes[0].y;
-    uint level = 0u, version = 0u;
+    uint level = 0u, version = 0u, nodeLo = 0u;
     bool found = false;
     for (uint lev = 1u; lev <= octreeDepth; lev++){
         uint p2  = L >> lev;
@@ -33,9 +32,10 @@ void main(){
                  |  uint(bool(p.z & p2));
         uvec2 n = octree.nodes[block + idx];
         if (n.x == 0u && n.y == 0u) return;                 // empty cell
-        if ((n.x & 1u) == 0u){                               // leaf
-            if (((n.x >> 1u) & 0x7Fu) == 0u) return;         // empty material
-            level = lev; version = (n.x >> 16u) & 0xFFu; found = true; break;
+        if ((n.x & NODE_ISNODE_BIT) == 0u){                  // leaf
+            if (((n.x >> NODE_MAT_SHIFT) & MATERIAL_MASK) == 0u) return;   // empty material
+            level = lev; version = (n.x >> NODE_VER_SHIFT) & NODE_VER_MASK;
+            nodeLo = n.x; found = true; break;
         }
         if (lev == octreeDepth) return;
         block = n.y;
@@ -44,7 +44,9 @@ void main(){
 
     uint  vsize = L >> level;
     uvec3 vpos  = p & ~uvec3(vsize - 1u);                    // voxel origin = key position
-    uint  slot  = probeLBuffer(vpos, level, version);
+    // These are an edit's NEIGHBOURS, mostly off-screen, so their baked offsets can predate
+    // the last octree upload — probe fallback, or a missed flag leaves a stale normal.
+    uint  slot  = findLBuffer(vpos, level, version, nodeLo);
     if (slot == LB_NO_SLOT) return;                          // not cached → nothing to flag
-    atomicOr(lbuf.data[linearSlotToBase(slot) + 3u], NORMAL_UPDATE_BIT);
+    atomicOr(lbuf.data[linearSlotToBase(slot) + LB_NORMAL], NORMAL_UPDATE_BIT);
 }

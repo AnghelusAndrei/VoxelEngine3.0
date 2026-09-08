@@ -1,48 +1,7 @@
-// Shared lBuffer addressing, voxel key, probe, and HDR helpers. Mirrors Renderer's
-// LBUFFER_* constants. Including shaders get the slot data at SSBO binding 2. The cache
-// is a FLAT, lock-free, OPEN-ADDRESSED table: slot = hash(key) & (N-1), linear probe.
-// Claiming is by CAS on the timestamp word (see lbuffer_claim.comp / architecture/CLAIM.md)
-// — no bucket lock, no retry buffers. A "slot" is a flat index 0..N-1.
-//
-// 16-DWORD slot (64 B, Milestone B):
-//   0 : pos.x[0:15] | pos.y[16:31]                          \ key
-//   1 : pos.z[0:15] | sizeLevel[16:23] | version[24:31]     /
-//   2 : timestamp (monotonic frameStamp; 0 ⟺ pristine-empty / claim token)
-//   3 : octNormal[2:31] | flag[0] | spare[1]
-//   4 : diffuse  channel — irradiance, RGB9E5 (EMA result, read by resolve)
-//   5 : specular channel — RGB9E5 (EMA result, read by resolve)
-//   6 : N_diff[0:15] | N_spec[16:31]   (EMA sample counts)
-//   7..9  : diffuse  accumulator R,G,B (u32, HDR fixed-point, atomicAdd in accum)
-//   10    : pixelCount                 (u32, atomicAdd in accum)
-//   11..13: specular accumulator R,G,B (u32, HDR fixed-point, atomicAdd in accum)
-//   14 : spare (ReSTIR reservoir)
-//   15 : spare (ReSTIR reservoir)
-
-// Flat open-addressed table. N must be a power of two (so home = hash & (N-1)).
-// Size N ≈ 2× peak visible voxels (keep load factor ≤ 0.5 => ~1.5 avg probes).
-#define LBUFFER_SLOTS_TOTAL 4194304u   // 2^22 slots × 64 B = 256 MB
-#define SLOT_DWORDS         16u
-#define LB_PROBE_LIMIT      32u        // max linear probe length
-#define LB_NO_SLOT          0xFFFFFFFFu
-
-// Slot field offsets (DWORD index within a slot).
-#define LB_KEY0      0u
-#define LB_KEY1      1u
-#define LB_TIMESTAMP 2u
-#define LB_NORMAL    3u
-#define LB_DIFFUSE   4u
-#define LB_SPECULAR  5u
-#define LB_SAMPLES   6u
-#define LB_DIFF_ACC  7u    // R,G,B = 7,8,9
-#define LB_PIXELS    10u
-#define LB_SPEC_ACC  11u   // R,G,B = 11,12,13
-// DWORDs 14,15 are free (reserved for a future per-voxel illumination reservoir — see RESTIR.md).
+#include "constants.glsl"
 
 
-#define ACCUM_SCALE   1024.0
-#define FIREFLY_CLAMP 16.0
-
-layout(std430, binding = 2) coherent buffer LBuffer { uint data[]; } lbuf;
+layout(std430, binding = SSBO_LBUFFER_BINDING) coherent buffer LBuffer { uint data[]; } lbuf;
 
 uint lb_hash(uint x){ x ^= x>>16; x *= 0x7feb352du; x ^= x>>15; x *= 0x846ca68bu; x ^= x>>16; return x; }
 
@@ -59,7 +18,6 @@ uint voxelKey(uvec3 pos, uint level, uint version){
 uint homeSlot(uvec3 pos, uint level, uint version){
     return voxelKey(pos, level, version) & (LBUFFER_SLOTS_TOTAL - 1u);
 }
-uint slotBase(uint slot){ return slot * SLOT_DWORDS; }
 uint linearSlotToBase(uint slot){ return slot * SLOT_DWORDS; }   // slot index is already flat
 
 // Slot identity (DWORD0,1) for a voxel key.
@@ -85,6 +43,36 @@ uint probeLBuffer(uvec3 pos, uint level, uint version){
     return LB_NO_SLOT;
 }
 
+// O(1) lookup — the per-pixel path. `nodeLo` is the voxel's octree node Lo word (the caller
+// indexes it directly with the gbuffer's `vid`; no traversal). claim baked this voxel's probe
+// distance into its free bits, so the slot is just home+offset.
+//
+// The full key is verified on the slot's OWN cache line — D0/D1 sit in the same 64 B as the
+// channels the caller reads next, so the check is free. That verify is what makes every
+// wrong-offset case safe and self-describing, with no validity bit and no sentinel:
+//   * never written / zeroed by a CPU node write -> offset 0 -> home slot -> key mismatch
+//   * voxel was evicted, another key now owns the slot        -> key mismatch
+//   * garbage bits from a recycled node                       -> masked in range, key mismatch
+// All of them return LB_NO_SLOT, which is just the ordinary hole state the fill pass absorbs.
+// Offset 0 is therefore unambiguous: it means "at home" exactly when the key agrees.
+uint lookupLBuffer(uvec3 pos, uint level, uint version, uint nodeLo){
+    uint off = (nodeLo >> NODE_SLOTOFF_SHIFT) & NODE_SLOTOFF_MASK;
+    uint s   = (homeSlot(pos, level, version) + off) & (LBUFFER_SLOTS_TOTAL - 1u);
+    uint sb  = s * SLOT_DWORDS;
+    uvec2 key = packSlotKey(pos, level, version);
+    return (lbuf.data[sb] == key.x && lbuf.data[sb + 1u] == key.y) ? s : LB_NO_SLOT;
+}
+
+// O(1) lookup with the probe as a correctness net. Use this wherever the caller has the
+// voxel's node word in hand
+uint findLBuffer(uvec3 pos, uint level, uint version, uint nodeLo){
+    uint s = lookupLBuffer(pos, level, version, nodeLo);
+    return (s != LB_NO_SLOT) ? s : probeLBuffer(pos, level, version);
+}
+
+// Is a slot's channel still trustworthy? `window == 0` disables the check.
+bool fresh(uint age, uint window){ return window == 0u || age <= window; }
+
 // Slot DWORD3 layout:  flag[0] | spare[1] | z[2:11] | y[12:21] | x[22:31]
 // 3×10-bit signed unit vector. Flag at bit 0 so it never collides with the normal.
 #define NORMAL_UPDATE_BIT 1u
@@ -102,6 +90,11 @@ uint pkNormC(float c){ return uint(clamp((c + 1.0) * 511.0, 0.0, 1023.0)) & 0x3F
 uint PackNormal(vec3 n){
     return (pkNormC(n.x) << 22u) | (pkNormC(n.y) << 12u) | (pkNormC(n.z) << 2u);
 }
+
+// Rec. 709 luma weights, for LINEAR light - which is what the diffuse and specular
+// channels are (irradiance E/pi and outgoing radiance, never gamma-encoded). The
+// Rec. 601 weights are for gamma-encoded video and would be wrong here.
+float luminance(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 
 // ---- RGB9E5 shared-exponent HDR packing (used by avg writer / resolve reader) ----
 uint packRGB9E5(vec3 rgb){

@@ -3,6 +3,7 @@
 #include <fstream>
 #include <sstream>
 #include <vector>
+#include <map>
 #include <cstdint>
 #include <string>
 #include <stdio.h>
@@ -21,8 +22,9 @@
 
 namespace core {
 
-typedef std::function<void(const char*, va_list args)> logFunc;
+typedef std::function<void(const char*)> logFunc;
 typedef std::function<glm::ivec2()> framebufferSizeFunc;
+
 
 // -----------------------------------------------------------------------------
 // SSBO binding points — shared between the C++ glBindBufferBase calls and the
@@ -37,10 +39,11 @@ constexpr GLuint SSBO_CLAIM_BINDING        = 1;
 constexpr GLuint SSBO_LBUFFER_BINDING      = 2;   // flat open-addressed voxel hash (see CLAIM.md)
 constexpr GLuint SSBO_UNIQUE_LIST_BINDING  = 3;   // uvec4[] : {key.xy, claimedSlot, spare}
 constexpr GLuint SSBO_UNIQUE_COUNT_BINDING = 4;   // uint    : atomic append counter
-constexpr GLuint SSBO_INDIRECT_ARGS_BINDING = 8;  // uvec4[] : dispatch-indirect args
-// bindings 5/6 are free (were the emissive light SVO + ReSTIR reservoir — removed with the NEE path).
-// bindings 6/7 (ping-pong retry) and 9 (per-bucket lock) retired with the lock-free
-// open-addressing claim — slots are claimed by CAS on the timestamp word, single dispatch.
+constexpr GLuint SSBO_INDIRECT_ARGS_BINDING = 5;  // uvec4[] : dispatch-indirect args
+constexpr GLuint SSBO_ACCUM_DIFFUSE_BINDING  = 6;   // uvec4[] : diffuse sum + pixelCount, per uniqueList entry
+constexpr GLuint SSBO_ACCUM_SPECULAR_BINDING = 7;   // uvec4[] : specular sum, per uniqueList entry
+constexpr GLuint SSBO_MATERIAL_BINDING       = 8;   // Material[] : too big for a UBO (see material.cpp)
+// Binding 9+ free (the retry/lock buffers retired with the lock-free open-addressing claim).
 
 // -----------------------------------------------------------------------------
 // RendererConfig — passed once at construction, immutable during a session.
@@ -52,60 +55,26 @@ struct RendererConfig {
     bool                debuggingEnabled;
 
     void logMessage(const char* format, ...) const {
+        char stackBuf[1024];
         va_list args;
+
         va_start(args, format);
-        log(format, args);
+        int needed = vsnprintf(stackBuf, sizeof(stackBuf), format, args);
         va_end(args);
+
+        if (needed < (int)sizeof(stackBuf)) {
+            log(stackBuf);
+            return;
+        }
+
+        std::vector<char> heapBuf(needed + 1);
+        va_start(args, format);
+        vsnprintf(heapBuf.data(), heapBuf.size(), format, args);
+        va_end(args);
+        log(heapBuf.data());
     }
 };
 
-// -----------------------------------------------------------------------------
-// GPU pass descriptors — lightwei// Shader handles are not retained after link; only the program handle is kept.
-// -----------------------------------------------------------------------------
-struct ComputePass {
-    GLuint     program   = 0;
-    glm::ivec2 groupSize;
-    glm::ivec2 globalSize;
-    GLuint     texture   = 0;
-};
-
-struct RasterPass {
-    GLuint program     = 0;
-    GLuint VBO         = 0;
-    GLuint VAO         = 0;
-    GLuint framebuffer = 0;
-    GLuint rbo         = 0;
-    GLuint texture     = 0;
-};
-
-// -----------------------------------------------------------------------------
-// DispatchArgs — covers both glDispatchCompute and glDispatchComputeIndirect.
-// Use shader::dispatch(args) to issue the call.
-// -----------------------------------------------------------------------------
-enum class DispatchMode : uint8_t { Direct, Indirect };
-
-struct DispatchArgs {
-    DispatchMode mode = DispatchMode::Direct;
-    union {
-        struct { glm::ivec2 globalSize; glm::ivec2 groupSize; } direct;
-        struct { GLuint buffer; GLintptr offset;               } indirect;
-    };
-
-    static DispatchArgs makeDirect(glm::ivec2 global, glm::ivec2 group) noexcept {
-        DispatchArgs a{};
-        a.mode              = DispatchMode::Direct;
-        a.direct.globalSize = global;
-        a.direct.groupSize  = group;
-        return a;
-    }
-    static DispatchArgs makeIndirect(GLuint buf, GLintptr off = 0) noexcept {
-        DispatchArgs a{};
-        a.mode             = DispatchMode::Indirect;
-        a.indirect.buffer  = buf;
-        a.indirect.offset  = off;
-        return a;
-    }
-};
 
 // -----------------------------------------------------------------------------
 // RenderType — selects the resolve visualisation mode. Values are passed to
@@ -116,14 +85,20 @@ enum RenderType {
     MATERIAL      = 1,   // material albedo
     NORMAL        = 2,   // decoded lBuffer normal (Increment 3)
     VERSION       = 3,   // per-voxel version (debug)
-    CLAIM_AGE     = 4,   // frame - lBuffer timestamp (debug, Increment 2)
-    LRU_OCCUPANCY = 5,   // lBuffer hit/bucket fill (debug, Increment 2)
+    // These two FREEZE THE CACHE while selected: every pass that writes the lBuffer is
+    // skipped, so the camera flies around a snapshot of what is genuinely resident
+    // instead of re-seating each voxel the moment it is looked at (see Renderer::run).
+    CLAIM_AGE     = 4,   // frozen: frame - lBuffer timestamp; bright = recently claimed
+    LRU_OCCUPANCY = 5,   // frozen: green = resident, red = evicted/never seated
     VIRTUAL       = 6,   // downscaled virtual-gbuffer material (debug, B1.1)
     SHADE         = 7,   // raw 1-spp path-traced virtual buffer (debug, B1.2)
     SHADING       = 8,   // final lit composite from the denoised cache (B1.3/B1.4)
     SAMPLES       = 9,   // per-voxel diffuse EMA sample count heatmap (debug)
-    STEPS         = 10   // per-ray DDA step count heatmap (primary.comp cost, debug)
+    HOLES         = 10,  // cache-hole fill coverage (debug, see resolve.comp)
+    LUMINANCE     = 11,  // log(luminance) heatmap (debug, see resolve.comp)
+    VARIANCE      = 12   // log(luminance) variance heatmap (debug, see resolve.comp)
 };
+
 
 // -----------------------------------------------------------------------------
 // FrameConfig — per-frame parameters set by the application.
@@ -134,14 +109,11 @@ struct FrameConfig {
     bool       renderToTexture     = false;
     int        primary_raystop     = 100;
     int        normalPrecision     = 6;     // normal kernel radius (voxel-size units)
-    int        lbuffer_retries     = 6;     // lbuffer_claim ping-pong iterations (tunable)
     int        virtualScale        = 5;     // shading downscale divisor (virtual framebuffer)
-    int        emaDiffuse          = 28;    // diffuse temporal window (sample cap, long)
-    int        emaSpecular         = 1;     // specular temporal window (sample cap, short)
-    int        atrousIters         = 4;     // à-trous MAX iters on virtual SPECULAR (adaptive by roughness: mirrors→1, glossy→this); 0 = off
-    float      atrousSigmaN        = 80.0f; // à-trous normal edge-stop exponent (higher = sharper)
-    float      atrousSigmaP        = 2.0f;  // à-trous position edge-stop (center-voxel-size units)
-    int        staleFrames         = 64;    // re-visit gap (frames) past which a cached channel's EMA count is reset (diffuse + specular; 0 = off)
+    int        emaDiffuse          = 140;    // diffuse temporal window (sample cap, long)
+    int        emaSpecular         = 4;     // specular temporal window (sample cap, short)
+    int        staleViewDep        = 50;    // re-visit gap (frames) past which a cached channel's EMA count is reset (specular; 0 = off)
+    int        staleViewIndep      = 1e7;    // re-visit gap (frames) past which a cached channel's EMA count is reset (diffuse; 0 = off)
 };
 
 // -----------------------------------------------------------------------------

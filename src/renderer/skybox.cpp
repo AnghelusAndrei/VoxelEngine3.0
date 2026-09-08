@@ -130,8 +130,9 @@ void Skybox::BindUniforms(GLuint program_, uint8_t &texturesBound) {
     glActiveTexture(GL_TEXTURE0 + texturesBound);
     glBindTexture(GL_TEXTURE_CUBE_MAP, gl_ID);
     
-    GLint texLoc = glGetUniformLocation(program_, "skybox");
-    glUniform1i(texLoc, (int)texturesBound);
+    // glProgramUniform*, not glUniform*: names the program instead of writing to
+    // whichever one is current - there may be none.
+    glProgramUniform1i(program_, glGetUniformLocation(program_, "skybox"), (int)texturesBound);
     
     texturesBound++;
 }

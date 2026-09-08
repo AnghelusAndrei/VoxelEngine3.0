@@ -42,16 +42,17 @@ class VoxelEngine{
         FPCamera::ControllerConfig controllerConfig;
         Camera::Config             cameraConfig;
 
+        
+        // demo scene state
         bool     ui_active     = true;
         uint32_t insertionMat  = 0;
         uint32_t insertionSize = 0;
         int insertionRadius = 0;
-
         uint32_t matEmissive  = 0;
         uint32_t matRed       = 0;
         uint32_t matGreen     = 0;
         uint32_t matWhite     = 0;
         uint32_t matMetallic  = 0;
         uint32_t matBlue      = 0;
-        uint32_t emissive_mat4 = 0;
+        glm::ivec3 sponzaCentre = glm::ivec3(0);   // atrium centre; the light sits here
 };

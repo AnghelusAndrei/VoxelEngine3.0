@@ -1,8 +1,12 @@
 // 64-bit node, AoS in octree.nodes[] (uvec2 per slot: .x = lo, .y = hi).
-//   Lo: [ isNode:1 | material:7 | childmask:8 | reserved:16 ]   Hi: [ next:32 ]
+//   Lo: [ isNode:1 | material:10 | childmask:8 | version:8 | slotOffset:5 ]  Hi: [ next:32 ]
+//   Field shifts/masks live in constants.glsl (NODE_* / MATERIAL_*).
 // Mirrors Octree::Node on the CPU — keep both sides on these explicit masks.
 const float inv_127 = 1.0 / 127.0;
-#define MAXDEPTH 12
+
+#ifndef MAXDEPTH
+#error "MAXDEPTH not defined - compile this through shader::compile with shaderDefines"
+#endif
 uint octreeLength; // Assume this is provided by uniform/buffer
 
 struct Node {
@@ -17,11 +21,11 @@ struct ray_t { vec3 origin, direction, inverted_direction; };
 Node UnpackNode(uvec2 raw) {
     uint lo = raw.x;
     return Node(
-        bool(lo & 1u),            // type     (isNode, bit 0)
-        (lo >> 8u) & 0xFFu,       // childmask (bits 8..15)
-        raw.y,                    // next     (full 32-bit hi word)
-        (lo >> 1u) & 0x7Fu,       // material (bits 1..7)
-        (lo >> 16u) & 0xFFu       // version  (bits 16..23)
+        bool(lo & NODE_ISNODE_BIT),
+        (lo >> NODE_CM_SHIFT)  & NODE_CM_MASK,    // childmask
+        raw.y,                                    // next (full 32-bit hi word)
+        (lo >> NODE_MAT_SHIFT) & MATERIAL_MASK,   // material
+        (lo >> NODE_VER_SHIFT) & NODE_VER_MASK    // version
     );
 }
 
@@ -91,6 +95,18 @@ hit_t Raycast(ray_t ray, uint maxDepth, uint maxSteps, float originOffset) {
     vec3  target_pos = vec3(0.0);
     uint  target_size = octreeLength;
 
+    // Hoisted out of the loop so they are initialised ONCE, not per DDA step — the descent
+    // below reads them only after assigning, so this costs the walk nothing.
+    // They must exist across iterations because the maxSteps fallback reads them, and the
+    // descent can `break` on an empty octant BEFORE assigning either (the parent-childmask
+    // early-out skips the node fetch). Declared inside the loop they were then read
+    // uninitialised, so the fallback could fabricate a hit from a garbage material and hand
+    // back a garbage `id` — which callers now use to index octree.nodes[] for the baked slot
+    // offset. material 0 is the canonical "no hit", so the fallback simply cannot fire until
+    // a real node has been descended into.
+    Node  node = Node(false, 0u, 0u, 0u, 0u);
+    uint  slot = 0u;
+
     while (inBounds(r_pos, float(octreeLength)) && q < maxSteps) {
         q++;
         uvec3 ur_pos = uvec3(r_pos);
@@ -100,7 +116,7 @@ hit_t Raycast(ray_t ray, uint maxDepth, uint maxSteps, float originOffset) {
         if (diff == 0u) {
             // Numerical stall fallback: advance by a fraction of the current voxel size
             // so it scales correctly at every octree depth, then re-enter the DDA.
-            r_pos += ray.direction * (float(target_size) * 1e-3);
+            r_pos += ray.direction * (float(target_size) * 1e-2);
             continue;
         }
 
@@ -110,14 +126,13 @@ hit_t Raycast(ray_t ray, uint maxDepth, uint maxSteps, float originOffset) {
 
         // Extract block base (next ptr) from the parent node on the stack
         uint offset = gs_stack[resume_depth - 1u][threadIdx].y;
-        Node node; uint slot;
 
         for (uint d = resume_depth; d <= effDepth; d++) {
             target_size = octreeLength >> d; // Replaced dynamic p2c array allocation
             uint childIdx = locate(ur_pos, target_size);
 
             // Skip the node fetch when parent childmask indicates an empty octant
-            uint parent_mask = (gs_stack[d - 1u][threadIdx].x >> 8u) & 0xFFu;
+            uint parent_mask = (gs_stack[d - 1u][threadIdx].x >> NODE_CM_SHIFT) & NODE_CM_MASK;
             if ((parent_mask & (1u << childIdx)) == 0u) {
                 target_pos = vec3(uvec3(ur_pos) & ~uvec3(target_size - 1u));
                 break;

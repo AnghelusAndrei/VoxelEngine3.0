@@ -8,7 +8,7 @@
 #include <functional>
 #include <cstdlib>
 
-#define maxDepth 11
+#define maxDepth 15
 
 class Renderer;
 
@@ -18,20 +18,33 @@ public:
     // one 8-slot block = 64 B = exactly one L2 cache line (blocks are 8-slot
     // aligned — see allocBlock / the constructor).
     //
-    //   Lo word: [ isNode:1 | material:7 | childmask:8 | version:8 | reserved:8 ]
+    //   Lo word: [ isNode:1 | material:10 | childmask:8 | version:8 | slotOffset:5 ]
     //   Hi word: [ next:32 ]
+    //
+    // Mirrors shd/constants.glsl NODE_* / MATERIAL_*; the static_asserts below fail the
+    // build if the two drift. The word is completely full - widening any field means
+    // narrowing another, and the slot offset is already exactly LB_PROBE_LIMIT wide.
 
     struct Node {
         uint32_t lo = 0;
         uint32_t hi = 0;
 
         static constexpr uint32_t ISNODE_BIT = 1u;       // lo bit 0
-        static constexpr uint32_t MAT_SHIFT  = 1u;       // lo bits 1..7
-        static constexpr uint32_t MAT_MASK   = 0x7Fu;
-        static constexpr uint32_t CM_SHIFT   = 8u;       // lo bits 8..15
+        static constexpr uint32_t MAT_SHIFT  = 1u;       // lo bits 1..10
+        static constexpr uint32_t MAT_MASK   = 0x3FFu;
+        static constexpr uint32_t CM_SHIFT   = 11u;      // lo bits 11..18
         static constexpr uint32_t CM_MASK    = 0xFFu;
-        static constexpr uint32_t VER_SHIFT  = 16u;      // lo bits 16..23
+        static constexpr uint32_t VER_SHIFT  = 19u;      // lo bits 19..26
         static constexpr uint32_t VER_MASK   = 0xFFu;
+        static constexpr uint32_t SLOTOFF_SHIFT = 27u;   // lo bits 27..31
+        static constexpr uint32_t SLOTOFF_MASK  = 0x1Fu; // exactly LB_PROBE_LIMIT (32)
+
+        // The Lo word must be exactly full and non-overlapping.
+        static_assert(MAT_SHIFT == 1u, "material follows the isNode bit");
+        static_assert(CM_SHIFT  == MAT_SHIFT + 10u, "material is 10 bits");
+        static_assert(VER_SHIFT == CM_SHIFT  + 8u,  "childmask is 8 bits");
+        static_assert(SLOTOFF_SHIFT == VER_SHIFT + 8u, "version is 8 bits");
+        static_assert(SLOTOFF_SHIFT + 5u == 32u, "slot offset fills the word");
 
         bool     isNode()    const { return (lo & ISNODE_BIT) != 0u; }
         bool     empty()     const { return lo == 0u && hi == 0u; }
@@ -66,12 +79,15 @@ public:
     ~Octree();
 
 
-    void     setProgram(GLuint program_);
     void     GenUBO();
     void     freeVRAM();
-    void     BindUniforms(uint8_t& texturesBound);
+    void     BindUniforms(GLuint program);
     // Zero the claim bitfield — call once per frame before primary.comp's dedup TAS.
     void     clearClaimBitfield();
+    // Rewrite every leaf material through `remap` (old id -> new id). The other half
+    // of MaterialPool::collapse: without it, compacting the pool silently repaints
+    // everything already in the tree. Returns the number of nodes changed.
+    uint32_t remapMaterials(const std::vector<uint32_t>& remap);
 
     // ---- Write ----
     void insert(glm::uvec3 pos, uint32_t material, uint32_t leafDepth = 0);
@@ -86,7 +102,7 @@ public:
     uint32_t lookup(glm::uvec3 pos) const;
     // CPU port of the GPU Raycast() — used for picking (insert/remove on click).
     RayHit raycast(glm::vec3 origin, glm::vec3 direction,
-                   uint32_t maxSteps = 300) const;
+                   uint32_t maxSteps = 100) const;
 
     // Push pending CPU edits to GPU as a single coalesced glBufferSubData.
     void flushEdits();
@@ -156,6 +172,7 @@ private:
     bool     blockIsEmpty(uint32_t block) const;
     void     freeSubtree(uint32_t blockSlot);
     void     markDirty(uint32_t slot, uint32_t count = 1);
+
     void     setChildBit(uint32_t internalSlot, uint32_t childIdx);
 
     // Recompute one internal node's representative material as the majority over

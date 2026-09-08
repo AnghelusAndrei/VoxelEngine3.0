@@ -1,148 +1,266 @@
 # Pipeline — Per-Voxel Irradiance-Cache Path Tracer
 
-**Status: IMPLEMENTED (as-built).** The live render pipeline (`src/renderer/renderer.cpp::run`,
-`src/shd/*.comp`): lock-free claim ([CLAIM.md](CLAIM.md)), the megakernel cache path tracer, the
-adaptive specular-only à-trous, and the dynamic-light staleness reset. See
-[MILESTONE_B.md](MILESTONE_B.md) for the design decisions, [LBUFFER.md](LBUFFER.md) for the slot
-layout, and [RESTIR.md](RESTIR.md) for the next step (ReSTIR GI denoising).
+How a frame is produced. Slot layout and cache internals: [LBUFFER.md](LBUFFER.md). Node format
+and GPU buffers: [OCTREE.md](OCTREE.md). Driving it, and materials: [USAGE.md](USAGE.md).
 
-## Design in one paragraph
+## What it is
 
-Primary rays discover visible voxels at native resolution and dedup them into a per-frame list
-(`primary` + claim bitfield). Each unique voxel claims a persistent slot in the **lBuffer** — a
-hash-indexed, LRU per-voxel radiance cache ([LBUFFER.md](LBUFFER.md)). Shading runs on a **downscaled
-virtual framebuffer** as a **megakernel path tracer**: one cosine diffuse ray + one GGX-VNDF specular
-ray, each a single bounce that reads the *previous frame's* cache at the hit voxel
-(**irradiance-cache feedback** ⇒ effectively unbounded bounces over frames). **Direct light is the
-diffuse bounce landing on an emissive voxel** (visibility built in — no shadow ray); the skybox is the
-other light. Per-frame samples scatter into per-voxel accumulators (`accum`) and fold into the slot's
-channels via a per-voxel **EMA** (`avg`). `resolve` reads the converged per-voxel cache at full
-resolution and composites.
+Primary rays find visible voxels at full resolution. Shading runs on a **downscaled virtual
+framebuffer** as a megakernel path tracer: one cosine diffuse ray + one GGX-VNDF specular ray, each
+a single bounce that reads the **previous frame's** per-voxel cache at the hit — irradiance-cache
+feedback, so bounces compound across frames. Direct light *is* the diffuse bounce landing on an
+emissive voxel; visibility is built in, there is no shadow ray. The skybox is the other light.
+Per-frame samples scatter into per-voxel accumulators and fold into the cache through a
+variance-adaptive EMA. `resolve` reads that cache at full resolution and composites.
 
 ---
 
-## Data-Flow Diagram
+## Frame
 
 ```mermaid
 flowchart TD
-    CPU["CPU Renderer::run\nclear claim bitfield + uniqueCount\nframeTime (ms, LRU) · frameIdx (monotonic, RNG)\npop ≤1 EditRegion"] --> P1
-
-    P1["primary.comp — full-res 8×8\nDDA octree SSBO → gbuffer (pos,level,material,version)\nclaim-bitfield atomicOr TAS\nwave-compact → uniqueVoxelList (uvec4), uniqueVoxelCount"]
-    P1 -->|IMAGE·STORAGE| PA["buildArgs.comp (1 thread)\nuniqueCount → indirectArgs[0] · reset retry counters"]
-    PA -->|STORAGE·COMMAND| P2["lbuffer_claim.comp — SINGLE dispatch (lock-free)\nflat open-addressed: home=hash&(N-1) · linear probe\nCAS on timestamp D2 (empty/match/evict) · LRU evict d2<frameStamp\nwrite claimedSlot → uniqueList[origIdx].z"]
-    P2 -->|STORAGE·COMMAND| EM["edit_mark.comp (only if region pending)\n3D over capped AABB · probe lBuffer · set NormalUpdateFlag"]
-    EM -->|STORAGE| PA2["buildArgs.comp — rebuild indirectArgs from uniqueCount"]
-    PA2 -->|STORAGE·COMMAND| N["normal.comp — indirect over uniqueList, local 64\nread claimedSlot · skip if flag==0\noccupancy-gradient normal → D3 · clear flag"]
-    N -->|STORAGE| DS["downscale.comp — virtual-res 8×8\nPER-PIXEL jittered sample of full-res gbuffer → virtual gbuffer"]
-    DS -->|IMAGE| SH["shade.comp — virtual-res 8×8 (MEGAKERNEL PT)\nvoxelNormal: cache probe → radius-2 kernel fallback\nWORLD-keyed RNG (hash of voxel pos)\ncosine diffuse (emission ON ⇒ bounce-hit emitter = direct) + GGX-VNDF specular\n1 bounce + cache feedback · firefly clamp → virtualDiffuse (E/π), virtualSpecular"]
-    SH -->|IMAGE| AT["atrous.comp — virtual-res 8×8 (optional ×atrousIters, ping-pong)\nedge-stop à-trous (normal·pos·material) on SPECULAR only, BEFORE accum\nper-pixel iters ADAPTIVE by roughness (mirrors 1 → glossy atrousIters); stride 1,2,4…"]
-    AT -->|IMAGE·STORAGE| AC["accum.comp — virtual-res 8×8\nprobe slot · atomicAdd HDR fixed-point diff/spec sums + pixelCount"]
-    AC -->|STORAGE| AV["avg.comp — indirect over uniqueList, local 64\nframeMean = sum/(pixels·SCALE)\nEMA blend (long diffuse / short specular window) → RGB9E5 channels\nclear per-frame accumulators"]
-    AV -->|STORAGE| R["resolve.comp — full-res 8×8\nmiss→skybox · else probe slot\nSHADING = (1-metallic)·albedo·diffuse + specular + emissive\n(+ debug modes)"]
-    R -->|IMAGE| F["final.frag — fullscreen quad → swapchain"]
+    CPU["CPU Renderer::run\nclear claim bitfield + uniqueVoxelCount\nlatch frameStamp · pop ≤1 EditRegion"] --> P1
+    P1["primary.comp — full-res 8×8\nDDA octree → gbuffer (pos, level, material, version, vid)\nreads only · miss = uvec4(0)"]
+    P1 -->|IMAGE| DS["downscale.comp — virtual-res 8×8, subgroup\njittered 1-of-scale² sample → virtual gbuffer\nclaim-bitfield atomicOr TAS by vid\nwave-compact → uniqueVoxelList + count"]
+    DS -->|IMAGE·STORAGE| BA["buildArgs.comp — 1 thread\nuniqueCount → indirectArgs[0]"]
+    BA -->|STORAGE·COMMAND| CL["lbuffer_claim.comp — indirect, single dispatch\nlock-free open addressing · CAS on timestamp\nwrite claimedSlot + listIndex · bake slot offset into node"]
+    CL -->|STORAGE| EM["edit_mark.comp — 3D, ≤1 region/frame\nre-flag NormalUpdateFlag around an edit"]
+    EM -->|STORAGE| NM["normal.comp — indirect per voxel\noccupancy-gradient normal → D3, clear flag"]
+    NM -->|STORAGE| SH["shade.comp — virtual-res 8×8 (megakernel PT)\nONE lookupLBuffer: normal + listIndex off one line\nworld-keyed RNG · cosine diffuse + GGX-VNDF specular\n1 bounce + cache feedback · firefly clamp\nstamps listIndex into virtual gbuffer .z"]
+    SH -->|IMAGE·STORAGE| AC["accum.comp — virtual-res 8×8\ngid = VGListIdx(gbuffer) · no lBuffer, no octree, no hash\natomicAdd HDR fixed-point sums + pixelCount"]
+    AC -->|STORAGE| AV["avg.comp — indirect per voxel\nframeMean = sum/(pixels·SCALE)\nvariance-adaptive EMA → RGB9E5 channels\nupdate log-luminance mean + variance"]
+    AV -->|STORAGE| HF["holefill.comp — virtual-res 8×8\none lookupLBuffer per texel, no filtering\nchannels + per-tap confidence → holeFill"]
+    HF -->|IMAGE| RS["resolve.comp — full-res 8×8\nmiss→skybox · else lookupLBuffer (O(1) baked offset)\nunserved channel → confidence-weighted bilinear over holeFill"]
+    RS -->|IMAGE| FN["final.frag — fullscreen quad → swapchain"]
 ```
 
-`buildArgs` is reused (not a separate `buildAvgArgs`); `avg` dispatches over the same
-`uniqueVoxelList` / `indirectArgs[0]` as `normal` (every visible voxel, early-out if
-`pixels==0`). There is **no** `shadedVoxelList`.
+`buildArgs` runs once; `claim`, `normal` and `avg` all dispatch indirectly over the same
+`uniqueVoxelList` (`uniqueCount` is fixed after `downscale`, and none of them touch `indirectArgs`).
 
 ---
 
-## Pass specifications (as-built)
+## Passes
 
-### primary.comp — full-res `8×8`, subgroup extensions
-DDA-traces the octree, writes the gbuffer, dedups visible voxels.
-- **gbuffer** (RGBA32UI, see `gbuffer.glsl`): `x = pos.x|pos.y`, `y = pos.z|level<<16|version<<24`, `z = material`, `w = reserved`. Miss → `uvec4(0)` (level==0).
-- **Dedup:** `atomicOr` on the claim bitfield by `hit.id` (octree slot) — one append per unique node. Wave-compacted (`subgroupBallot`/`…ExclusiveBitCount`/`subgroupElect`) into `uniqueVoxelList` (`uvec4{key.xy, claimedSlot=NO_SLOT, spare}`), `uniqueVoxelCount`.
-- Barrier: `IMAGE | STORAGE`.
+### primary.comp — full-res `8×8`
+DDA-traces the octree and writes the gbuffer. Does not dedup.
+- **gbuffer** (RGBA32UI): `x = pos.x|pos.y`, `y = pos.z|level<<16|version<<24`, `z = material`,
+  `w = vid` (octree node id). Miss → `uvec4(0)`, i.e. `level == 0`, which is the canonical miss test.
+- Barrier `IMAGE`.
+
+### downscale.comp — virtual-res `8×8`, subgroup extensions
+Each virtual texel samples ONE full-res texel at `vp*scale + jit`. `jit` is semi-deterministic: a
+per-pixel `phase` hashed from `vp`, advanced by `jitterStride * (frameIndex % S)` mod `S = scale²`,
+with `jitterStride` chosen coprime to `scale` on the host. Every pixel therefore walks all `S`
+sub-tile offsets exactly once per `S` frames. Per-pixel phase breaks the structured coverage a global
+offset bakes in; the coprime stride guarantees complete coverage.
+- **Dedup:** `atomicOr` on the claim bitfield by `vid` — one append per unique node, wave-compacted
+  (`subgroupBallot` / `…ExclusiveBitCount` / `subgroupElect`) into `uniqueVoxelList` and
+  `uniqueVoxelCount`. Deduping here rather than at full res means only the texels actually shaded get
+  claimed.
+- Barrier `IMAGE | STORAGE`.
 
 ### buildArgs.comp — 1 thread
-`indirectArgs[0] = ⌈count/64⌉` from `uniqueCount` (or a retry counter, by `srcParity`); resets the chosen retry counter (`resetParity`). Barrier `STORAGE | COMMAND`.
+`indirectArgs[0] = ⌈uniqueCount / 64⌉`. Barrier `STORAGE | COMMAND`.
 
-### lbuffer_claim.comp — indirect, local `64`, **single dispatch** (lock-free)
-Per voxel: `home = voxelKey(pos,level,version) & (LBUFFER_SLOTS_TOTAL-1)`. Linear-probe from
-home; take a slot by `atomicCompSwap` on the **timestamp word (D2)** as a per-slot per-frame
-token — empty (`D2==0`) / match / evict-stalest (`D2<frameStamp`) all CAS the same word, so
-exactly one thread wins and losers advance the probe (no spin, no lock, no retry buffer). On
-claim: write key (D0,D1), zero D4–D15, `NormalUpdateFlag=1`; write `claimedSlot` back to
-`uniqueList[origIndex].z`. Staleness: a MATCH re-claim past `staleFrames` drops **both** EMA sample
-counts (diffuse + specular, in-register, one shared window — dynamic lighting; [LBUFFER.md](LBUFFER.md)).
-Barrier `STORAGE`. ([CLAIM.md](CLAIM.md))
+### lbuffer_claim.comp — indirect, local `64`, single dispatch
+Seats every visible voxel in the cache and bakes its probe distance into the octree node. Full
+algorithm: [LBUFFER.md](LBUFFER.md). Barrier `STORAGE`.
 
 ### edit_mark.comp — 3D `4×4×4`, ≤1 region/frame
-Pops one `EditRegion` AABB (capped at 64³, split across frames if larger); for each lattice point descends to the leaf, probes the lBuffer, and `atomicOr`s `NormalUpdateFlag` so `normal.comp` recomputes neighbour normals whose occupancy changed. Barrier `STORAGE`.
+Pops one `EditRegion` AABB (capped at 64³, split across frames if larger); for each lattice point
+descends to the resident leaf and `atomicOr`s `NormalUpdateFlag` so `normal.comp` recomputes
+neighbour normals whose occupancy changed. Barrier `STORAGE`.
 
-### normal.comp — indirect over uniqueList, local `64`
-Reads `claimedSlot` from the list; skips if `NormalUpdateFlag==0`. Computes an occupancy-gradient normal (baseline weighted sphere of radius `normalPrecision`, sampled at voxel size; a multiscale-prototype estimator lives behind a `#define`), packs **3×10-bit** into D3 (flag bit cleared). Barrier `STORAGE`.
-
-### downscale.comp — virtual-res `8×8`
-Each virtual pixel samples ONE full-res gbuffer texel at `vp*scale + jit`, where `jit` is a **per-pixel, per-frame** random offset in `[0,scale)` (salted `lb_hash(vp, frame)`). Per-pixel (not global) jitter is required: a shared offset samples coherently and bakes a structured per-voxel coverage pattern. Writes the virtual gbuffer. Barrier `IMAGE`.
+### normal.comp — indirect per voxel, local `64`
+Skips unless `NormalUpdateFlag` is set. Occupancy-gradient normal over a weighted sphere of radius
+`normalPrecision` sampled at voxel size, packed 3×10-bit into D3 with the flag cleared.
+Barrier `STORAGE`.
 
 ### shade.comp — virtual-res `8×8` (megakernel path tracer)
-1. Read virtual gbuffer → primary voxel; reconstruct `center`, `V = normalize(cam − center)`.
-2. `voxelNormal`: probe the cache for the stored normal; if absent/flagged, fall back to a radius-2 occupancy-gradient kernel.
-3. **RNG seed = world voxel identity** (`lb_hash` of `gb.pos`, with `frameIndex` and `vp` mixed in as secondary terms). Seeding by screen pixel bakes a screen-periodic error into the world cache — do not.
-4. **Diffuse bounce:** one cosine-weighted ray from `center + N·(0.87·vsize+0.5)`; `traceRadiance(…, includeEmission=true)` — a bounce landing on an emissive voxel returns its emission (**that is the direct light**); else sky + cached indirect. Firefly-clamp.
-5. **Specular:** one GGX-VNDF ray (`sampleGGXVNDF` + `ggxThroughput = F·G1(L)`), `traceRadiance(…, includeEmission=true)`, gated on `dot(L,N)>0` and `material.specular>0.01`. Firefly-clamp.
-6. `traceRadiance(origin,dir,includeEmission)`: DDA (`originOffset=0`); miss → skybox; hit → `(includeEmission && emissive ? emission : 0) + (1-metallic)·albedo·unpack(cache.diffuse)` (irradiance-cache feedback, reads previous frame).
-7. Write `virtualDiffuse` (E/π) and `virtualSpecular` (throughput-weighted), RGBA32F. Barrier `IMAGE | STORAGE`.
+1. Read the virtual gbuffer → primary voxel; reconstruct `centre`, `V`.
+2. **One `lookupLBuffer`** serves the whole texel: the cached normal (D3) and this voxel's
+   `listIndex` (D7) are on the same 64 B line. The index is stamped into the virtual gbuffer's spare
+   `.z` bits so `accum` needs no lookup of its own. Normal falls back to a radius-2 occupancy kernel
+   when absent.
+3. **RNG seed = world voxel identity** (`lb_hash` of `gb.pos`, with `frameIndex` and `vp` mixed in as
+   secondary terms). Seeding by screen pixel bakes a screen-periodic error into a world-space cache.
+4. **Diffuse:** one cosine-weighted ray from `centre + N·(0.87·vsize + 0.5)`. `traceRadiance` returns
+   emission on an emissive hit (**that is the direct light**), else sky + the hit voxel's cached
+   diffuse. Firefly-clamped.
+5. **Specular:** one GGX-VNDF ray (`sampleGGXVNDF` + `F·G1(L)` throughput), gated on `dot(L,N) > 0`
+   and `material.specular > 0.01`.
+6. Writes `virtualDiffuse` (E/π) and `virtualSpecular`. Barrier `IMAGE | STORAGE`.
 
 ### accum.comp — virtual-res `8×8`
-Probe the primary voxel's slot; `atomicAdd` the firefly-clamped diffuse/specular samples (HDR fixed-point ×`ACCUM_SCALE`) into D7–9 / D11–13 and `+1` into `pixelCount` (D10). Barrier `STORAGE`.
+`gid = VGListIdx(virtual gbuffer)`, then `atomicAdd` the firefly-clamped samples (HDR fixed-point
+×`ACCUM_SCALE`) into `accumDiffuse[gid].xyz` / `accumSpecular[gid].xyz` and `+1` into
+`accumDiffuse[gid].w`. Touches **neither the lBuffer nor the octree** — `shade` already resolved the
+index. `VG_LISTIDX_NONE` covers sky and voxels that never seated. Barrier `STORAGE`.
 
-### avg.comp — indirect over uniqueList, local `64`
-Per voxel (`pixels==0` → keep history): `frameMean = sum/(pixels·SCALE)`; **sample-capped EMA** `M' = (M·N + frameMean·pixels)/(N+pixels)`, `N' = min(N+pixels, cap)` — diffuse cap `emaDiffuse` (long), specular cap `emaSpecular` (short, view-dependent). Write channels as **RGB9E5**; clear D7–13. Barrier `STORAGE`.
+### avg.comp — indirect per voxel, local `64`
+Early-out on `pixels == 0` (not sampled this frame → keep history). Folds this frame's mean into the
+cached channels and updates the variance tracker: [LBUFFER.md](LBUFFER.md) § Accumulate and temporal blend.
+Barrier `STORAGE`.
+
+### holefill.comp — virtual-res `8×8`
+One `lookupLBuffer` per texel, no filtering. Exists to hoist the expensive half of the fill (node
+read + hash chain + scattered 64 B line) out of the full-res loop, where every pixel in a `scale²`
+tile repeated it. Each channel is published only if its EMA count is non-zero and it is inside its
+staleness window; otherwise `IRR_HOLE`.
+
+Output `holeFill` (RGBA32UI, virtual-res):
+
+| | Contents |
+|---|---|
+| `x`, `y` | diffuse / specular, RGB9E5 exactly as the lBuffer stores them, or `IRR_HOLE` |
+| `z`, `w` | the texel's voxel key (gbuffer `.xy` layout), with `version` replaced by a **confidence** byte |
+
+Confidence is `1 / (1 + v/n)` from the variance and sample count already on the fetched line — the
+squared standard error of the stored mean. It costs nothing and is strictly better than gating on
+sample count, which says how *much* was measured but not how much it disagreed. Barrier `IMAGE`.
 
 ### resolve.comp — full-res `8×8`
-Per pixel: miss → skybox. `SHADING`: probe slot → `(1-metallic)·albedo·diffuse + specular + (emissive ? emission : 0)`; `NO_SLOT` → flat albedo fallback. Debug modes: `OCTREE · MATERIAL · NORMAL · VERSION · CLAIM_AGE · LRU_OCCUPANCY · VIRTUAL · SHADE · SAMPLES`. Barrier `IMAGE`.
+Miss → skybox **without touching the cache** (the lookup is guarded on `gb.hit`; a sky pixel would
+otherwise pay a node read, a hash chain and a scattered fetch only to discard them). On a hit,
+`lookupLBuffer(pos, level, version, octree.nodes[gb.vid].x)` — the O(1) baked-offset read, not a
+probe — then each channel is taken only if inside its staleness window, else marked `IRR_HOLE`.
+
+`SHADING` composites `(1-metallic)·albedo·diffuse + specular + (emissive ? emission : 0)`.
+
+**Cache-hole fill (`holeFillAt`).** An unserved channel is reconstructed by a gated bilinear over
+`holeFill`, four coherent image loads:
+
+```glsl
+c    = (pix + 0.5)/virtualScale - 0.5;   // texel vp is centred at vp*scale + (scale-1)/2
+base = floor(c);  t = c - base;
+w    = bilinear(t) × HFConfidence(tap)
+```
+
+A tap is dropped when its channel is `IRR_HOLE` or its level differs; surviving weights
+**renormalize**, which is the trick — a bilinear that skips invalid taps and renormalizes *is* a 2×2
+gather, so a sparse field still reconstructs. The taps are skipped entirely when both channels came
+from the cache. If nothing survives the channel stays **black**, never flat albedo. Barrier `IMAGE`.
 
 ### final.vert / final.frag
-Fullscreen quad samples `resolveTexture` → swapchain. No tone mapping.
+Fullscreen quad samples `resolveTexture` → swapchain (or the offscreen target when
+`renderToTexture`). No tone mapping.
 
 ---
 
-## Buffer inventory (as-built)
+## Buffers
 
 | Name | Type | Format | Notes |
 |---|---|---|---|
-| `gbufferTexture` | uimage2D | RGBA32UI, full-res | pos/level/material/version; miss = 0 |
+| `gbufferTexture` | uimage2D | RGBA32UI, full-res | pos/level/material/version/vid; miss = 0 |
 | `OctreeBuffer` | SSBO `uvec2[]` (bind 0) | — | 64-bit nodes ([OCTREE.md](OCTREE.md)) |
-| `ClaimBuffer` | SSBO `uint[]` (bind 1) | — | 1 bit/slot dedup; cleared each frame |
-| `lBuffer` | SSBO `uint[]` (bind 2) | — | flat, 16-DWORD slot, `2²²` slots, **256 MB** ([LBUFFER.md](LBUFFER.md)) |
-| `uniqueVoxelList` | SSBO `uvec4[]` (bind 3) | — | `{key.xy, claimedSlot, spare}` |
+| `ClaimBuffer` | SSBO `uint[]` (bind 1) | — | 1 bit/node dedup TAS; cleared each frame |
+| `lBuffer` | SSBO `uint[]` (bind 2) | — | 16-DWORD slot, 2²² slots, **256 MB** ([LBUFFER.md](LBUFFER.md)) |
+| `uniqueVoxelList` | SSBO `uvec4[]` (bind 3) | — | `{key.xy, claimedSlot, vid}`; virtual-pixel count |
 | `uniqueVoxelCount` | SSBO `uint` (bind 4) | — | cleared each frame |
-| `indirectArgs` | SSBO `uvec4[2]` (bind 8) | — | claim/normal/avg dispatch args |
-| `virtualGBuffer` | uimage2D | RGBA32UI, virtual-res | downscaled voxel id |
-| `virtualDiffuse` | image2D | RGBA32F, virtual-res | incident diffuse E/π (unfiltered) |
-| `virtualSpecular` (×2) | image2D | RGBA32F, virtual-res | specular outgoing radiance; 2nd is à-trous ping-pong |
-| `virtualNormal` | image2D | RGBA32F, virtual-res | xyz=normal, w=roughness — à-trous edge-stop + adaptive budget |
+| `indirectArgs` | SSBO `uvec4[2]` (bind 5) | — | claim/normal/avg dispatch args |
+| `accumDiffuse` | SSBO `uvec4[]` (bind 6) | — | per-list-entry diffuse sum + `pixelCount` |
+| `accumSpecular` | SSBO `uvec4[]` (bind 7) | — | per-list-entry specular sum |
+| `MaterialBuffer` | SSBO `Material[]` (bind 8) | — | 1024 × 64 B; an SSBO because that exceeds any UBO |
+| `virtualGBuffer` | uimage2D | RGBA32UI, virtual-res | downscaled key; `.z` spare bits carry `listIndex` |
+| `virtualDiffuse` | image2D | RGBA32F, virtual-res | incident diffuse E/π |
+| `virtualSpecular` | image2D | RGBA32F, virtual-res | specular outgoing radiance |
+| `holeFill` | uimage2D | RGBA32UI, virtual-res | channels + voxel key + confidence |
 | `resolveTexture` | image2D | RGBA32F, full-res | → final.frag |
 
-> Bindings 5/6/7/9 are **free** (the retry/lock buffers retired with B1.5; the light-tree binding 5
-> freed with the NEE removal). Binding 6, 2 DWORDs/slot is earmarked for the ReSTIR GI reservoir.
+> Binding numbers live in **one** place: `core.hpp` (C++) and `shd/constants.glsl` (GLSL), mirrored by
+> hand. Shaders must use the `SSBO_*_BINDING` defines, never a numeric literal — a shader writing to
+> an unbound point fails **silently**. Bindings 9+ are free.
+
+### Spare-bit contracts
+
+Two images carry extra fields in bits their primary consumer does not read. Both are declared with
+accessors in `gbuffer.glsl`, never as ad-hoc shifts:
+
+| Field | Lives in | Why it is free |
+|---|---|---|
+| `VGListIdx` | virtual gbuffer `.z` bits 10..31 | `material` needs only 10 bits |
+| `HFConfidence` | `holeFill.w` bits 24..31 | `resolve` gates on `pos`/`level`, never `version` |
+
+The list index caps the virtual framebuffer at 4.19 M texels; `allocVoxelLists` logs if exceeded.
 
 ---
 
-## Configurable parameters (`core::FrameConfig` + UI)
+## Shader specialisation
+
+`shader::compile` injects a `Defines` block immediately after the `#version` line — ahead of every
+`#extension` and `#include`, so headers see it. `Renderer::shaderDefines()` builds the set every pass
+shares and each pass owns its copy, so `link()`/`reload()` take no shader arguments and a hot reload
+cannot drift from the original build.
+
+```cpp
+shader::Defines()
+    .include("constants.glsl")                       // bindings, slot layout, render modes
+    .define("MAXDEPTH", volume->depth + 1)           // sizes internal.glsl's shared-memory stack
+```
+
+`constants.glsl` is injected rather than `#include`d per shader, so the pipeline's shared vocabulary
+has one declaration site. `MAXDEPTH` sizes `shared uvec2 gs_stack[MAXDEPTH][64]` — 512 B per level per
+workgroup, and shared memory is what caps occupancy in `primary`/`shade`, so it must be the octree
+actually in use, not the compile-time ceiling. `internal.glsl` has **no default** for it and `#error`s
+instead: a silent fallback would still compile and still render, just at half occupancy.
+
+`Library` collects every pass; `linkAll` / `reloadAll` / `destroyAll` are one call each. `PassUBO`
+flags bind UBO blocks on every link *and* relink. `ComputePass::dispatch` and `FinalRasterPass::draw`
+bind their own program, so no call site binds one by hand.
+
+---
+
+## Parameters (`core::FrameConfig` + UI)
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `primary_raystop` | 80 | max DDA steps |
-| `normalPrecision` | 6 | normal kernel radius |
-| `virtualScale` | 5 | shading downscale divisor (UI slider) |
-| `emaDiffuse` | 28 | diffuse temporal window (UI slider) |
-| `emaSpecular` | 1 | specular temporal window (UI slider) — so short that temporal does ~nothing for specular ⇒ à-trous is its real denoiser |
-| `staleFrames` | 64 | re-visit gap past which both cached channels' EMA counts are reset (dynamic lighting; 0 = off — [LBUFFER.md](LBUFFER.md)) |
-| `atrousIters` | — | à-trous MAX iters on **specular** (adaptive by roughness; 0 = off); `atrousSigmaN`/`atrousSigmaP` edge stops |
-| `renderType` | SHADING | + all debug modes |
+| `primary_raystop` | 100 | max DDA steps |
+| `normalPrecision` | 6 | normal kernel radius, voxel-size units |
+| `virtualScale` | 5 | shading downscale divisor |
+| `emaDiffuse` | 140 | diffuse window **at unit variance** — the reference, not a cap ([LBUFFER.md](LBUFFER.md)) |
+| `emaSpecular` | 4 | specular window; short so specular stays view-responsive |
+| `staleViewDep` | 50 | frames before a specular channel is refused as stale |
+| `staleViewIndep` | 1e7 | effectively an eviction control, not a freshness gate: diffuse irradiance is view-independent |
+
+Shader-side constants that behave like tunables live in `constants.glsl`: `HOLE_RADIUS`,
+`VAR_ALPHA_MIN`/`MAX`, `VAR_WINDOW_EPS`/`MIN`, `LUM_FLOOR`, `FIREFLY_CLAMP`, `ACCUM_SCALE`.
 
 ---
 
-## Known limitation (current) → ReSTIR GI
+## Debug modes
 
-The visible defect is **convergence speed**, not capacity: each voxel converges from few samples per
-frame (lower `virtualScale` / raise the EMA window to mitigate). The temporal cache denoises well but
-is slow on newly-disoccluded regions and rare bounce hits on small/occluded emitters. The next step is
-**ReSTIR GI** — spatiotemporal reservoir reuse of the bounce samples — which denoises direct emission
-and one-bounce indirect together, with no NEE/shadow-ray connection. See [RESTIR.md](RESTIR.md),
-[ROADMAP.md](ROADMAP.md).
+`renderMode` mirrors `core::RenderType` and the `MODE_*` defines in `constants.glsl`.
+
+| Mode | Shows |
+|---|---|
+| `OCTREE` / `MATERIAL` / `VERSION` | straight from the gbuffer |
+| `NORMAL` | decoded D3 normal; grey = not yet computed |
+| `CLAIM_AGE` | **freezes the cache**; bright = recently claimed, magenta = not resident |
+| `LRU_OCCUPANCY` | **freezes the cache**; green = resident, red = evicted / never seated |
+| `VIRTUAL` / `SHADE` | virtual gbuffer material / raw 1-spp preview |
+| `SHADING` | the composite |
+| `SAMPLES` | diffuse EMA sample count |
+| `HOLES` | fill contribution; **red = hole with no usable tap** (black in `SHADING`) |
+| `LUMINANCE` | EMA mean of log-luminance, remapped over `log(LUM_FLOOR)..log(FIREFLY_CLAMP)` |
+| `VARIANCE` | standard deviation in log units, blue → red. Variance itself spans orders of magnitude |
+
+**The two frozen modes** skip every pass that writes the lBuffer — `claim`, `edit_mark`, `normal`,
+`shade`, `accum`, `avg` — while `primary`/`downscale`/`holefill`/`resolve` keep running, so the view
+updates as you fly. Without the freeze neither mode can answer what it exists to answer: a voxel the
+camera looks at is seated and stamped that same frame, so both would paint whatever is on screen and
+report the act of looking. The frame stamp is latched on entry too — left advancing, `CLAIM_AGE`
+would fade the whole cache to black in ten frames, measuring the freeze rather than the cache.
+`frameIdx` keeps advancing so the downscale jitter stays alive.
+
+> `CLAIM_AGE`, `LRU_OCCUPANCY`, `SAMPLES` and `NORMAL` share `resolve`'s single `lookupLBuffer`, so
+> they visualise **fast-path** hits. A voxel reachable only by probing reads as a miss — the more
+> useful diagnostic, since the per-pixel path never probes.
+
+---
+
+## Current limitation
+
+`traceRadiance` contributes **exactly 0** when a bounce lands on a voxel with no cached channel. That
+is a systematic darkening bias, strongest in newly-visible regions — where there is least information
+to begin with. The fill machinery in `holefill`/`resolve` fixes it on screen but not in the feedback
+loop, so the bias compounds through bounces.

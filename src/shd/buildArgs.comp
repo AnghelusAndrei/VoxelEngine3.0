@@ -2,8 +2,8 @@
 
 layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 
-layout(std430, binding = 4) readonly buffer UniqueCount  { uint uniqueCount; };
-layout(std430, binding = 8) writeonly buffer IndirectArg { uvec4 args[]; };
+layout(std430, binding = SSBO_UNIQUE_COUNT_BINDING)  readonly  buffer UniqueCount { uint uniqueCount; };
+layout(std430, binding = SSBO_INDIRECT_ARGS_BINDING) writeonly buffer IndirectArg { uvec4 args[]; };
 
 uniform uint localSize;     // per-voxel pass local_size_x (64)
 

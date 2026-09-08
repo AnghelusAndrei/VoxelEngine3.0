@@ -24,11 +24,11 @@ void ViewportWidget::Draw(){
     }
 
     avail_size = ImGui::GetContentRegionAvail();
-    ImGui::Image((ImTextureID)gl_ID, avail_size, ImVec2(0, 1), ImVec2(1, 0));
+    ImGui::Image(reinterpret_cast<ImTextureID>(static_cast<intptr_t>(gl_ID)), avail_size, ImVec2(0, 1), ImVec2(1, 0));
 
     ImGui::End();
 }
 
-bool ViewportWidget::getDrawID(GLuint gl_ID_){
+void ViewportWidget::setDrawID(GLuint gl_ID_){
     gl_ID = gl_ID_;
 }

@@ -1,22 +1,25 @@
 #version 460 core
 
 layout(local_size_x = 8, local_size_y = 8) in;
+#include "lbuffer.glsl"
 
-// Per-pixel compositor. Reads the gbuffer and writes the final color by render
-// mode. (Increment 1: OCTREE / MATERIAL / VERSION are real from the gbuffer;
-// NORMAL / CLAIM_AGE / LRU_OCCUPANCY become real once the lBuffer is populated.)
 layout(binding = 0, rgba32ui) readonly  uniform uimage2D  gbufferTexture;
 layout(binding = 1, rgba32f)  writeonly uniform image2D   resolveTexture;
 layout(binding = 2, rgba32ui) readonly  uniform uimage2D  virtualGBuffer;    // downscaled (debug)
 layout(binding = 3, rgba32f)  readonly  uniform image2D   virtualDiffuse;    // shade output (debug)
 layout(binding = 4, rgba32f)  readonly  uniform image2D   virtualSpecular;   // shade output (debug)
+layout(binding = 5, rgba32ui) readonly  uniform uimage2D  holeFill;          // holefill.comp: x=diffuse, y=specular
 
 uniform uint  octreeDepth;
 uniform ivec2 screenResolution;
 uniform uint  renderMode;   // core::RenderType
 uniform uint  frameStamp;   // monotonic per-frame stamp (== lBuffer timestamp units)
 uniform uint  virtualScale;
-uniform uint  primaryRaystop;   // max DDA steps, normalizes the STEPS heatmap
+uniform uint staleViewDep;    // specular window (frames); 0 = never stale
+uniform uint staleViewIndep;  // diffuse  window (frames); 0 = never stale
+uniform ivec2 virtualSize;    // virtual gbuffer dimensions (tap bounds)
+
+layout(std430, binding = SSBO_OCTREE_BINDING) readonly buffer OctreeBuffer { uvec2 nodes[]; } octree;
 
 layout(std140, binding = 0) uniform CameraUniform {
     vec4 position;
@@ -29,25 +32,53 @@ struct Material {
     bool emissive;
     float emissiveIntensity;
 };
-layout(std140, binding = 1) uniform MaterialUniform {
-    Material material[127];
+layout(std430, binding = SSBO_MATERIAL_BINDING) readonly buffer MaterialBuffer {
+    Material material[];
 };
 
 uniform samplerCube skybox;
 
 #include "gbuffer.glsl"
-#include "lbuffer.glsl"
 
-// Render modes — keep in sync with core::RenderType.
-const uint MODE_OCTREE = 0u, MODE_MATERIAL = 1u, MODE_NORMAL = 2u,
-           MODE_VERSION = 3u, MODE_CLAIM_AGE = 4u, MODE_LRU = 5u, MODE_VIRTUAL = 6u,
-           MODE_SHADE = 7u, MODE_SHADING = 8u, MODE_SAMPLES = 9u, MODE_STEPS = 10u;
 
-// jet-style ramp (blue=>cyan=>yellow=>red) for the per-ray DDA step heatmap.
-vec3 heat(float t){
-    return clamp(vec3(1.5 - abs(4.0*t - 3.0),
-                      1.5 - abs(4.0*t - 2.0),
-                      1.5 - abs(4.0*t - 1.0)), 0.0, 1.0);
+struct Fill { vec3 diffuse, specular; float dW, sW; };   // dW/sW == 0 => nothing usable
+
+Fill holeFillAt(ivec2 pix, GBuffer gb) {
+    Fill f = Fill(vec3(0.0), vec3(0.0), 0.0, 0.0);
+
+    vec2  c    = (vec2(pix) + 0.5) / float(virtualScale) - 0.5;
+    ivec2 base = ivec2(floor(c));
+    vec2  t    = c - vec2(base);
+    vec2  wx   = vec2(1.0 - t.x, t.x), wy = vec2(1.0 - t.y, t.y);
+
+    for (int dy = 0; dy <= 1; dy++)
+    for (int dx = 0; dx <= 1; dx++) {
+        ivec2 tp = base + ivec2(dx, dy);
+        float w  = wx[dx] * wy[dy];
+        if (w <= 0.0 || any(lessThan(tp, ivec2(0))) || any(greaterThanEqual(tp, virtualSize)))
+            continue;
+
+        uvec4   hf = imageLoad(holeFill, tp);
+        GBuffer vg = UnpackGBuffer(uvec4(hf.zw, 0u, 0u));    // the tap's own voxel key
+        if (!vg.hit) continue;
+
+        w *= HFConfidence(hf);
+
+        if (hf.x != IRR_HOLE) { f.diffuse  += unpackRGB9E5(hf.x) * w; f.dW += w; }
+        if (hf.y != IRR_HOLE) { f.specular += unpackRGB9E5(hf.y) * w; f.sW += w; }
+    }
+
+    if (f.dW > 0.0) f.diffuse  /= f.dW;
+    if (f.sW > 0.0) f.specular /= f.sW;
+    return f;
+}
+
+// blue -> cyan -> yellow -> red; enough dynamic range to read a variance map at a glance.
+vec3 heat(float t) {
+    t = clamp(t, 0.0, 1.0);
+    return clamp(vec3(1.5 - abs(4.0 * t - 3.0),
+                      1.5 - abs(4.0 * t - 2.0),
+                      1.5 - abs(4.0 * t - 1.0)), 0.0, 1.0);
 }
 
 void main() {
@@ -56,13 +87,15 @@ void main() {
 
     GBuffer gb = UnpackGBuffer(imageLoad(gbufferTexture, pix));
 
-    // STEPS heatmap: per-ray DDA traversal cost (hits AND misses) — diagnostic for where
-    // primary.comp spends time. Bypasses the miss=>skybox path so far misses show too.
-    if (renderMode == MODE_STEPS) {
-        float t = clamp(float(gb.steps) / float(max(primaryRaystop, 1u)), 0.0, 1.0);
-        imageStore(resolveTexture, pix, vec4(heat(t), 1.0));
-        return;
+    uint diff = IRR_HOLE, spec = IRR_HOLE, slot = LB_NO_SLOT;
+    if (gb.hit) slot = lookupLBuffer(gb.pos, gb.level, gb.version, octree.nodes[gb.vid].x);
+    if (slot != LB_NO_SLOT) {
+        uint sb  = linearSlotToBase(slot);
+        uint age = frameStamp - lbuf.data[sb + LB_TIMESTAMP];   // same 64 B line as the channels
+        if (fresh(age, staleViewIndep)) diff = lbuf.data[sb + LB_DIFFUSE];
+        if (fresh(age, staleViewDep))   spec = lbuf.data[sb + LB_SPECULAR];
     }
+
 
     vec3 col;
     if (!gb.hit) {
@@ -84,23 +117,18 @@ void main() {
     } else if (renderMode == MODE_VERSION) {
         col = vec3(float(gb.version) / 255.0);
     } else if (renderMode == MODE_CLAIM_AGE) {
-        uint slot = probeLBuffer(gb.pos, gb.level, gb.version);
         if (slot == LB_NO_SLOT) col = vec3(1.0, 0.0, 1.0);          // magenta = not cached
         else {
-            uint age = frameStamp - lbuf.data[linearSlotToBase(slot) + 2u];
+            uint age = frameStamp - lbuf.data[linearSlotToBase(slot) + LB_TIMESTAMP];
             col = vec3(1.0 / (1.0 + float(age) * 0.1));             // bright = freshly claimed
         }
     } else if (renderMode == MODE_LRU) {
-        uint slot = probeLBuffer(gb.pos, gb.level, gb.version);
         col = (slot == LB_NO_SLOT) ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);  // red miss / green cached
     } else if (renderMode == MODE_VIRTUAL) {
-        // Downscaled material from the jittered virtual gbuffer (blocky + per-frame
-        // jitter confirms downscale.comp). Miss in the virtual sample => magenta.
         GBuffer vg = UnpackGBuffer(imageLoad(virtualGBuffer, pix / int(virtualScale)));
         col = vg.hit ? material[vg.material].color.rgb : vec3(1.0, 0.0, 1.0);
     } else if (renderMode == MODE_SHADE) {
         // Raw 1-spp path-traced preview (noisy, no temporal accumulation yet):
-        // albedo·diffuse(E/π) + specular, straight from the virtual radiance images.
         ivec2 vp = pix / int(virtualScale);
         GBuffer vg = UnpackGBuffer(imageLoad(virtualGBuffer, vp));
         if (!vg.hit) col = vec3(0.0);
@@ -112,30 +140,48 @@ void main() {
             if (mm.emissive) col += mm.color.rgb * mm.emissiveIntensity;   // self-emission (view-independent)
         }
     } else if (renderMode == MODE_SHADING) {
-        // Final lit composite from the denoised per-voxel cache (avg.comp output).
+
         Material mm = material[gb.material];
-        uint slot = probeLBuffer(gb.pos, gb.level, gb.version);
-        if (slot == LB_NO_SLOT) {
-            col = mm.color.rgb;                              // overflow voxel => flat albedo fallback
-        } else {
-            uint sb  = linearSlotToBase(slot);
-            vec3 dch = unpackRGB9E5(lbuf.data[sb + LB_DIFFUSE]);
-            vec3 sch = unpackRGB9E5(lbuf.data[sb + LB_SPECULAR]);
-            col = (1.0 - mm.metallic) * mm.color.rgb * dch + sch;
+        vec3 dch = (diff != IRR_HOLE) ? unpackRGB9E5(diff) : vec3(0.0);
+        vec3 sch = (spec != IRR_HOLE) ? unpackRGB9E5(spec) : vec3(0.0);
+        if (diff == IRR_HOLE || spec == IRR_HOLE) {     // skip the taps when fully cached
+            Fill f = holeFillAt(pix, gb);
+            if (diff == IRR_HOLE) dch = f.diffuse;      // still nothing => stays black
+            if (spec == IRR_HOLE) sch = f.specular;
         }
+        col = (1.0 - mm.metallic) * mm.color.rgb * dch + sch;
         if (mm.emissive) col += mm.color.rgb * mm.emissiveIntensity;   // self-emission
+
+    } else if (renderMode == MODE_HOLES) {
+        Material mm = material[gb.material];
+        Fill f = holeFillAt(pix, gb);
+        if ((diff == IRR_HOLE && f.dW <= 0.0) || (spec == IRR_HOLE && f.sW <= 0.0))
+            col = vec3(1.0, 0.0, 0.0);
+        else
+            col = (1.0 - mm.metallic) * mm.color.rgb * ((diff == IRR_HOLE) ? f.diffuse : vec3(0.0))
+                + ((spec == IRR_HOLE) ? f.specular : vec3(0.0));
+
+    } else if (renderMode == MODE_LUMINANCE) {
+        if (slot == LB_NO_SLOT) col = vec3(1.0, 0.0, 1.0);
+        else {
+            float m = uintBitsToFloat(lbuf.data[linearSlotToBase(slot) + LB_LUMINANCE]);
+            const float lo = log(LUM_FLOOR), hi = log(FIREFLY_CLAMP);
+            col = vec3(clamp((m - lo) / (hi - lo), 0.0, 1.0));
+        }
+    } else if (renderMode == MODE_VARIANCE) {
+        if (slot == LB_NO_SLOT) col = vec3(1.0, 0.0, 1.0);
+        else {
+            float v = uintBitsToFloat(lbuf.data[linearSlotToBase(slot) + LB_VARIANCE]);
+            col = vec3(sqrt(max(v, 0.0)) / VAR_DISPLAY_MAX);
+        }
     } else if (renderMode == MODE_SAMPLES) {
-        uint slot = probeLBuffer(gb.pos, gb.level, gb.version);
         if (slot == LB_NO_SLOT) col = vec3(1.0, 0.0, 1.0);
         else col = vec3(float(lbuf.data[linearSlotToBase(slot) + LB_SAMPLES] & 0xFFFFu) / 1024.0);
     } else {   // MODE_NORMAL
-        uint slot = probeLBuffer(gb.pos, gb.level, gb.version);
         if (slot == LB_NO_SLOT) col = vec3(0.5);                 // not cached => neutral
         else {
-            uint d3 = lbuf.data[linearSlotToBase(slot) + 3u];
-            col = ((d3 & NORMAL_UPDATE_BIT) != 0u)
-                ? vec3(0.5)                                      // not computed yet
-                : UnpackNormal(d3) * 0.5 + 0.5;
+            uint d3 = lbuf.data[linearSlotToBase(slot) + LB_NORMAL];
+            col = ((d3 & NORMAL_UPDATE_BIT) != 0u) ? vec3(0.5) : UnpackNormal(d3) * 0.5 + 0.5;
         }
     }
 

@@ -1,14 +1,17 @@
 #version 460 core
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_ballot     : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
-// Jittered downscale of the full-res gbuffer into the virtual gbuffer. Each virtual
-// pixel samples ONE full-res gbuffer texel within its scale×scale tile, at a
-// PER-PIXEL random offset. A global per-frame offset (shared by all virtual pixels)
-// makes the grid sample coherently => each voxel is covered by a structured,
-// deterministic subset of samples => the per-voxel cache converges to a streaky
-// pattern that temporal averaging can't remove. Per-pixel random coverage turns that
-// structured error into ordinary noise the EMA cleans up.
+// claim bitfield — 1 bit per octree slot (binding = SSBO_CLAIM_BINDING).
+layout(std430, binding = SSBO_CLAIM_BINDING) coherent buffer ClaimBuffer { uint bits[]; } claimbuf;
+// dedup output: uvec4 {key.xy, claimedSlot, spare}; claimedSlot pre-set to NO_SLOT.
+layout(std430, binding = SSBO_UNIQUE_LIST_BINDING) writeonly buffer UniqueList { uvec4 entries[]; } uniqueList;
+layout(std430, binding = SSBO_UNIQUE_COUNT_BINDING) coherent  buffer UniqueCnt  { uint uniqueCount; };
+
+
 layout(binding = 0, rgba32ui) readonly  uniform uimage2D gbufferTexture;
 layout(binding = 1, rgba32ui) writeonly uniform uimage2D virtualGBuffer;
 
@@ -16,19 +19,50 @@ uniform ivec2 screenResolution;
 uniform ivec2 virtualSize;
 uniform uint  virtualScale;
 uniform uint  frameIndex;
+uniform uint  jitterStride;
+
+#include "gbuffer.glsl"
 
 uint lb_hash(uint x){ x ^= x>>16; x *= 0x7feb352du; x ^= x>>15; x *= 0x846ca68bu; x ^= x>>16; return x; }
 
 void main() {
     ivec2 vp = ivec2(gl_GlobalInvocationID.xy);
-    if (vp.x >= virtualSize.x || vp.y >= virtualSize.y) return;
+    bool inBounds = (vp.x < virtualSize.x && vp.y < virtualSize.y);
 
-    // Per-pixel, per-frame random offset in [0, virtualScale)
-    uint h = lb_hash(uint(vp.x) ^ lb_hash(uint(vp.y) ^ lb_hash(frameIndex * 2654435761u + 1u)));
-    ivec2 jit = ivec2(h % virtualScale, (h / virtualScale) % virtualScale);
+    uvec4 gkey       = uvec4(0u);
+    uint  vid        = 0u;          // octree node id — claim needs it to bake the slot offset
+    bool  needsAppend = false;
 
-    ivec2 fp = vp * int(virtualScale) + jit;
-    fp = min(fp, screenResolution - ivec2(1));     // clamp the last partial tile
+    if (inBounds) {
+        uint  S     = virtualScale * virtualScale;
+        uint  phase = lb_hash(uint(vp.x) ^ lb_hash(uint(vp.y))) % S;
+        uint  idx   = (jitterStride * (frameIndex % S) + phase) % S;
+        ivec2 jit   = ivec2(idx % virtualScale, idx / virtualScale);
 
-    imageStore(virtualGBuffer, vp, imageLoad(gbufferTexture, fp));
+        ivec2 fp = vp * int(virtualScale) + jit;
+        fp = min(fp, screenResolution - ivec2(1));     // clamp the last partial tile
+
+        gkey = imageLoad(gbufferTexture, fp);
+        imageStore(virtualGBuffer, vp, gkey);
+
+        GBuffer gb = UnpackGBuffer(gkey);
+        if (gb.hit) {   // canonical miss test (level != 0); vid = octree slot id, 0 is a valid id
+            // Claim this octree slot once per frame (dedup TAS).
+            vid = gb.vid;
+            uint w = gb.vid >> 5u, b = 1u << (gb.vid & 31u);
+            needsAppend = (atomicOr(claimbuf.bits[w], b) & b) == 0u;
+        }
+    }
+
+    // Wave-compacted append of unique voxels (ALL lanes participate).
+    uvec4 ballot   = subgroupBallot(needsAppend);
+    uint  waveCnt  = subgroupBallotBitCount(ballot);
+    uint  waveBase = 0u;
+    if (subgroupElect() && waveCnt > 0u)
+        waveBase = atomicAdd(uniqueCount, waveCnt);
+    waveBase = subgroupBroadcastFirst(waveBase);
+    if (needsAppend) {
+        uint off = subgroupBallotExclusiveBitCount(ballot);
+        uniqueList.entries[waveBase + off] = uvec4(gkey.x, gkey.y, LB_NO_SLOT, vid);
+    }
 }

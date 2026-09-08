@@ -10,15 +10,18 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 #include "lbuffer.glsl"
 
-layout(std430, binding = 3) buffer UniqueList { uvec4 entries[]; } uniqueList;
-layout(std430, binding = 4) readonly buffer UniqueCnt { uint uniqueCount; };
+layout(std430, binding = SSBO_UNIQUE_LIST_BINDING) buffer UniqueList { uvec4 entries[]; } uniqueList;
+layout(std430, binding = SSBO_UNIQUE_COUNT_BINDING) readonly buffer UniqueCnt { uint uniqueCount; };
+
+layout(std430, binding = SSBO_OCTREE_BINDING) coherent buffer OctreeBuffer { uvec2 nodes[]; } octree;
 
 uniform uint frameStamp;   // frameIdx+1, never 0
-uniform uint staleFrames;  
+uniform uint staleViewDep;    // specular window (frames); 0 = never stale
+uniform uint staleViewIndep;  // diffuse  window (frames); 0 = never stale
 
 void initSlot(uint sb){
     lbuf.data[sb + LB_NORMAL] = NORMAL_UPDATE_BIT;          // flag=1, normal=0 → normal.comp recomputes
-    for (uint d = 4u; d < SLOT_DWORDS; d++) lbuf.data[sb + d] = 0u;  // channels / accumulators / samples
+    for (uint d = LB_NORMAL + 1u; d < SLOT_DWORDS; d++) lbuf.data[sb + d] = 0u;   // channels + counts
 }
 
 void main(){
@@ -43,10 +46,16 @@ void main(){
 
         if (lbuf.data[sb] == key.x && lbuf.data[sb + 1u] == key.y){          // MATCH
             if (atomicCompSwap(lbuf.data[sb + LB_TIMESTAMP], d2, frameStamp) == d2){
-                // Stale re-visit
-                if (staleFrames != 0u && (frameStamp - d2) > staleFrames){
+                // Stale re-visit: drop each channel's EMA count independently.
+                uint age = frameStamp - d2;
+                bool staleD = (staleViewIndep != 0u && age > staleViewIndep);   // diffuse
+                bool staleS = (staleViewDep   != 0u && age > staleViewDep);     // specular
+                if (staleD || staleS){
                     uint sm = lbuf.data[sb + LB_SAMPLES];
-                    lbuf.data[sb + LB_SAMPLES] = min(sm & 0xFFFFu, 1u) | (min(sm >> 16u, 1u) << 16u);
+                    uint nD = sm & 0xFFFFu, nS = sm >> 16u;
+                    if (staleD) nD = 0u;
+                    if (staleS) nS = 0u;
+                    lbuf.data[sb + LB_SAMPLES] = nD | (nS << 16u);
                 }
                 claimed = s; break;
             }
@@ -76,4 +85,22 @@ void main(){
     }
 
     uniqueList.entries[gid].z = claimed;
+
+    if (claimed != LB_NO_SLOT) {
+        // One write for match / empty / evict alike. The evict path in particular MUST
+        // refresh it: the slot still holds the previous occupant's index, and accum would
+        // otherwise scatter this voxel's radiance into that voxel's accumulator.
+        lbuf.data[linearSlotToBase(claimed) + LB_LISTID] = gid;
+
+        // Bake this voxel's probe distance into its octree node so the per-pixel lookup
+        // can go straight to the slot (lookupLBuffer).
+        uint off = (claimed - h) & (LBUFFER_SLOTS_TOTAL - 1u);
+        if (off <= NODE_SLOTOFF_MASK) {          // guard: LB_PROBE_LIMIT raised past 256
+            uint vid   = entry.w;
+            uint lo    = octree.nodes[vid].x;
+            uint newLo = (lo & ~(NODE_SLOTOFF_MASK << NODE_SLOTOFF_SHIFT))
+                       | (off << NODE_SLOTOFF_SHIFT);
+            if (newLo != lo) octree.nodes[vid].x = newLo;   // skip the write when unchanged
+        }
+    }
 }

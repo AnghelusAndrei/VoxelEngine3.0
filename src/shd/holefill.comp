@@ -1,0 +1,55 @@
+#version 460 core
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Output (RGBA32UI, virtual-res):
+//   x,y : diffuse / specular channel, RGB9E5 exactly as the lBuffer stores them, or IRR_HOLE
+//   z,w : this texel's voxel key (gbuffer .xy layout) — resolve gates its taps on it
+
+layout(binding = 0, rgba32ui) readonly  uniform uimage2D virtualGBuffer;
+layout(binding = 1, rgba32ui) writeonly uniform uimage2D holeFill;
+
+uniform ivec2 virtualSize;
+uniform uint  frameStamp;
+uniform uint  staleViewDep;     // specular window (frames); 0 = never stale
+uniform uint  staleViewIndep;   // diffuse  window (frames); 0 = never stale
+
+// Read ONLY for the baked slot offset, indexed straight by the virtual gbuffer's `vid`.
+layout(std430, binding = SSBO_OCTREE_BINDING) readonly buffer OctreeBuffer { uvec2 nodes[]; } octree;
+
+#include "gbuffer.glsl"
+#include "lbuffer.glsl"
+
+void main() {
+    ivec2 vp = ivec2(gl_GlobalInvocationID.xy);
+    if (vp.x >= virtualSize.x || vp.y >= virtualSize.y) return;
+
+    uvec4   g  = imageLoad(virtualGBuffer, vp);
+    GBuffer gb = UnpackGBuffer(g);
+
+    uint  diff = IRR_HOLE, spec = IRR_HOLE;
+    float conf = 0.0;
+    uint slot = gb.hit ? lookupLBuffer(gb.pos, gb.level, gb.version, octree.nodes[gb.vid].x)
+                       : LB_NO_SLOT;
+    if (slot != LB_NO_SLOT) {
+        uint sb  = linearSlotToBase(slot);          // timestamp, channels and counts: one 64 B line
+        uint age = frameStamp - lbuf.data[sb + LB_TIMESTAMP];
+        uint n   = lbuf.data[sb + LB_SAMPLES];
+        // Each channel on its own staleness window and its own EMA count. A count of 0 means the
+        // slot was claimed but never averaged: it holds a literal 0, not a dark measurement.
+        if ((n & 0xFFFFu) > 0u && fresh(age, staleViewIndep)) diff = lbuf.data[sb + LB_DIFFUSE];
+        if ((n >> 16u)    > 0u && fresh(age, staleViewDep))   spec = lbuf.data[sb + LB_SPECULAR];
+
+        // How much this tap is worth to a neighbour, from the SAME 64 B line already
+        // fetched - no extra read. v/n is the squared standard error of the stored mean,
+        // so this is high for a converged voxel and low for one that is either noisy or
+        // barely sampled. Strictly better than gating on the sample count alone, which
+        // says how MUCH was measured but nothing about how much it disagreed.
+        float nd = float(n & 0xFFFFu);
+        float v  = uintBitsToFloat(lbuf.data[sb + LB_VARIANCE]);
+        conf = 1.0 / (1.0 + v / max(nd, 1.0));
+    }
+
+    // A miss stores key 0 => level 0 => !hit, which is how resolve rejects the tap.
+    imageStore(holeFill, vp, HFSetConfidence(uvec4(diff, spec, g.x, g.y), conf));
+}

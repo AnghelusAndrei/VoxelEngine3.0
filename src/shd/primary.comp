@@ -1,20 +1,11 @@
 #version 460 core
-#extension GL_KHR_shader_subgroup_basic      : require
-#extension GL_KHR_shader_subgroup_ballot     : require
-#extension GL_KHR_shader_subgroup_arithmetic : require
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
 
 layout(binding = 0, rgba32ui) writeonly uniform uimage2D gbufferTexture;
 
-layout(std430, binding = 0) readonly buffer OctreeBuffer { uvec2 nodes[]; } octree;
-
-// claim bitfield — 1 bit per octree slot (binding = SSBO_CLAIM_BINDING).
-layout(std430, binding = 1) coherent buffer ClaimBuffer { uint bits[]; } claimbuf;
-// dedup output: uvec4 {key.xy, claimedSlot, spare}; claimedSlot pre-set to NO_SLOT.
-layout(std430, binding = 3) writeonly buffer UniqueList { uvec4 entries[]; } uniqueList;
-layout(std430, binding = 4) coherent  buffer UniqueCnt  { uint uniqueCount; };
+layout(std430, binding = SSBO_OCTREE_BINDING) readonly buffer OctreeBuffer { uvec2 nodes[]; } octree;
 
 uniform uint octreeDepth;
 uniform ivec2 screenResolution;
@@ -25,16 +16,12 @@ layout(std140, binding = 0) uniform CameraUniform {
     vec4 cameraPlane, cameraPlaneRight, cameraPlaneUp;
 } camera;
 
-#define NO_SLOT 0xFFFFFFFFu
-
 #include "gbuffer.glsl"
 #include "internal.glsl"
 
 void main() {
     ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
     bool inBoundsPix = (pix.x < screenResolution.x && pix.y < screenResolution.y);
-
-    bool needsAppend = false;
     uvec4 gkey = uvec4(0u);
 
     if (inBoundsPix) {
@@ -59,26 +46,11 @@ void main() {
 
         if (voxel.hit && voxel.material != 0u) {
             uint level = max(1u, octreeDepth - uint(findMSB(voxel.size)));
-            gkey = PackGBuffer(voxel.position, level, voxel.material, voxel.version, voxel.steps);
+            gkey = PackGBuffer(voxel.position, level, voxel.material, voxel.version, voxel.id);
             imageStore(gbufferTexture, pix, gkey);
-
-            // Claim this octree slot once per frame (dedup TAS).
-            uint w = voxel.id >> 5u, b = 1u << (voxel.id & 31u);
-            needsAppend = (atomicOr(claimbuf.bits[w], b) & b) == 0u;
-        } else {
-            imageStore(gbufferTexture, pix, uvec4(0u, 0u, 0u, voxel.steps));   // miss (keep steps for STEPS mode)
+        }else{
+            gkey = PackGBuffer(uvec3(0u), 0u, 0u, 0u, 0u);
+            imageStore(gbufferTexture, pix, gkey);
         }
-    }
-
-    // Wave-compacted append of unique voxels (operates over active lanes).
-    uvec4 ballot   = subgroupBallot(needsAppend);
-    uint  waveCnt  = subgroupBallotBitCount(ballot);
-    uint  waveBase = 0u;
-    if (subgroupElect() && waveCnt > 0u)
-        waveBase = atomicAdd(uniqueCount, waveCnt);
-    waveBase = subgroupBroadcastFirst(waveBase);
-    if (needsAppend) {
-        uint off = subgroupBallotExclusiveBitCount(ballot);
-        uniqueList.entries[waveBase + off] = uvec4(gkey.x, gkey.y, NO_SLOT, 0u);
     }
 }

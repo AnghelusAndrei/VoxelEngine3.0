@@ -40,7 +40,6 @@ class Camera{
     friend class Renderer;
 
     protected:
-    void setProgram(GLuint program_);
     void UpdateUBO();
     float aspect_ratio;
 

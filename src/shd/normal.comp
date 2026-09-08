@@ -6,9 +6,9 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 #include "lbuffer.glsl"
 
-layout(std430, binding = 0) readonly buffer OctreeBuffer { uvec2 nodes[]; } octree;
-layout(std430, binding = 3) readonly buffer UniqueList { uvec4 entries[]; } uniqueList;
-layout(std430, binding = 4) readonly buffer UniqueCnt  { uint uniqueCount; };
+layout(std430, binding = SSBO_OCTREE_BINDING) readonly buffer OctreeBuffer { uvec2 nodes[]; } octree;
+layout(std430, binding = SSBO_UNIQUE_LIST_BINDING) readonly buffer UniqueList { uvec4 entries[]; } uniqueList;
+layout(std430, binding = SSBO_UNIQUE_COUNT_BINDING) readonly buffer UniqueCnt  { uint uniqueCount; };
 
 uniform uint octreeDepth;
 uniform uint normalPrecision;  
@@ -21,7 +21,7 @@ void main(){
     uint  slot  = entry.z;
     if (slot == LB_NO_SLOT) return;                  // never seated this frame
     uint sb = linearSlotToBase(slot);
-    if ((lbuf.data[sb + 3u] & NORMAL_UPDATE_BIT) == 0u) return;   // already current
+    if ((lbuf.data[sb + LB_NORMAL] & NORMAL_UPDATE_BIT) == 0u) return;   // already current
 
     uvec2 key   = uvec2(entry.x, entry.y);
     uvec3 pos   = uvec3(key.x & 0xFFFFu, key.x >> 16u, key.y & 0xFFFFu);
@@ -54,7 +54,7 @@ void main(){
                      |  uint(bool(sp.z & p2));
             uvec2 n = octree.nodes[block + idx];
             if (n.x == 0u && n.y == 0u)  { occ = false; break; }
-            if ((n.x & 1u) == 0u)        { occ = ((n.x >> 1u) & 0x7Fu) != 0u; break; }
+            if ((n.x & NODE_ISNODE_BIT) == 0u) { occ = ((n.x >> NODE_MAT_SHIFT) & MATERIAL_MASK) != 0u; break; }
             if (lev == level)            { occ = true; break; }
             block = n.y;
         }
@@ -63,5 +63,5 @@ void main(){
     }
     normal = (dot(grad, grad) > 1e-8) ? normalize(-grad) : vec3(0.0, 1.0, 0.0);
 
-    lbuf.data[sb + 3u] = PackNormal(normal);         // flag bit 0 cleared => "valid"
+    lbuf.data[sb + LB_NORMAL] = PackNormal(normal);  // flag bit 0 cleared => "valid"
 }

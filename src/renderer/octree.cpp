@@ -40,8 +40,6 @@ Octree::Octree(Config* config) {
 
 Octree::~Octree() { freeVRAM(); }
 
-void Octree::setProgram(GLuint program_) { program = program_; }
-
 void Octree::GenUBO() {
     // Octree node buffer (SSBO). uvec2 per slot (lo, hi).
     glGenBuffers(1, &gl_ID);
@@ -79,14 +77,10 @@ void Octree::clearClaimBitfield() {
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 }
 
-void Octree::BindUniforms(uint8_t& texturesBound) {
-    // Octree and its claim bitfield are SSBOs bound to fixed binding points, not
-    // texture units — texturesBound is intentionally left untouched so callers
-    // that bind real textures (skybox, ...) keep their unit numbering.
-    (void)texturesBound;
+void Octree::BindUniforms(GLuint program) {
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, core::SSBO_OCTREE_BINDING, gl_ID);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, core::SSBO_CLAIM_BINDING, claimBuffer_ID);
-    glUniform1ui(glGetUniformLocation(program, "octreeDepth"), (GLuint)depth);
+    glProgramUniform1ui(program, glGetUniformLocation(program, "octreeDepth"), (GLuint)depth);
 }
 
 
@@ -166,6 +160,23 @@ bool Octree::blockIsEmpty(uint32_t block) const {
     for (int i = 0; i < 8; i++)
         if (!data[block + i].empty()) return false;
     return true;
+}
+
+uint32_t Octree::remapMaterials(const std::vector<uint32_t>& remap) {
+    uint32_t changed = 0;
+    for (uint32_t s = 0; s < size; s++) {
+        Node& n = data[s];
+        if (n.empty()) continue;
+        // Internal nodes carry a representative material too, so they remap as well -
+        // a coarse LOD hit reads it (see internal.glsl's maxSteps fallback).
+        const uint32_t old = n.material();
+        if (old == 0 || old >= remap.size()) continue;
+        if (remap[old] == old) continue;
+        n.setMaterial(remap[old]);
+        markDirty(s);
+        changed++;
+    }
+    return changed;
 }
 
 void Octree::markDirty(uint32_t slot, uint32_t count) {
