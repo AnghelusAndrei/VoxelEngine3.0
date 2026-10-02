@@ -313,6 +313,21 @@ bool Renderer::run(core::FrameConfig *frameConfig){
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
     shader::checkGLError("avgPass", success, *config);
 
+    // ---------------- filter.comp : per-voxel spatial gather (indirect over uniqueList) ----------------
+    // Inside the freeze block on purpose: it writes the lBuffer, which CLAIM_AGE / LRU_OCCUPANCY
+    // exist to hold still. Placed BEFORE holefill so holefill can publish the filtered channels,
+    // keeping resolve's O(1) path and its 2x2 fill on one operator (architecture/FILTER.md).
+    glBindImageTexture(0, virtualGBufferTex, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32UI);
+    {
+        volume->BindUniforms(filterPass.program());    // octree SSBO (binding 0) + octreeDepth
+        filterPass.set("virtualSize", glm::ivec2(virtualSize.x, virtualSize.y));
+    }
+    profiler.start("filter");
+    filterPass.dispatch(perVoxel());
+    profiler.end("filter");
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    shader::checkGLError("filterPass", success, *config);
+
     }   // end !freezeCache
 
     // ---------------- holefill.comp : per-virtual-texel cache-hole gather ----------------

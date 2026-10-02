@@ -59,6 +59,7 @@ private:
     shader::ComputePass shadePass    {passes, "./shd/shade.comp",         shaderDefines(), shader::UBO_CAMERA};
     shader::ComputePass accumPass    {passes, "./shd/accum.comp",         shaderDefines()};
     shader::ComputePass avgPass      {passes, "./shd/avg.comp",           shaderDefines()};
+    shader::ComputePass filterPass   {passes, "./shd/filter.comp",        shaderDefines()};
     shader::ComputePass holefillPass {passes, "./shd/holefill.comp",      shaderDefines()};
     shader::ComputePass resolvePass  {passes, "./shd/resolve.comp",       shaderDefines(), shader::UBO_CAMERA};
     shader::FinalRasterPass finalPass{passes, "./shd/final.vert", "./shd/final.frag"};
@@ -89,7 +90,7 @@ private:
     // ------------------ per-voxel accumulators : uniqueList + accumulators --------------------
     GLuint accumDiffuseSSBO  = 0;   // uvec4[] : per-list-entry diffuse accumulator (xyz = RGB, w = pixelCount)
     GLuint accumSpecularSSBO = 0;   // uvec4[] : per-list-entry specular accumulator (xyz = RGB, w spare)
-    GLuint uniqueListSSBO   = 0;   // uvec4[] : {key.xy, claimedSlot, spare}
+    GLuint uniqueListSSBO   = 0;   // uvec4[] : {key.xy, packed virtual texel, vid -> claimedSlot}
     GLuint uniqueCountSSBO  = 0;   // uint
     GLuint indirectArgsSSBO = 0;   // uvec4[2]
     void allocVoxelLists();        // (re)size uniqueList + both accumulators to the virtual res

@@ -35,8 +35,11 @@
 //   7 : uniqueVoxelList index this frame
 //   8 : EMA mean of log(luminance)      - float32 BIT PATTERN (floatBitsToUint)
 //   9 : EMA variance of log(luminance)  - float32 BIT PATTERN (floatBitsToUint)
+//  10 : EMA drift of log(luminance)     - float32 BIT PATTERN (floatBitsToUint)
 //       MUST be read with uintBitsToFloat and written with floatBitsToUint.
-//   10->15 : spare (unused, reserved for future expansion)
+//  11 : filtered diffuse  channel — RGB9E5 (filter.comp; read by holefill + resolve)
+//  12 : filtered specular channel — RGB9E5 (filter.comp; read by holefill + resolve)
+//   13->15 : spare (unused, reserved for future expansion)
 
 // Slot field offsets (DWORD index within a slot).
 #define LB_KEY0      0u
@@ -49,6 +52,9 @@
 #define LB_LISTID    7u
 #define LB_LUMINANCE 8u
 #define LB_VARIANCE  9u
+#define LB_DRIFT     10u
+#define LB_FDIFFUSE  11u
+#define LB_FSPECULAR 12u
 
 
 // ---- octree node Lo word ---------------------------------------------------------------
@@ -73,16 +79,24 @@
 #define VAR_ALPHA_MAX  0.2
 #define VAR_ALPHA_MIN  0.03      // ~33-frame ceiling on variance memory, regardless of n
 
-// Variance-adaptive EMA window: window = nDiffMax / (v + VAR_WINDOW_EPS).
-#define VAR_WINDOW_EPS 0.01
+#define VAR_WINDOW_EPS 0.01 // Variance-adaptive EMA window: window = nDiffMax / (v + VAR_WINDOW_EPS).
 #define VAR_WINDOW_MIN 3u        // never smooth over fewer than this
-// LB_SAMPLES packs two 16-bit counts, so a window past this wraps silently.
-#define LB_COUNT_MAX   65535u
-// Full-scale point of the VARIANCE debug ramp, in log-luminance standard deviations.
-#define VAR_DISPLAY_MAX 1.5
-
-//irradiance channels' sentinel values (see resolve.comp)
+#define LB_COUNT_MAX   65535u // LB_SAMPLES packs two 16-bit counts, so a window past this wraps silently.
+#define VAR_DISPLAY_MAX 1.5 // Full-scale point of the VARIANCE debug ramp, in log-luminance standard deviations.
 #define IRR_HOLE 0xFFFFFFFFu   // stale or uncached => reconstruct from virtual neighbours
+
+// ---- filter.comp : per-voxel screen-space gather (see architecture/FILTER.md) ----------
+// FILTER_TAPS 0 degenerates to D11 = D4, D12 = D5 — the off switch, and the A/B baseline.
+#define GOLDEN           2.39996323
+#define FILTER_TAPS      3u
+#define FILTER_RADIUS    8.0    // spiral extent, virtual texels
+#define FILT_SIGMA_N     8.0    // normal-alignment exponent
+#define FILT_SIGMA_P     1.0    // plane distance, in voxel edges
+#define FILT_SIGMA_R_S   2.0
+#define FILT_VAR_EPS     0.01
+
+#define FILTER_WORLD_TAPS   3u
+#define FILTER_WORLD_RADIUS 3.0   // voxel edges
 
 
 
@@ -100,5 +114,9 @@
 #define MODE_HOLES      10u
 #define MODE_LUMINANCE  11u
 #define MODE_VARIANCE   12u
+#define MODE_FILTER     13u
+#define MODE_UNFILTERED 14u
+#define MODE_DIFFUSE    15u
+#define MODE_SPECULAR   16u
 
 #endif // CONSTANTS_GLSL

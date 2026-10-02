@@ -156,9 +156,17 @@ private:
     // Free 8-slot blocks waiting to be reused (from removes).
     std::stack<uint32_t> freeBlocks;
 
-    // Dirty range (half-open: [dirtyMin, dirtyMax)). UINT32_MAX = empty.
+    // Dirty tracking. The bitmap carries the granularity (1 bit per node, 8.4 MB at a 67 M-node
+    // capacity — a per-slot u32 stamp would be 268 MB); the range only bounds the scan so a flush
+    // never walks the whole bitmap. Both are reset together.
+    //
+    // Granularity is not a bandwidth optimisation: the baked lBuffer slot offset lives in node Lo
+    // bits 27..31 in VRAM ONLY (the CPU mirror writes them as 0 — see Node::makeLeaf), so every
+    // node re-uploaded loses its offset and its voxel falls off the O(1) cache read path until the
+    // next claim re-bakes it. A min/max range meant two distant edits wiped everything between.
     uint32_t dirtyMin = UINT32_MAX;
     uint32_t dirtyMax = 0;
+    std::vector<uint64_t> dirtyBits;        // 1 bit per node slot; word w covers slots [64w, 64w+64)
 
     uint32_t utils_p2r[maxDepth + 1];
     uint32_t locate(glm::uvec3 position, uint32_t depth_) const;

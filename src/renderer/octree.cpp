@@ -90,9 +90,12 @@ void Octree::Update() {
                  data.data(), GL_DYNAMIC_DRAW);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
     gpuBufferSize = capacity;
-    // Whole buffer is now in sync.
+    // Whole buffer is now in sync. The bitmap must be cleared with the range, or the next flush
+    // re-uploads stale runs over freshly-synced data — and each such upload needlessly wipes the
+    // baked slot offsets in those nodes.
     dirtyMin = UINT32_MAX;
     dirtyMax = 0;
+    dirtyBits.assign((size_t(capacity) + 63u) / 64u, 0ull);
 }
 
 void Octree::resizeDataIfNeeded(uint32_t requiredCapacity) {
@@ -123,9 +126,11 @@ void Octree::resizeDataIfNeeded(uint32_t requiredCapacity) {
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 
         gpuBufferSize = capacity;
-        // Buffer was just fully repopulated — no pending dirty range needed.
+        // Buffer was just fully repopulated — no pending dirty range needed. Resize AND clear the
+        // bitmap: capacity just doubled, and any bits set before the realloc are already synced.
         dirtyMin = UINT32_MAX;
         dirtyMax = 0;
+        dirtyBits.assign((size_t(capacity) + 63u) / 64u, 0ull);
     }
 }
 
@@ -180,6 +185,8 @@ uint32_t Octree::remapMaterials(const std::vector<uint32_t>& remap) {
 }
 
 void Octree::markDirty(uint32_t slot, uint32_t count) {
+    if (count == 0u) return;
+
     if (dirtyMin == UINT32_MAX) {
         dirtyMin = slot;
         dirtyMax = slot + count;
@@ -187,6 +194,12 @@ void Octree::markDirty(uint32_t slot, uint32_t count) {
         if (slot < dirtyMin) dirtyMin = slot;
         if (slot + count > dirtyMax) dirtyMax = slot + count;
     }
+
+    const size_t need = (size_t(capacity) + 63u) / 64u;
+    if (dirtyBits.size() < need) dirtyBits.resize(need, 0ull);
+    const uint32_t end = (slot + count > capacity) ? capacity : slot + count;
+    for (uint32_t s = slot; s < end; ++s)
+        dirtyBits[s >> 6] |= (1ull << (s & 63u));
 }
 
 // Set bit `childIdx` (0–7) in the internal node's childmask, recording that
@@ -271,10 +284,37 @@ void Octree::flushEdits() {
     if (dirtyMax > capacity) dirtyMax = capacity;
 
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, gl_ID);
-    glBufferSubData(GL_SHADER_STORAGE_BUFFER,
-                    GLintptr(dirtyMin)  * GLintptr(sizeof(Node)),
-                    GLsizeiptr(dirtyMax - dirtyMin) * GLsizeiptr(sizeof(Node)),
-                    &data[dirtyMin]);
+
+    auto upload = [&](uint32_t first, uint32_t last) {          // half-open [first, last)
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                        GLintptr(first) * GLintptr(sizeof(Node)),
+                        GLsizeiptr(last - first) * GLsizeiptr(sizeof(Node)),
+                        &data[first]);
+    };
+
+    // Coalesce set bits into runs. Runs separated by fewer than RUN_GAP clean nodes are merged:
+    // re-uploading a handful of unchanged nodes is far cheaper than a second driver call, and
+    // those nodes lose only their baked slot offset, which findLBuffer's probe absorbs.
+    constexpr uint32_t RUN_GAP = 64u;
+    uint32_t runFirst = UINT32_MAX, runLast = 0u;
+
+    const size_t wFirst = size_t(dirtyMin) >> 6;
+    const size_t wLast  = size_t(dirtyMax - 1u) >> 6;
+    for (size_t w = wFirst; w <= wLast && w < dirtyBits.size(); ++w) {
+        uint64_t bits = dirtyBits[w];
+        if (bits == 0ull) continue;
+        dirtyBits[w] = 0ull;
+        for (uint32_t b = 0; b < 64u; ++b) {
+            if (((bits >> b) & 1ull) == 0ull) continue;
+            const uint32_t s = uint32_t(w) * 64u + b;
+            if (s >= capacity) break;
+            if (runFirst == UINT32_MAX)          { runFirst = s; runLast = s + 1u; }
+            else if (s <= runLast + RUN_GAP)     { runLast  = s + 1u; }
+            else { upload(runFirst, runLast);      runFirst = s; runLast = s + 1u; }
+        }
+    }
+    if (runFirst != UINT32_MAX) upload(runFirst, runLast);
+
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 
     dirtyMin = UINT32_MAX;

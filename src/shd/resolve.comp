@@ -88,12 +88,12 @@ void main() {
     GBuffer gb = UnpackGBuffer(imageLoad(gbufferTexture, pix));
 
     uint diff = IRR_HOLE, spec = IRR_HOLE, slot = LB_NO_SLOT;
-    if (gb.hit) slot = lookupLBuffer(gb.pos, gb.level, gb.version, octree.nodes[gb.vid].x);
+    if (gb.hit) slot = findLBuffer(gb.pos, gb.level, gb.version, octree.nodes[gb.vid].x);
     if (slot != LB_NO_SLOT) {
         uint sb  = linearSlotToBase(slot);
         uint age = frameStamp - lbuf.data[sb + LB_TIMESTAMP];   // same 64 B line as the channels
-        if (fresh(age, staleViewIndep)) diff = lbuf.data[sb + LB_DIFFUSE];
-        if (fresh(age, staleViewDep))   spec = lbuf.data[sb + LB_SPECULAR];
+        if (fresh(age, staleViewIndep)) diff = lbuf.data[sb + LB_FDIFFUSE];   // filter.comp output
+        if (fresh(age, staleViewDep))   spec = lbuf.data[sb + LB_FSPECULAR];
     }
 
 
@@ -120,10 +120,22 @@ void main() {
         if (slot == LB_NO_SLOT) col = vec3(1.0, 0.0, 1.0);          // magenta = not cached
         else {
             uint age = frameStamp - lbuf.data[linearSlotToBase(slot) + LB_TIMESTAMP];
-            col = vec3(1.0 / (1.0 + float(age) * 0.1));             // bright = freshly claimed
+            col = vec3(1.0 / (1.0 + float(age)));             // bright = freshly claimed
         }
     } else if (renderMode == MODE_LRU) {
-        col = (slot == LB_NO_SLOT) ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);  // red miss / green cached
+        if(slot == LB_NO_SLOT) col = vec3(1.0, 0.0, 0.0);
+        else{
+            Material mm = material[gb.material];
+            vec3 dch = (diff != IRR_HOLE) ? unpackRGB9E5(diff) : vec3(0.0);
+            vec3 sch = (spec != IRR_HOLE) ? unpackRGB9E5(spec) : vec3(0.0);
+            if (diff == IRR_HOLE || spec == IRR_HOLE) {     // skip the taps when fully cached
+                Fill f = holeFillAt(pix, gb);
+                if (diff == IRR_HOLE) dch = f.diffuse;      // still nothing => stays black
+                if (spec == IRR_HOLE) sch = f.specular;
+            }
+            col = (1.0 - mm.metallic) * mm.color.rgb * dch + sch;
+            if (mm.emissive) col += mm.color.rgb * mm.emissiveIntensity;   // self-emission
+        }
     } else if (renderMode == MODE_VIRTUAL) {
         GBuffer vg = UnpackGBuffer(imageLoad(virtualGBuffer, pix / int(virtualScale)));
         col = vg.hit ? material[vg.material].color.rgb : vec3(1.0, 0.0, 1.0);
@@ -174,10 +186,49 @@ void main() {
             float v = uintBitsToFloat(lbuf.data[linearSlotToBase(slot) + LB_VARIANCE]);
             col = vec3(sqrt(max(v, 0.0)) / VAR_DISPLAY_MAX);
         }
+    } else if (renderMode == MODE_FILTER) {
+        if (slot == LB_NO_SLOT) col = vec3(1.0, 0.0, 1.0);
+        else {
+            uint sb2 = linearSlotToBase(slot);
+            float rawD = luminance(unpackRGB9E5(lbuf.data[sb2 + LB_DIFFUSE]));
+            float fltD = luminance(unpackRGB9E5(lbuf.data[sb2 + LB_FDIFFUSE]));
+            col = vec3(clamp(abs(fltD - rawD), 0.0, 1.0));
+        }
+    }else if (renderMode == MODE_UNFILTERED) {
+        Material mm = material[gb.material];
+        uint sb  = linearSlotToBase(slot);
+        uint age = frameStamp - lbuf.data[sb + LB_TIMESTAMP];   // same 64 B line as the channels
+        if (fresh(age, staleViewIndep)) diff = lbuf.data[sb + LB_DIFFUSE];
+        if (fresh(age, staleViewDep))   spec = lbuf.data[sb + LB_SPECULAR];
+        vec3 dch = (diff != IRR_HOLE) ? unpackRGB9E5(diff) : vec3(0.0);
+        vec3 sch = (spec != IRR_HOLE) ? unpackRGB9E5(spec) : vec3(0.0);
+        if (diff == IRR_HOLE || spec == IRR_HOLE) {     // skip the taps when fully cached
+            Fill f = holeFillAt(pix, gb);
+            if (diff == IRR_HOLE) dch = f.diffuse;      // still nothing => stays black
+            if (spec == IRR_HOLE) sch = f.specular;
+        }
+        col = (1.0 - mm.metallic) * mm.color.rgb * dch + sch;
+        if (mm.emissive) col += mm.color.rgb * mm.emissiveIntensity;   // self-emission
     } else if (renderMode == MODE_SAMPLES) {
         if (slot == LB_NO_SLOT) col = vec3(1.0, 0.0, 1.0);
         else col = vec3(float(lbuf.data[linearSlotToBase(slot) + LB_SAMPLES] & 0xFFFFu) / 1024.0);
-    } else {   // MODE_NORMAL
+    } else if (renderMode == MODE_DIFFUSE){
+        Material mm = material[gb.material];
+        vec3 dch = (diff != IRR_HOLE) ? unpackRGB9E5(diff) : vec3(0.0);
+        if (diff == IRR_HOLE) {     // skip the taps when fully cached
+            Fill f = holeFillAt(pix, gb);
+            if (diff == IRR_HOLE) dch = f.diffuse;
+        }
+        col = dch;
+    } else if (renderMode == MODE_SPECULAR){
+        Material mm = material[gb.material];
+        vec3 sch = (spec != IRR_HOLE) ? unpackRGB9E5(spec) : vec3(0.0);
+        if (spec == IRR_HOLE) {     // skip the taps when fully cached
+            Fill f = holeFillAt(pix, gb);
+            if (spec == IRR_HOLE) sch = f.specular;
+        }
+        col = sch;
+    }else {   // MODE_NORMAL
         if (slot == LB_NO_SLOT) col = vec3(0.5);                 // not cached => neutral
         else {
             uint d3 = lbuf.data[linearSlotToBase(slot) + LB_NORMAL];

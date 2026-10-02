@@ -1,7 +1,8 @@
-// 64-bit node, AoS in octree.nodes[] (uvec2 per slot: .x = lo, .y = hi).
-//   Lo: [ isNode:1 | material:10 | childmask:8 | version:8 | slotOffset:5 ]  Hi: [ next:32 ]
-//   Field shifts/masks live in constants.glsl (NODE_* / MATERIAL_*).
-// Mirrors Octree::Node on the CPU — keep both sides on these explicit masks.
+// Ray traversal. Node decode (`Node`, `UnpackNode`, `locate`) and the point lookup
+// (`descendAt`) live in octree.glsl — passes that only need to resolve a position take that
+// header directly and avoid the shared-memory stack declared below.
+#include "octree.glsl"
+
 const float inv_127 = 1.0 / 127.0;
 
 #ifndef MAXDEPTH
@@ -9,32 +10,12 @@ const float inv_127 = 1.0 / 127.0;
 #endif
 uint octreeLength; // Assume this is provided by uniform/buffer
 
-struct Node {
-    bool type;
-    uint childmask, next, material, version;
-};
-
 struct leaf_t { uint size; vec3 position; };
 struct hit_t { bool hit; uint id, material; uvec3 position; uint size; uint version; uint steps; };
 struct ray_t { vec3 origin, direction, inverted_direction; };
 
-Node UnpackNode(uvec2 raw) {
-    uint lo = raw.x;
-    return Node(
-        bool(lo & NODE_ISNODE_BIT),
-        (lo >> NODE_CM_SHIFT)  & NODE_CM_MASK,    // childmask
-        raw.y,                                    // next (full 32-bit hi word)
-        (lo >> NODE_MAT_SHIFT) & MATERIAL_MASK,   // material
-        (lo >> NODE_VER_SHIFT) & NODE_VER_MASK    // version
-    );
-}
-
-bool inBounds(vec3 v, float n) { 
+bool inBounds(vec3 v, float n) {
     return all(lessThanEqual(vec3(0.0), v)) && all(lessThanEqual(v, vec3(n)));
-}
-
-uint locate(uvec3 pos, uint p2) { 
-    return (uint(bool(pos.x & p2)) << 2u) | (uint(bool(pos.y & p2)) << 1u) | uint(bool(pos.z & p2));
 }
 
 vec4 intersect(ray_t r, vec3 box_min, vec3 box_max) {

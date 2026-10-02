@@ -97,26 +97,16 @@ vec3 sampleSky(vec3 d){ return texture(skybox, d).rgb; }
 // ---- occupancy fallback normal (rare: primary voxel not cached / overflow) ----
 bool occAt(ivec3 sp, uint lev, uint Lng){
     if (any(lessThan(sp, ivec3(0))) || any(greaterThanEqual(sp, ivec3(int(Lng))))) return false;
-    uvec3 u = uvec3(sp);
-    if ((octree.nodes[0].x & NODE_ISNODE_BIT) == 0u)
-        return ((octree.nodes[0].x >> NODE_MAT_SHIFT) & MATERIAL_MASK) != 0u;
-    uint block = octree.nodes[0].y;
-    for (uint d = 1u; d <= lev; d++){
-        uint p2  = Lng >> d;
-        uint idx = (uint(bool(u.x & p2)) << 2u) | (uint(bool(u.y & p2)) << 1u) | uint(bool(u.z & p2));
-        uvec2 n = octree.nodes[block + idx];
-        if (n.x == 0u && n.y == 0u) return false;
-        if ((n.x & NODE_ISNODE_BIT) == 0u) return ((n.x >> NODE_MAT_SHIFT) & MATERIAL_MASK) != 0u;
-        if (d == lev)               return true;
-        block = n.y;
-    }
-    return false;
+    return descendAt(uvec3(sp), lev, Lng).hit;   // octree.glsl; `.hit` => solid, leaf or not
 }
-vec3 kernelNormal(uvec3 pos, uint level, uint vsize, uint Lng){
+// R is the kernel radius: 2 (125 samples) for a primary voxel whose normal is seen
+// directly, 1 (27) for a secondary bounce, where the normal only has to pick a
+// plausible hemisphere and every sample costs an octree descent.
+vec3 kernelNormal(uvec3 pos, uint level, uint vsize, uint Lng, int R){
     vec3 g = vec3(0.0);
-    for (int dz = -2; dz <= 2; dz++)
-    for (int dy = -2; dy <= 2; dy++)
-    for (int dx = -2; dx <= 2; dx++){
+    for (int dz = -R; dz <= R; dz++)
+    for (int dy = -R; dy <= R; dy++)
+    for (int dx = -R; dx <= R; dx++){
         int r2 = dx*dx + dy*dy + dz*dz; if (r2 == 0) continue;
         if (occAt(ivec3(pos) + ivec3(dx,dy,dz)*int(vsize), level, Lng))
             g += vec3(dx,dy,dz) / float(r2);
@@ -131,12 +121,10 @@ vec3 voxelNormal(uint slot, uvec3 pos, uint level, uint vsize, uint Lng){
         uint d3 = lbuf.data[linearSlotToBase(slot) + LB_NORMAL];
         if ((d3 & NORMAL_UPDATE_BIT) == 0u) return normalize(UnpackNormal(d3));
     }
-    return kernelNormal(pos, level, vsize, Lng);   // cache miss => approximate
+    return kernelNormal(pos, level, vsize, Lng, 2);   // cache miss => approximate
 }
 
-// One bounce + irradiance-cache feedback. Returns incoming radiance along `dir`
-// frames. Miss => skybox. Uncached non-emissive hit contributes 0.
-vec3 traceRadiance(vec3 origin, vec3 dir){
+vec3 traceRadiance(vec3 origin, vec3 dir, inout uint rng){
     ray_t r; r.origin = origin; r.direction = dir; r.inverted_direction = 1.0 / dir;
     hit_t h = Raycast(r, octreeDepth, primary_raystop, 0.0);
     if (!h.hit) return sampleSky(dir);                     // escaped to sky
@@ -144,10 +132,12 @@ vec3 traceRadiance(vec3 origin, vec3 dir){
     vec3 rad = (m.emissive) ? m.color.rgb * m.emissiveIntensity : vec3(0.0);
     uint wlev = max(1u, octreeDepth - uint(findMSB(h.size)));
     // Bounce targets are arbitrary voxels, not necessarily claimed this frame, and any
-    // octree upload zeroes the baked offsets — so keep the probe as the correctness net.
+    // octree upload zeroes the baked offsets - so keep the probe as the correctness net.
     uint slot = findLBuffer(h.position, wlev, h.version, octree.nodes[h.id].x);
-    if (slot != LB_NO_SLOT)                                // cached => its diffuse radiosity (indirect feedback)
-        rad += (1.0 - m.metallic) * m.color.rgb * unpackRGB9E5(lbuf.data[linearSlotToBase(slot) + LB_DIFFUSE]);
+
+    if (slot != LB_NO_SLOT) {                              // cached => indirect feedback
+        rad += (1.0 - m.metallic) * m.color.rgb * unpackRGB9E5(lbuf.data[linearSlotToBase(slot) + LB_FDIFFUSE]);
+    }
     return rad;
 }
 
@@ -166,10 +156,7 @@ void main(){
         return;
     }
 
-    // The one lBuffer lookup any virtual texel makes this frame. Its 64 B line carries both
-    // the cached normal and this voxel's accumulator index, so republishing the index into
-    // the virtual gbuffer costs nothing and saves accum a lookup of its own.
-    uint slot    = lookupLBuffer(gb.pos, gb.level, gb.version, octree.nodes[gb.vid].x);
+    uint slot    = findLBuffer(gb.pos, gb.level, gb.version, octree.nodes[gb.vid].x);
     uint listIdx = (slot != LB_NO_SLOT) ? lbuf.data[linearSlotToBase(slot) + LB_LISTID]
                                         : VG_LISTIDX_NONE;
     imageStore(virtualGBuffer, vp, VGSetListIdx(g, listIdx));
@@ -186,7 +173,7 @@ void main(){
     vec3 origin = center + N * (0.87 * float(vsize) + 0.5);
 
     vec3 Ld      = cosineHemisphere(N, rng);
-    vec3 diffuse = traceRadiance(origin, Ld);
+    vec3 diffuse = traceRadiance(origin, Ld, rng);
 
     // specular: GGX-VNDF sample, throughput F·G1(L)·specular. Keeps emission (slab stays in reflections).
     vec3 specular = vec3(0.0);
@@ -196,7 +183,7 @@ void main(){
         if (dot(Ls, N) > 0.0){
             vec3 F0  = mix(vec3(0.04), m.color.rgb, m.metallic);
             vec3 thr = ggxThroughput(N, Vd, Ls, H, m.roughness, F0) * m.specular;
-            specular = traceRadiance(origin, Ls) * thr;
+            specular = traceRadiance(origin, Ls, rng) * thr;
         }
     }
 

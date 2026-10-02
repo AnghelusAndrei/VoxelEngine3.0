@@ -20,7 +20,7 @@ void main() {
     uint gid = gl_GlobalInvocationID.x;
     if (gid >= uniqueCount) return;
 
-    uint slot = uniqueList.entries[gid].z;
+    uint slot = uniqueList.entries[gid].w;   // claim's writeback (.z carries the virtual texel)
     if (slot == LB_NO_SLOT) return;
     uint sb = linearSlotToBase(slot);
 
@@ -46,26 +46,25 @@ void main() {
     float lframe = log(max(luminance(dframe), LUM_FLOOR));
     float m = uintBitsToFloat(lbuf.data[sb + LB_LUMINANCE]);
     float v = uintBitsToFloat(lbuf.data[sb + LB_VARIANCE]);
+    float b = uintBitsToFloat(lbuf.data[sb + LB_DRIFT]);
 
-    if (nd == 0.0) {
-        // Fresh slot
+    if (nd == 0.0) {// Fresh slot
         m = lframe;
         v = 0.0;
+        b = 0.0;
     } else {
-        // Clamped at BOTH ends: the ceiling keeps a heavily-covered voxel from
-        // collapsing the update to zero, the floor keeps a sparsely-covered one from
-        // freezing its variance for thousands of frames (constants.glsl).
         const float av    = clamp(pf / (nd + pf), VAR_ALPHA_MIN, VAR_ALPHA_MAX);
         const float delta = lframe - m;
         m += av * delta;
         v  = max((1.0 - av) * (v + av * delta * delta), 0.0);
+        b += 0.05 * (delta - b);  // smoothed drift
     }
 
     dch = (dch * nd + dframe * pf) / (nd + pf);     // sample-capped running average
     sch = (sch * ns + sframe * pf) / (ns + pf);
 
-    // Variance-adaptive window. 
-    uint window = clamp(uint(float(nDiffMax) / (v + VAR_WINDOW_EPS)), VAR_WINDOW_MIN, LB_COUNT_MAX);
+    // Drift/variance-adaptive window. 
+    uint window = max(uint(float(nDiffMax) / (1.0 + 64.0 * b*b / max(v, VAR_WINDOW_EPS))), VAR_WINDOW_MIN);
     uint ndNew = min((samples & 0xFFFFu) + pixels, window);
     uint nsNew = min((samples >> 16u)   + pixels, min(nSpecMax, LB_COUNT_MAX));
 
@@ -74,7 +73,7 @@ void main() {
     lbuf.data[sb + LB_SAMPLES]  = (ndNew & 0xFFFFu) | (nsNew << 16u);
     lbuf.data[sb + LB_LUMINANCE] = floatBitsToUint(m);
     lbuf.data[sb + LB_VARIANCE]  = floatBitsToUint(v);
-
+    lbuf.data[sb + LB_DRIFT]     = floatBitsToUint(b);
     // clear per-frame accumulators for next frame
     accumDiffuse.accum[gid] = uvec4(0u);
     accumSpecular.accum[gid] = uvec4(0u);

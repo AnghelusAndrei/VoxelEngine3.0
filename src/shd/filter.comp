@@ -1,0 +1,144 @@
+#version 460 core
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+#include "lbuffer.glsl"
+
+layout(binding = 0, rgba32ui) readonly uniform uimage2D virtualGBuffer;
+
+layout(std430, binding = SSBO_OCTREE_BINDING) readonly buffer OctreeBuffer { uvec2 nodes[]; } octree;
+layout(std430, binding = SSBO_UNIQUE_LIST_BINDING) readonly buffer UniqueList { uvec4 entries[]; } uniqueList;
+layout(std430, binding = SSBO_UNIQUE_COUNT_BINDING) readonly buffer UniqueCnt  { uint uniqueCount; };
+
+uniform uint  octreeDepth;
+uniform ivec2 virtualSize;
+
+#include "gbuffer.glsl"
+#include "octree.glsl"   // descendAt — the point lookup, without internal.glsl's ray stack
+
+float noiseVar(float v, float b) { return max(v - b * b, 0.0); }
+
+void main(){
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= uniqueCount) return;
+
+    uvec4 entry = uniqueList.entries[gid];
+    uint  slot  = entry.w;                       // claim's writeback; .z is the virtual texel
+    if (slot == LB_NO_SLOT) return;              // never seated this frame
+    uint sb = linearSlotToBase(slot);
+
+    uvec3 pos   = uvec3(entry.x & 0xFFFFu, entry.x >> 16u, entry.y & 0xFFFFu);
+    uint  level = (entry.y >> 16u) & 0xFFu;
+    uint  vsize = 1u << (octreeDepth - level);
+    vec3  C     = vec3(pos) + float(vsize) * 0.5;
+
+    uint d3 = lbuf.data[sb + LB_NORMAL];
+    vec3 D4 = unpackRGB9E5(lbuf.data[sb + LB_DIFFUSE]);
+    vec3 D5 = unpackRGB9E5(lbuf.data[sb + LB_SPECULAR]);
+
+    // Tap 0: the voxel of interest
+    uint  cnt   = lbuf.data[sb + LB_SAMPLES];
+    float v     = uintBitsToFloat(lbuf.data[sb + LB_VARIANCE]);
+    float drift = uintBitsToFloat(lbuf.data[sb + LB_DRIFT]);
+    float vN    = noiseVar(v, drift);
+    float precD = float(cnt & 0xFFFFu) / (vN + FILT_VAR_EPS);
+    float precS = float(cnt >> 16u)    / (vN + FILT_VAR_EPS);
+
+    vec3  sumD = D4 * precD, sumS = D5 * precS;
+    float wSumD = precD, wSumS = precS;
+
+    if ((d3 & NORMAL_UPDATE_BIT) == 0u) {
+        vec3  N   = normalize(UnpackNormal(d3));
+        ivec2 vp0 = ivec2(entry.z & 0xFFFFu, entry.z >> 16u);   // downscale's bake
+
+        float rot = float(lb_hash(entry.x ^ lb_hash(entry.y))) * (6.2831853 / 4294967296.0);
+
+        for (uint i = 0u; i < FILTER_TAPS; i++){
+            float ang = GOLDEN * float(i) + rot;
+            float rad = FILTER_RADIUS * sqrt((float(i) + 0.5) / float(FILTER_TAPS));  // equal-area
+            ivec2 tp  = vp0 + ivec2(round(vec2(cos(ang), sin(ang)) * rad));
+            if (any(lessThan(tp, ivec2(0))) || any(greaterThanEqual(tp, virtualSize))) continue;
+
+            GBuffer vg = UnpackGBuffer(imageLoad(virtualGBuffer, tp));
+            if (!vg.hit || vg.level != level) continue;   // different scale => different measurement
+            if (all(equal(vg.pos, pos))) continue;        // the centre voxel again; already tap 0
+
+            uint s = lookupLBuffer(vg.pos, vg.level, vg.version, octree.nodes[vg.vid].x);
+            if (s == LB_NO_SLOT) continue;
+            uint tb = linearSlotToBase(s);
+
+            uint td3 = lbuf.data[tb + LB_NORMAL];
+            if ((td3 & NORMAL_UPDATE_BIT) != 0u) continue;   // normal not computed yet
+
+            uint  cnt = lbuf.data[tb + LB_SAMPLES];
+            float nq  = float(cnt & 0xFFFFu), nsq = float(cnt >> 16u);
+            if (nq == 0.0 && nsq == 0.0) continue;           // claimed but never averaged
+            float vNq = noiseVar(uintBitsToFloat(lbuf.data[tb + LB_VARIANCE]),
+                                 uintBitsToFloat(lbuf.data[tb + LB_DRIFT]));
+
+            vec3 Cq = vec3(vg.pos) + float(vsize) * 0.5;
+
+            float base = exp(-abs(dot(Cq - C, N)) / (FILT_SIGMA_P * float(vsize)))
+                       * pow(max(dot(N, normalize(UnpackNormal(td3))), 0.0), FILT_SIGMA_N);
+            if (base <= 1e-4) continue;
+
+            float inv = 1.0 / (vNq + FILT_VAR_EPS);
+            float r2  = dot(vec2(tp - vp0), vec2(tp - vp0));
+            float wd  = base * nq  * inv;
+            float ws  = base * nsq * inv * exp(-r2 / (2.0 * FILT_SIGMA_R_S * FILT_SIGMA_R_S));
+
+            sumD += unpackRGB9E5(lbuf.data[tb + LB_DIFFUSE])  * wd; wSumD += wd;
+            sumS += unpackRGB9E5(lbuf.data[tb + LB_SPECULAR]) * ws; wSumS += ws;
+        }
+
+        // ---- world taps: the tangent plane, resolved by descent ------------------------
+        //diffuse only (offscreen voxels ore view dependent)
+        if (FILTER_WORLD_TAPS > 0u) {
+            uint Lng = 1u << octreeDepth;
+            vec3 T   = normalize(cross(abs(N.z) < 0.999 ? vec3(0,0,1) : vec3(1,0,0), N));
+            vec3 B   = cross(N, T);
+
+            for (uint i = 0u; i < FILTER_WORLD_TAPS; i++) {
+                float ang = GOLDEN * float(i) + rot;
+                float rad = FILTER_WORLD_RADIUS * sqrt((float(i) + 0.5) / float(FILTER_WORLD_TAPS));
+                vec3  off = (T * cos(ang) + B * sin(ang)) * (rad * float(vsize));
+
+                // Thicken the plane by +-1 voxel along N.
+                for (int k = 0; k < 3; k++) {
+                    float s = (k == 0) ? 0.0 : ((k == 1) ? 1.0 : -1.0);
+                    vec3  q = C + off + N * (s * float(vsize));
+                    if (any(lessThan(q, vec3(0.0))) || any(greaterThanEqual(q, vec3(float(Lng)))))
+                        continue;
+
+                    point_t pt = descendAt(uvec3(q), level, Lng);
+                    if (!pt.leaf || pt.level != level) continue;   // internal node, air, or wrong scale
+                    if (all(equal(pt.position, pos))) break;       // the centre voxel; done with this tap
+
+                    uint ts = findLBuffer(pt.position, pt.level, pt.version, octree.nodes[pt.id].x);
+                    if (ts == LB_NO_SLOT) continue;
+                    uint wb = linearSlotToBase(ts);
+
+                    uint wd3 = lbuf.data[wb + LB_NORMAL];
+                    if ((wd3 & NORMAL_UPDATE_BIT) != 0u) continue;
+
+                    float wnq = float(lbuf.data[wb + LB_SAMPLES] & 0xFFFFu);
+                    if (wnq == 0.0) break;                          // seated but never averaged
+                    float wvN = noiseVar(uintBitsToFloat(lbuf.data[wb + LB_VARIANCE]),
+                                         uintBitsToFloat(lbuf.data[wb + LB_DRIFT]));
+
+                    vec3  Cq = vec3(pt.position) + float(vsize) * 0.5;
+                    float w  = exp(-abs(dot(Cq - C, N)) / (FILT_SIGMA_P * float(vsize)))
+                             * pow(max(dot(N, normalize(UnpackNormal(wd3))), 0.0), FILT_SIGMA_N)
+                             * wnq / (wvN + FILT_VAR_EPS);
+
+                    sumD += unpackRGB9E5(lbuf.data[wb + LB_DIFFUSE]) * w;   // D4: the invariant
+                    wSumD += w;
+                    break;                                          // this tap is spent
+                }
+            }
+        }
+    }
+
+    lbuf.data[sb + LB_FDIFFUSE]  = packRGB9E5(wSumD > 0.0 ? sumD / wSumD : D4);
+    lbuf.data[sb + LB_FSPECULAR] = packRGB9E5(wSumS > 0.0 ? sumS / wSumS : D5);
+}

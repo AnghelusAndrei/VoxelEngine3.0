@@ -29,7 +29,8 @@ flowchart TD
     NM -->|STORAGE| SH["shade.comp — virtual-res 8×8 (megakernel PT)\nONE lookupLBuffer: normal + listIndex off one line\nworld-keyed RNG · cosine diffuse + GGX-VNDF specular\n1 bounce + cache feedback · firefly clamp\nstamps listIndex into virtual gbuffer .z"]
     SH -->|IMAGE·STORAGE| AC["accum.comp — virtual-res 8×8\ngid = VGListIdx(gbuffer) · no lBuffer, no octree, no hash\natomicAdd HDR fixed-point sums + pixelCount"]
     AC -->|STORAGE| AV["avg.comp — indirect per voxel\nframeMean = sum/(pixels·SCALE)\nvariance-adaptive EMA → RGB9E5 channels\nupdate log-luminance mean + variance"]
-    AV -->|STORAGE| HF["holefill.comp — virtual-res 8×8\none lookupLBuffer per texel, no filtering\nchannels + per-tap confidence → holeFill"]
+    AV -->|STORAGE| FT["filter.comp — indirect per voxel\nFILTER_TAPS screen taps + FILTER_WORLD_TAPS tangent-plane taps\nnormal · plane-distance · precision n/v, renormalized\nD4/D5 → D11/D12 (FILTER.md)"]
+    FT -->|STORAGE| HF["holefill.comp — virtual-res 8×8\none lookupLBuffer per texel, no filtering\nFILTERED channels + per-tap confidence → holeFill"]
     HF -->|IMAGE| RS["resolve.comp — full-res 8×8\nmiss→skybox · else lookupLBuffer (O(1) baked offset)\nunserved channel → confidence-weighted bilinear over holeFill"]
     RS -->|IMAGE| FN["final.frag — fullscreen quad → swapchain"]
 ```
@@ -85,8 +86,15 @@ Barrier `STORAGE`.
 3. **RNG seed = world voxel identity** (`lb_hash` of `gb.pos`, with `frameIndex` and `vp` mixed in as
    secondary terms). Seeding by screen pixel bakes a screen-periodic error into a world-space cache.
 4. **Diffuse:** one cosine-weighted ray from `centre + N·(0.87·vsize + 0.5)`. `traceRadiance` returns
-   emission on an emissive hit (**that is the direct light**), else sky + the hit voxel's cached
-   diffuse. Firefly-clamped.
+   emission on an emissive hit (**that is the direct light**), else sky + the hit voxel's
+   **filtered** cached diffuse (D11, not D4 — [FILTER.md](FILTER.md) § shade.comp — the feedback).
+   Firefly-clamped.
+   — A bounce landing on an **uncached** voxel would contribute 0, which is a systematic darkening
+   rather than a neutral result. It instead fires one more bounce with probability `secondBounceP`
+   and divides by it — Russian roulette, so the estimator's mean is unchanged while only ~p of such
+   hits pay for a ray. The chain is unrolled by hand (`traceRadianceTerminal` is its floor) because
+   GLSL has no recursion; the secondary hemisphere comes from a radius-1 occupancy kernel, since a
+   voxel with no slot has no cached normal either.
 5. **Specular:** one GGX-VNDF ray (`sampleGGXVNDF` + `F·G1(L)` throughput), gated on `dot(L,N) > 0`
    and `material.specular > 0.01`.
 6. Writes `virtualDiffuse` (E/π) and `virtualSpecular`. Barrier `IMAGE | STORAGE`.
@@ -101,6 +109,17 @@ index. `VG_LISTIDX_NONE` covers sky and voxels that never seated. Barrier `STORA
 Early-out on `pixels == 0` (not sampled this frame → keep history). Folds this frame's mean into the
 cached channels and updates the variance tracker: [LBUFFER.md](LBUFFER.md) § Accumulate and temporal blend.
 Barrier `STORAGE`.
+
+### filter.comp — indirect per voxel, local `64`
+Per-voxel spatial gather. `FILTER_TAPS` screen taps on a golden-angle spiral centred on the texel
+`downscale` baked into `uniqueVoxelList.z`, each resolved through the virtual gbuffer's own `vid` to
+its slot's single 64 B line; plus `FILTER_WORLD_TAPS` tangent-plane taps resolved by `descendAt`
+(`octree.glsl`), thickened ±1 voxel along N because a voxelised surface is a staircase, and diffuse
+only since an off-screen voxel's specular was accumulated for another view. Every tap — the centre
+included — is weighted by normal alignment, plane distance and its **precision** `n/v`, then
+renormalized: the inverse-variance combination, so a converged centre outweighs its neighbours and
+barely moves while a fresh one is pulled entirely onto its neighbourhood. Reads D4/D5 and **never** D11/D12: full rationale, the invariant and
+what is deliberately deferred are in [FILTER.md](FILTER.md). Barrier `STORAGE`.
 
 ### holefill.comp — virtual-res `8×8`
 One `lookupLBuffer` per texel, no filtering. Exists to hoist the expensive half of the fill (node
@@ -155,7 +174,7 @@ Fullscreen quad samples `resolveTexture` → swapchain (or the offscreen target 
 | `OctreeBuffer` | SSBO `uvec2[]` (bind 0) | — | 64-bit nodes ([OCTREE.md](OCTREE.md)) |
 | `ClaimBuffer` | SSBO `uint[]` (bind 1) | — | 1 bit/node dedup TAS; cleared each frame |
 | `lBuffer` | SSBO `uint[]` (bind 2) | — | 16-DWORD slot, 2²² slots, **256 MB** ([LBUFFER.md](LBUFFER.md)) |
-| `uniqueVoxelList` | SSBO `uvec4[]` (bind 3) | — | `{key.xy, claimedSlot, vid}`; virtual-pixel count |
+| `uniqueVoxelList` | SSBO `uvec4[]` (bind 3) | — | `{key.xy, virtual texel, vid → claimedSlot}`; virtual-pixel count ([FILTER.md](FILTER.md)) |
 | `uniqueVoxelCount` | SSBO `uint` (bind 4) | — | cleared each frame |
 | `indirectArgs` | SSBO `uvec4[2]` (bind 5) | — | claim/normal/avg dispatch args |
 | `accumDiffuse` | SSBO `uvec4[]` (bind 6) | — | per-list-entry diffuse sum + `pixelCount` |
@@ -221,6 +240,7 @@ bind their own program, so no call site binds one by hand.
 | `emaSpecular` | 4 | specular window; short so specular stays view-responsive |
 | `staleViewDep` | 50 | frames before a specular channel is refused as stale |
 | `staleViewIndep` | 1e7 | effectively an eviction control, not a freshness gate: diffuse irradiance is view-independent |
+| `secondBounceP` | 0.15 | P(extra bounce on an uncached hit); 0 restores the old darkening |
 
 Shader-side constants that behave like tunables live in `constants.glsl`: `HOLE_RADIUS`,
 `VAR_ALPHA_MIN`/`MAX`, `VAR_WINDOW_EPS`/`MIN`, `LUM_FLOOR`, `FIREFLY_CLAMP`, `ACCUM_SCALE`.
@@ -243,6 +263,7 @@ Shader-side constants that behave like tunables live in `constants.glsl`: `HOLE_
 | `HOLES` | fill contribution; **red = hole with no usable tap** (black in `SHADING`) |
 | `LUMINANCE` | EMA mean of log-luminance, remapped over `log(LUM_FLOOR)..log(FIREFLY_CLAMP)` |
 | `VARIANCE` | standard deviation in log units, blue → red. Variance itself spans orders of magnitude |
+| `FILTER` | what `filter.comp` changed: `\|D11−D4\|/D4`, heat. **Black = the filter did nothing here** |
 
 **The two frozen modes** skip every pass that writes the lBuffer — `claim`, `edit_mark`, `normal`,
 `shade`, `accum`, `avg` — while `primary`/`downscale`/`holefill`/`resolve` keep running, so the view
@@ -258,9 +279,13 @@ would fade the whole cache to black in ten frames, measuring the freeze rather t
 
 ---
 
-## Current limitation
+## Current limitations
 
-`traceRadiance` contributes **exactly 0** when a bounce lands on a voxel with no cached channel. That
-is a systematic darkening bias, strongest in newly-visible regions — where there is least information
-to begin with. The fill machinery in `holefill`/`resolve` fixes it on screen but not in the feedback
-loop, so the bias compounds through bounces.
+**Noise vs. change are conflated.** The variance-adaptive window reads high variance as "the light
+moved" and shortens; high variance from *sampling noise* wants the opposite. It works because change
+dominates and the spatial fill absorbs the noise, but separating the two needs a consistency test
+(compare the frame delta against the expected noise) rather than the variance alone.
+
+**Dividing by `secondBounceP` amplifies outliers.** A bright secondary bounce is scaled by `1/p`
+before `FIREFLY_CLAMP` sees it, so a low `p` trades bias for variance. The per-voxel variance is
+already the signal to tune it against.

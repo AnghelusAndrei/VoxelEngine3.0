@@ -85,9 +85,6 @@ enum RenderType {
     MATERIAL      = 1,   // material albedo
     NORMAL        = 2,   // decoded lBuffer normal (Increment 3)
     VERSION       = 3,   // per-voxel version (debug)
-    // These two FREEZE THE CACHE while selected: every pass that writes the lBuffer is
-    // skipped, so the camera flies around a snapshot of what is genuinely resident
-    // instead of re-seating each voxel the moment it is looked at (see Renderer::run).
     CLAIM_AGE     = 4,   // frozen: frame - lBuffer timestamp; bright = recently claimed
     LRU_OCCUPANCY = 5,   // frozen: green = resident, red = evicted/never seated
     VIRTUAL       = 6,   // downscaled virtual-gbuffer material (debug, B1.1)
@@ -96,7 +93,11 @@ enum RenderType {
     SAMPLES       = 9,   // per-voxel diffuse EMA sample count heatmap (debug)
     HOLES         = 10,  // cache-hole fill coverage (debug, see resolve.comp)
     LUMINANCE     = 11,  // log(luminance) heatmap (debug, see resolve.comp)
-    VARIANCE      = 12   // log(luminance) variance heatmap (debug, see resolve.comp)
+    VARIANCE      = 12,  // log(luminance) variance heatmap (debug, see resolve.comp)
+    FILTER        = 13,  // what filter.comp changed: |D11-D4|
+    UNFILTERED    = 14,  // unfiltered diffuse/specular (debug, see resolve.comp)
+    DIFFUSE       = 15,  // diffuse-only irradiance (debug, see resolve.comp)
+    SPECULAR      = 16   // specular-only irradiance (debug, see resolve.comp)
 };
 
 
@@ -110,8 +111,8 @@ struct FrameConfig {
     int        primary_raystop     = 100;
     int        normalPrecision     = 6;     // normal kernel radius (voxel-size units)
     int        virtualScale        = 5;     // shading downscale divisor (virtual framebuffer)
-    int        emaDiffuse          = 140;    // diffuse temporal window (sample cap, long)
-    int        emaSpecular         = 4;     // specular temporal window (sample cap, short)
+    int        emaDiffuse          = 700;    // diffuse temporal window (sample cap, long)
+    int        emaSpecular         = 5;     // specular temporal window (sample cap, short)
     int        staleViewDep        = 50;    // re-visit gap (frames) past which a cached channel's EMA count is reset (specular; 0 = off)
     int        staleViewIndep      = 1e7;    // re-visit gap (frames) past which a cached channel's EMA count is reset (diffuse; 0 = off)
 };

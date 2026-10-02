@@ -7,7 +7,12 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 // claim bitfield — 1 bit per octree slot (binding = SSBO_CLAIM_BINDING).
 layout(std430, binding = SSBO_CLAIM_BINDING) coherent buffer ClaimBuffer { uint bits[]; } claimbuf;
-// dedup output: uvec4 {key.xy, claimedSlot, spare}; claimedSlot pre-set to NO_SLOT.
+// dedup output: uvec4 {key.xy, packed virtual texel, vid -> claimedSlot}.
+// .z is this voxel's virtual texel, baked here (we hold `vp` in a register anyway) and read by
+// filter.comp to centre its screen-space gather. Exactly ONE lane writes it: the atomicOr dedup
+// above gives a single `needsAppend` per vid, so there is one writer per entry and no race.
+// .w is a PHASE field: it carries `vid` for lbuffer_claim, which consumes it to bake the slot
+// offset and then overwrites it with the claimed slot for normal/avg/filter. FILTER.md.
 layout(std430, binding = SSBO_UNIQUE_LIST_BINDING) writeonly buffer UniqueList { uvec4 entries[]; } uniqueList;
 layout(std430, binding = SSBO_UNIQUE_COUNT_BINDING) coherent  buffer UniqueCnt  { uint uniqueCount; };
 
@@ -63,6 +68,7 @@ void main() {
     waveBase = subgroupBroadcastFirst(waveBase);
     if (needsAppend) {
         uint off = subgroupBallotExclusiveBitCount(ballot);
-        uniqueList.entries[waveBase + off] = uvec4(gkey.x, gkey.y, LB_NO_SLOT, vid);
+        uniqueList.entries[waveBase + off] =
+            uvec4(gkey.x, gkey.y, (uint(vp.x) & 0xFFFFu) | (uint(vp.y) << 16u), vid);
     }
 }

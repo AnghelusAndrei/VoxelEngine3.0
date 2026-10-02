@@ -36,7 +36,14 @@ Mirrored in `renderer.hpp` (`LBUFFER_*`) and `shd/constants.glsl` — keep in sy
 | 7 | `listIndex` — this voxel's `uniqueVoxelList` index this frame | claim |
 | 8 | EMA **mean** of log-luminance — float32 **bit pattern** | avg.comp |
 | 9 | EMA **variance** of log-luminance — float32 **bit pattern** | avg.comp |
-| 10–15 | free | |
+| 10 | EMA **drift** of log-luminance — float32 **bit pattern** | avg.comp |
+| 11 | **filtered** diffuse — RGB9E5 ([FILTER.md](FILTER.md)) | filter.comp |
+| 12 | **filtered** specular — RGB9E5 | filter.comp |
+| 13–15 | free | |
+
+D11/D12 are what `holefill` publishes, what `resolve` composites, and what `shade`'s bounce reads
+back. D4/D5 stay the raw EMA and are the filter's **only** input — a filter that read a neighbour's
+D11 would compose blur with blur and grow its support without bound ([FILTER.md](FILTER.md)).
 
 - **Identity** = D0+D1. A real leaf has `level ≥ 1`, so `D1 == 0` cannot be a live key.
 - **D8/D9 are floats in a `uint[]` buffer.** They must be read with `uintBitsToFloat` and written
@@ -92,7 +99,9 @@ call site follows from *when* the pass runs and *which* voxels it reaches:
 | `resolve.comp` | primary voxel, per pixel | `lookupLBuffer` | hottest path; a miss is just a hole the fill absorbs |
 | `shade.comp` › primary voxel | virtual-gbuffer voxel | `lookupLBuffer` | runs after claim, over exactly the set it just baked |
 | `holefill.comp` | its own virtual texel | `lookupLBuffer` | same set, same frame |
-| `shade.comp` › `traceRadiance` | **bounce** target | `findLBuffer` | an arbitrary, often off-screen voxel |
+| `shade.comp` › `traceRadiance` | **bounce** target (D11) | `findLBuffer` | an arbitrary, often off-screen voxel |
+| `filter.comp` › world tap | tangent-plane neighbour | `findLBuffer` | same: arbitrary, often off-screen |
+| `filter.comp` › screen tap | its own virtual texel's voxel | `lookupLBuffer` | same set, same frame |
 | `edit_mark.comp` | neighbours of an edit | `findLBuffer` | mostly off-screen, and it runs right after an edit wiped the dirty range |
 
 The asymmetry that decides it is failure *cost*, not hit rate: `accum` losing a sample recurs and

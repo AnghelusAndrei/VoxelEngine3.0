@@ -29,7 +29,9 @@ void main() {
 
     uint  diff = IRR_HOLE, spec = IRR_HOLE;
     float conf = 0.0;
-    uint slot = gb.hit ? lookupLBuffer(gb.pos, gb.level, gb.version, octree.nodes[gb.vid].x)
+    // findLBuffer: an octree upload zeroes the baked offsets, and publishing IRR_HOLE for a
+    // voxel that IS cached would send resolve down the fill path for no reason.
+    uint slot = gb.hit ? findLBuffer(gb.pos, gb.level, gb.version, octree.nodes[gb.vid].x)
                        : LB_NO_SLOT;
     if (slot != LB_NO_SLOT) {
         uint sb  = linearSlotToBase(slot);          // timestamp, channels and counts: one 64 B line
@@ -37,14 +39,17 @@ void main() {
         uint n   = lbuf.data[sb + LB_SAMPLES];
         // Each channel on its own staleness window and its own EMA count. A count of 0 means the
         // slot was claimed but never averaged: it holds a literal 0, not a dark measurement.
-        if ((n & 0xFFFFu) > 0u && fresh(age, staleViewIndep)) diff = lbuf.data[sb + LB_DIFFUSE];
-        if ((n >> 16u)    > 0u && fresh(age, staleViewDep))   spec = lbuf.data[sb + LB_SPECULAR];
+        // The FILTERED channels: filter.comp ran this frame, before this pass, over the same
+        // uniqueVoxelList. Publishing them here rather than the raw D4/D5 is what keeps
+        // resolve's O(1) path and its 2x2 fill on one operator — otherwise cached pixels would
+        // be filtered and hole pixels raw, and the disagreement outlines every hole.
+        if ((n & 0xFFFFu) > 0u && fresh(age, staleViewIndep)) diff = lbuf.data[sb + LB_FDIFFUSE];
+        if ((n >> 16u)    > 0u && fresh(age, staleViewDep))   spec = lbuf.data[sb + LB_FSPECULAR];
 
         // How much this tap is worth to a neighbour, from the SAME 64 B line already
         // fetched - no extra read. v/n is the squared standard error of the stored mean,
         // so this is high for a converged voxel and low for one that is either noisy or
-        // barely sampled. Strictly better than gating on the sample count alone, which
-        // says how MUCH was measured but nothing about how much it disagreed.
+        // barely sampled.
         float nd = float(n & 0xFFFFu);
         float v  = uintBitsToFloat(lbuf.data[sb + LB_VARIANCE]);
         conf = 1.0 / (1.0 + v / max(nd, 1.0));

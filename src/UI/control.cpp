@@ -19,7 +19,8 @@ void Control::DrawSceneControl(){
 void Control::DrawShaderControl(){
     static const char* modes[] = {
         "OCTREE", "MATERIAL", "NORMAL", "VERSION", "CLAIM_AGE", "LRU_OCCUPANCY",
-        "VIRTUAL", "SHADE", "SHADING", "SAMPLES", "HOLES", "LUMINANCE", "VARIANCE"
+        "VIRTUAL", "SHADE", "SHADING", "SAMPLES", "HOLES", "LUMINANCE", "VARIANCE",
+        "FILTER", "UNFILTERED", "DIFFUSE", "SPECULAR"
     };
     int mode = (int)frameConfig->renderType;
     if(ImGui::Combo("render mode", &mode, modes, IM_ARRAYSIZE(modes)))

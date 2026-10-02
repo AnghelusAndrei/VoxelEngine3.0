@@ -84,7 +84,10 @@ void main(){
         // lost the eviction race → NO_SLOT (rare, only near full load)
     }
 
-    uniqueList.entries[gid].z = claimed;
+    // .w, not .z: downscale baked this voxel's virtual texel into .z for filter.comp, and .w
+    // held `vid`, which is dead the moment the offset bake below has used it. `entry` is a
+    // local copy taken at the top of main, so writing it back here cannot disturb that read.
+    uniqueList.entries[gid].w = claimed;
 
     if (claimed != LB_NO_SLOT) {
         // One write for match / empty / evict alike. The evict path in particular MUST

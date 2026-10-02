@@ -7,6 +7,8 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 #include "lbuffer.glsl"
 
 layout(std430, binding = SSBO_OCTREE_BINDING) readonly buffer OctreeBuffer { uvec2 nodes[]; } octree;
+
+#include "octree.glsl"   // descendAt — no ray stack, so no shared memory
 layout(std430, binding = SSBO_UNIQUE_LIST_BINDING) readonly buffer UniqueList { uvec4 entries[]; } uniqueList;
 layout(std430, binding = SSBO_UNIQUE_COUNT_BINDING) readonly buffer UniqueCnt  { uint uniqueCount; };
 
@@ -18,7 +20,7 @@ void main(){
     if (gid >= uniqueCount) return;
 
     uvec4 entry = uniqueList.entries[gid];
-    uint  slot  = entry.z;
+    uint  slot  = entry.w;                           // claim's writeback (.z carries the virtual texel)
     if (slot == LB_NO_SLOT) return;                  // never seated this frame
     uint sb = linearSlotToBase(slot);
     if ((lbuf.data[sb + LB_NORMAL] & NORMAL_UPDATE_BIT) == 0u) return;   // already current
@@ -45,21 +47,9 @@ void main(){
         uvec3 sp = uvec3(spi);
         if (sp.x >= L || sp.y >= L || sp.z >= L) continue;
 
-        uint block = octree.nodes[0].y;
-        bool occ = false;
-        for (uint lev = 1u; lev <= level; lev++){
-            uint p2  = L >> lev;
-            uint idx = (uint(bool(sp.x & p2)) << 2u)
-                     | (uint(bool(sp.y & p2)) << 1u)
-                     |  uint(bool(sp.z & p2));
-            uvec2 n = octree.nodes[block + idx];
-            if (n.x == 0u && n.y == 0u)  { occ = false; break; }
-            if ((n.x & NODE_ISNODE_BIT) == 0u) { occ = ((n.x >> NODE_MAT_SHIFT) & MATERIAL_MASK) != 0u; break; }
-            if (lev == level)            { occ = true; break; }
-            block = n.y;
-        }
-
-        if (occ) grad += vec3(dx, dy, dz) / float(r2);   // 1/r² weight
+        // `.hit`, not `.leaf`: an internal node at this level means something below it is
+        // filled, which is what an occupancy gradient asks. (octree.glsl)
+        if (descendAt(sp, level, L).hit) grad += vec3(dx, dy, dz) / float(r2);   // 1/r² weight
     }
     normal = (dot(grad, grad) > 1e-8) ? normalize(-grad) : vec3(0.0, 1.0, 0.0);
 
