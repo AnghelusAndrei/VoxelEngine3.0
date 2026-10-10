@@ -43,18 +43,7 @@ uint probeLBuffer(uvec3 pos, uint level, uint version){
     return LB_NO_SLOT;
 }
 
-// O(1) lookup — the per-pixel path. `nodeLo` is the voxel's octree node Lo word (the caller
-// indexes it directly with the gbuffer's `vid`; no traversal). claim baked this voxel's probe
-// distance into its free bits, so the slot is just home+offset.
-//
-// The full key is verified on the slot's OWN cache line — D0/D1 sit in the same 64 B as the
-// channels the caller reads next, so the check is free. That verify is what makes every
-// wrong-offset case safe and self-describing, with no validity bit and no sentinel:
-//   * never written / zeroed by a CPU node write -> offset 0 -> home slot -> key mismatch
-//   * voxel was evicted, another key now owns the slot        -> key mismatch
-//   * garbage bits from a recycled node                       -> masked in range, key mismatch
-// All of them return LB_NO_SLOT, which is just the ordinary hole state the fill pass absorbs.
-// Offset 0 is therefore unambiguous: it means "at home" exactly when the key agrees.
+// O(1) lookup
 uint lookupLBuffer(uvec3 pos, uint level, uint version, uint nodeLo){
     uint off = (nodeLo >> NODE_SLOTOFF_SHIFT) & NODE_SLOTOFF_MASK;
     uint s   = (homeSlot(pos, level, version) + off) & (LBUFFER_SLOTS_TOTAL - 1u);
@@ -68,6 +57,54 @@ uint lookupLBuffer(uvec3 pos, uint level, uint version, uint nodeLo){
 uint findLBuffer(uvec3 pos, uint level, uint version, uint nodeLo){
     uint s = lookupLBuffer(pos, level, version, nodeLo);
     return (s != LB_NO_SLOT) ? s : probeLBuffer(pos, level, version);
+}
+
+// Lock-free claim of `key` from its home slot `h`. Returns the slot or
+// LB_NO_SLOT. Shared by the voxel and ancestor claims, which differ only in what they do after:
+//   inserted  — the slot was empty or evicted and now carries `key`; the caller inits the payload
+//   prevStamp — on a MATCH, the timestamp the slot had before this frame (staleness)
+// Requires one thread per key per frame (the dedup), and frameStamp >= 1.
+uint lbClaim(uvec2 key, uint h, uint frameStamp, out bool inserted, out uint prevStamp){
+    inserted  = false;
+    prevStamp = 0u;
+    int  best   = -1;
+    uint bestTs = 0xFFFFFFFFu;
+
+    for (uint i = 0u; i < LB_PROBE_LIMIT; i++){
+        uint s  = (h + i) & (LBUFFER_SLOTS_TOTAL - 1u);
+        uint sb = s * SLOT_DWORDS;
+        uint d2 = lbuf.data[sb + LB_TIMESTAMP];
+
+        if (lbuf.data[sb] == key.x && lbuf.data[sb + 1u] == key.y){          // MATCH
+            if (atomicCompSwap(lbuf.data[sb + LB_TIMESTAMP], d2, frameStamp) == d2){
+                prevStamp = d2;
+                return s;
+            }
+            continue;                                                         // evicted under us
+        }
+        if (d2 == 0u){                                                        // EMPTY
+            if (atomicCompSwap(lbuf.data[sb + LB_TIMESTAMP], 0u, frameStamp) == 0u){
+                lbuf.data[sb]      = key.x;
+                lbuf.data[sb + 1u] = key.y;
+                inserted = true;
+                return s;
+            }
+            continue;
+        }
+        if (d2 < frameStamp && d2 < bestTs){ bestTs = d2; best = int(s); }
+    }
+
+    if (best >= 0){                                                           // EVICT stalest in the window
+        uint sb = uint(best) * SLOT_DWORDS;
+        if (atomicCompSwap(lbuf.data[sb + LB_TIMESTAMP], bestTs, frameStamp) == bestTs){
+            lbuf.data[sb]      = key.x;
+            lbuf.data[sb + 1u] = key.y;
+            inserted = true;
+            return uint(best);
+        }
+        // lost the eviction race → NO_SLOT (rare, only near full load)
+    }
+    return LB_NO_SLOT;
 }
 
 // Is a slot's channel still trustworthy? `window == 0` disables the check.
@@ -110,4 +147,56 @@ uint packRGB9E5(vec3 rgb){
 vec3 unpackRGB9E5(uint v){
     float scale = exp2(float(v >> 27u) - 15.0 - 9.0);
     return vec3(float(v & 0x1FFu), float((v >> 9u) & 0x1FFu), float((v >> 18u) & 0x1FFu)) * scale;
+}
+
+// ---- ancestor slots (constants.glsl § ancestor slots) ----------------------------------
+// Cube bin for a normal component on `axis`: +X -X +Y -Y +Z -Z.
+uint ancBin(uint axis, float c) { return 2u * axis + (c < 0.0 ? 1u : 0u); }
+
+float ancCount(uint sb, uint bin) {
+    vec2 p = unpackHalf2x16(lbuf.data[sb + LB_ANC_COUNT + (bin >> 1u)]);
+    return ((bin & 1u) == 0u) ? p.x : p.y;
+}
+
+// The cube at normal N, sample-weighted over N's three bins
+vec3 ancEval(uint sb, vec3 N, out float avail, out float cover) {
+    vec3 E = vec3(0.0); avail = 0.0; cover = 0.0;
+    for (uint a = 0u; a < 3u; a++) {
+        float p = N[a] * N[a];
+        uint  b = ancBin(a, N[a]);
+        float c = ancCount(sb, b);
+        if (p <= 0.0 || c <= 0.0) continue;
+        E += p * c * unpackRGB9E5(lbuf.data[sb + LB_ANC_BINS + b]);
+        avail += p * c;
+        cover += p;
+    }
+    cover /= max(dot(N, N), 1e-8);
+    return (avail > 0.0) ? E / avail : vec3(0.0);
+}
+
+// Direction-blind: every bin, sample-weighted — what a scalar aggregate would have stored.
+vec3 ancFlat(uint sb, out float avail) {
+    vec3 E = vec3(0.0); avail = 0.0;
+    for (uint b = 0u; b < 6u; b++) {
+        float c = ancCount(sb, b);
+        E += c * unpackRGB9E5(lbuf.data[sb + LB_ANC_BINS + b]);
+        avail += c;
+    }
+    return (avail > 0.0) ? E / avail : vec3(0.0);
+}
+
+// One level of the sample-budget borrow, shared by compose, resolve's hole fill and shade's bounce
+// fallback. A voxel short of `need` samples takes from each ancestor, nearest first, only what that
+// level ADDS over the levels below it (its count includes theirs):
+//   take = min(need - took, avail - below)
+// The caller ends with (n·x + acc) / (n + took). Returns this level's take.
+float ancBorrow(uint asb, vec3 N, bool hasN, float need,
+                inout float took, inout float below, inout vec3 acc) {
+    float avail, cover;
+    vec3  E = hasN ? ancEval(asb, N, avail, cover) : ancFlat(asb, avail);
+    float t = min(need - took, max(avail - below, 0.0));
+    acc   += t * E;
+    took  += t;
+    below  = max(below, avail);
+    return t;
 }

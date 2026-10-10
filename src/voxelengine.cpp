@@ -1,4 +1,4 @@
-#include "voxelengine.hpp"
+﻿#include "voxelengine.hpp"
 #include <algorithm>
 #include <vector>
 #include <glm/common.hpp>
@@ -31,7 +31,7 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
     };
 
     Octree::Config octreeConfig = {
-        .depth = 10
+        .depth = 11
     };
 
     controllerConfig = {
@@ -85,10 +85,10 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
     matBlue     = materialPool->addMaterial({0.1f, 0.1f, 1.0f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, 0.8f, 0.0f, 0.0f, false, 0.0f, "brush.blue");
     matWhite    = materialPool->addMaterial({1.0f, 1.0f, 1.0f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, 0.6f, 0.0f, 0.0f, false, 0.0f, "brush.white");
     matMetallic = materialPool->addMaterial({0.8f, 0.8f, 0.8f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, 0.1f, 0.95f, 0.85f, false, 0.0f, "brush.metal");
-    matEmissive = materialPool->addMaterial({1.0f, 0.95f, 0.85f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, 0.4f, 0.0f, 0.0f, true, 10.0f, "brush.emissive");
+    matEmissive = materialPool->addMaterial({1.0f, 0.95f, 0.85f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}, 0.4f, 0.0f, 0.0f, true, 7.0f, "brush.emissive");
 
     
-    scene::Model sponza = scene::load("./assets/models/sponza/sponza.obj",1000,false,3);
+    scene::Model sponza = scene::load("./assets/models/sponza/sponza.obj",2000,false,3);
     if (sponza.ok()) {
         sponza.finish("floor",      0.35f, 0.25f, 0.0f);
         sponza.finish("Material__57", 0.30f, 0.30f, 0.0f);
@@ -106,7 +106,7 @@ VoxelEngine::VoxelEngine(const Config *windowConfig){
         sponzaCentre = glm::ivec3((int)L / 2);
     }
 
-    //octree->insertSphere(glm::vec3(sponzaCentre), (float)L / 30.0f, matEmissive);
+    octree->insertSphere(glm::vec3(sponzaCentre), (float)L / 30.0f, matEmissive);
     octree->insertSphere(glm::vec3(sponzaCentre) + glm::vec3(0, sponza.dim.y / 3, 0), (float)L / 20.0f, matMetallic);
 
     printf("[scene] %s built in %.2fs: %lu voxels, %u/%u material slots, "

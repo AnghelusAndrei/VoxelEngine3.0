@@ -1,9 +1,10 @@
-CLAUDE.md
 .graphifyignore
 src/graphify-out
 build/
 bin/
 .claude/
+CLAUDE.md
 .vscode/
 graphify-out/
 assets/
+architecture/

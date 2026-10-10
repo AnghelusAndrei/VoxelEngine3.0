@@ -1,5 +1,6 @@
 #include "renderer.hpp"
 
+
 static uint32_t gcd_u(uint32_t a, uint32_t b){ while (b) { uint32_t t = a % b; a = b; b = t; } return a; }
 
 // Pick the deterministic-jitter stride K for a given downscale `scale`
@@ -72,6 +73,9 @@ Renderer::Renderer(core::RendererConfig *config_, Octree *volume_, Camera *camer
 
     // Dedup pipeline buffers. uniqueList is sized in allocVoxelLists() (via
     // framebufferEvent); the small count / args are fixed-size and allocated here.
+    glGenBuffers(1, &uniqueAncestorListSSBO);
+    glGenBuffers(1, &uniqueAncestorStartsSSBO);
+    glGenBuffers(1, &uniqueAncestorCountsSSBO);
     glGenBuffers(1, &uniqueListSSBO);
     glGenBuffers(1, &accumDiffuseSSBO);
     glGenBuffers(1, &accumSpecularSSBO);
@@ -82,8 +86,14 @@ Renderer::Renderer(core::RendererConfig *config_, Octree *volume_, Camera *camer
     glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(GLuint), NULL, GL_DYNAMIC_DRAW);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, core::SSBO_UNIQUE_COUNT_BINDING, uniqueCountSSBO);
 
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, indirectArgsSSBO);   // uvec4[2]
-    glBufferData(GL_SHADER_STORAGE_BUFFER, 2 * 4 * sizeof(GLuint), NULL, GL_DYNAMIC_DRAW);
+    // One counter per ancestor level (depths 0..depth-1); the segment starts depend on the
+    // virtual res, so they are built in allocVoxelLists().
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, uniqueAncestorCountsSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(GLuint) * volume->depth, NULL, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, core::SSBO_UNIQUE_ANCESTOR_COUNTS_BINDING, uniqueAncestorCountsSSBO);
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, indirectArgsSSBO);   // uvec4[ANC_ARGS_BASE + 2·depth]
+    glBufferData(GL_SHADER_STORAGE_BUFFER, (ANC_ARGS_BASE + 2 * volume->depth) * 4 * sizeof(GLuint), NULL, GL_DYNAMIC_DRAW);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, core::SSBO_INDIRECT_ARGS_BINDING, indirectArgsSSBO);
 
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
@@ -115,7 +125,6 @@ Renderer::Renderer(core::RendererConfig *config_, Octree *volume_, Camera *camer
     glGenTextures(1, &virtualGBufferTex);     // virtual gbuffer (RGBA32UI, downscaled)
     glGenTextures(1, &virtualDiffuseTex);     // virtual diffuse  (RGBA32F)
     glGenTextures(1, &virtualSpecularTex);    // virtual specular (RGBA32F)
-    glGenTextures(1, &holeFillTex);           // gathered cache-hole fill (RGBA32UI)
 
     glGenFramebuffers (1, &finalPass.framebuffer);
     glGenRenderbuffers(1, &finalPass.rbo);
@@ -152,6 +161,27 @@ bool Renderer::run(core::FrameConfig *frameConfig){
     stats.cam_direction  = camera->direction;
 
     
+    // ---- lighting reset: everything persistent goes back to its startup state ------------------
+    // The lBuffer (voxel AND ancestor slots) to zero = every slot pristine-empty, exactly as at
+    // startup; the per-frame accumulators too, in case a reset lands between accum and avg's
+    // clear. Baked slot offsets in the octree are left stale on purpose: every lookup verifies the
+    // key, so they degrade to a miss and are re-baked by the next claim.
+    if (frameConfig->resetCache) {
+        GLuint zero = 0u;
+        for (GLuint buf : { lBufferSSBO, accumDiffuseSSBO, accumSpecularSSBO }) {
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, buf);
+            glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
+        }
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+        resetFrame = frameIdx;
+        frameConfig->resetCache = false;
+        if (config->debuggingEnabled)
+            config->logMessage("[%f] lBuffer reset\n", glfwGetTime());
+        shader::checkGLError("lBuffer reset", success, *config);
+    }
+    stats.framesSinceReset = frameIdx - resetFrame;
+
     if (frameConfig->shaderRecompilation){
         passes.reloadAll(*config);
         frameConfig->shaderRecompilation = false;
@@ -173,12 +203,15 @@ bool Renderer::run(core::FrameConfig *frameConfig){
         jitterStride = pickJitterStride(jitterPeriod, scale);
     }
 
-    // Reset per-frame dedup state: clear the claim bitfield and uniqueVoxelCount.
+    // Reset per-frame dedup state: clear the claim bitfield, uniqueVoxelCount and the
+    // per-level ancestor counters.
     volume->clearClaimBitfield();
     {
         GLuint zero = 0u;
-        glBindBuffer(GL_SHADER_STORAGE_BUFFER, uniqueCountSSBO);
-        glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
+        for (GLuint buf : { uniqueCountSSBO, uniqueAncestorCountsSSBO }) {
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, buf);
+            glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
+        }
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
     }
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
@@ -200,6 +233,7 @@ bool Renderer::run(core::FrameConfig *frameConfig){
     glBindImageTexture(0, gbufferTex, 0, GL_FALSE, 0, GL_READ_ONLY,  GL_RGBA32UI);
     glBindImageTexture(1, virtualGBufferTex,   0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32UI);
     {
+        volume->BindUniforms(downscalePass.program());   // claim + octree SSBOs, octreeDepth (ancestor walk)
         downscalePass.set("screenResolution", glm::ivec2(framebufferSize.x, framebufferSize.y));
         downscalePass.set("virtualSize", glm::ivec2(virtualSize.x, virtualSize.y));
         downscalePass.set("virtualScale", (GLuint)curVirtualScale);
@@ -215,8 +249,10 @@ bool Renderer::run(core::FrameConfig *frameConfig){
     // buildArgs: indirectArgs[0] = ceil(uniqueCount / 64). One call covers claim, normal,
     // and avg — all dispatch per visible voxel over uniqueVoxelList (local 64). uniqueCount
     // is fixed after primary, and none of those passes modify indirectArgs.
+    // It also writes one indirectArgs entry per ancestor level from downscale's per-level counts.
     auto runBuildArgs = [&]() {
         buildArgsPass.set("localSize", (GLuint)64u);
+        buildArgsPass.set("octreeDepth", (GLuint)volume->depth);
         buildArgsPass.dispatch(single());
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
     };
@@ -230,6 +266,14 @@ bool Renderer::run(core::FrameConfig *frameConfig){
     claimPass.set("staleViewDep", (GLuint)frameConfig->staleViewDep);
     claimPass.set("staleViewIndep", (GLuint)frameConfig->staleViewIndep);
     claimPass.dispatch(perVoxel());
+
+    // Ancestors, one dispatch per level. No barrier between these or against the voxel claim:
+    // ancestor keys carry LB_ANCESTOR_FLAG, so every key in flight is distinct.
+    claimAncPass.set("frameStamp", (GLuint)frameStamp);
+    for (uint32_t d = 0; d < volume->depth; d++) {
+        claimAncPass.set("ancLevel", (GLuint)d);
+        claimAncPass.dispatch(perAncestorClaim(d));
+    }
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
     profiler.end("claim");
     shader::checkGLError("claimPass", success, *config);
@@ -285,6 +329,7 @@ bool Renderer::run(core::FrameConfig *frameConfig){
         shadePass.set("primary_raystop", (GLuint)frameConfig->primary_raystop);
         shadePass.set("frameIndex", (GLuint)frameIdx);
         shadePass.set("virtualSize", glm::ivec2(virtualSize.x, virtualSize.y));
+        shadePass.set("composeBudget", (GLuint)std::max(frameConfig->composeBudget, 0));
     }
     profiler.start("shade");
     shadePass.dispatch(virtualRes());
@@ -313,37 +358,32 @@ bool Renderer::run(core::FrameConfig *frameConfig){
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
     shader::checkGLError("avgPass", success, *config);
 
-    // ---------------- filter.comp : per-voxel spatial gather (indirect over uniqueList) ----------------
-    // Inside the freeze block on purpose: it writes the lBuffer, which CLAIM_AGE / LRU_OCCUPANCY
-    // exist to hold still. Placed BEFORE holefill so holefill can publish the filtered channels,
-    // keeping resolve's O(1) path and its 2x2 fill on one operator (architecture/FILTER.md).
-    glBindImageTexture(0, virtualGBufferTex, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32UI);
-    {
-        volume->BindUniforms(filterPass.program());    // octree SSBO (binding 0) + octreeDepth
-        filterPass.set("virtualSize", glm::ivec2(virtualSize.x, virtualSize.y));
+    // ---------------- ancestor_aggregate.comp : bottom-up cube per ancestor, one level at a time ----------------
+    // Deepest first, barrier between levels: a parent reads its internal children's cubes, so
+    // they must be finished. Reads avg's fresh D4 for leaf children, hence after avg.
+    volume->BindUniforms(aggregatePass.program());    // octree SSBO + octreeDepth
+    aggregatePass.set("frameStamp", (GLuint)frameStamp);
+    aggregatePass.set("staleViewIndep", (GLuint)frameConfig->staleViewIndep);
+    profiler.start("aggregate");
+    for (uint32_t d = volume->depth; d-- > 0; ) {
+        aggregatePass.set("ancLevel", (GLuint)d);
+        aggregatePass.dispatch(perAncestorAggregate(d));
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
     }
-    profiler.start("filter");
-    filterPass.dispatch(perVoxel());
-    profiler.end("filter");
+    profiler.end("aggregate");
+    shader::checkGLError("aggregatePass", success, *config);
+
+    // ---------------- compose.comp
+    composePass.set("octreeDepth", (GLuint)volume->depth);
+    composePass.set("composeBudget", (GLuint)std::max(frameConfig->composeBudget, 0));
+    profiler.start("compose");
+    composePass.dispatch(perVoxel());
+    profiler.end("compose");
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-    shader::checkGLError("filterPass", success, *config);
+    shader::checkGLError("composePass", success, *config);
 
     }   // end !freezeCache
 
-    // ---------------- holefill.comp : per-virtual-texel cache-hole gather ----------------
-    glBindImageTexture(0, virtualGBufferTex, 0, GL_FALSE, 0, GL_READ_ONLY,  GL_RGBA32UI);
-    glBindImageTexture(1, holeFillTex,       0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32UI);
-    {
-        holefillPass.set("virtualSize", glm::ivec2(virtualSize.x, virtualSize.y));
-        holefillPass.set("frameStamp", (GLuint)frameStamp);
-        holefillPass.set("staleViewDep", (GLuint)frameConfig->staleViewDep);
-        holefillPass.set("staleViewIndep", (GLuint)frameConfig->staleViewIndep);
-    }
-    profiler.start("holefill");
-    holefillPass.dispatch(virtualRes());
-    profiler.end("holefill");
-    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
-    shader::checkGLError("holefillPass", success, *config);
 
     // ---------------- resolve.comp : gbuffer → resolveTex ----------------
     glBindImageTexture(0, gbufferTex, 0, GL_FALSE, 0, GL_READ_ONLY,  GL_RGBA32UI);
@@ -351,7 +391,6 @@ bool Renderer::run(core::FrameConfig *frameConfig){
     glBindImageTexture(2, virtualGBufferTex,   0, GL_FALSE, 0, GL_READ_ONLY,  GL_RGBA32UI);
     glBindImageTexture(3, virtualDiffuseTex,   0, GL_FALSE, 0, GL_READ_ONLY,  GL_RGBA32F);   // SHADE debug: unfiltered diffuse
     glBindImageTexture(4, virtualSpecularTex,  0, GL_FALSE, 0, GL_READ_ONLY,  GL_RGBA32F);   // SHADE debug: unfiltered specular
-    glBindImageTexture(5, holeFillTex,         0, GL_FALSE, 0, GL_READ_ONLY,  GL_RGBA32UI);  // gathered cache-hole fill
     {
         uint8_t unit = 1;
         skybox->BindUniforms(resolvePass.program(), unit);
@@ -363,6 +402,8 @@ bool Renderer::run(core::FrameConfig *frameConfig){
         resolvePass.set("virtualSize", glm::ivec2(virtualSize.x, virtualSize.y));
         resolvePass.set("staleViewDep", (GLuint)frameConfig->staleViewDep);
         resolvePass.set("staleViewIndep", (GLuint)frameConfig->staleViewIndep);
+        resolvePass.set("ancestorLevel", (GLuint)frameConfig->ancestorLevel);
+        resolvePass.set("composeBudget", (GLuint)std::max(frameConfig->composeBudget, 0));
     }
     profiler.start("resolve");
     resolvePass.dispatch(fullRes());
@@ -410,6 +451,9 @@ Renderer::~Renderer(){
 
     glDeleteBuffers(1, &lBufferSSBO);
     glDeleteBuffers(1, &uniqueListSSBO);
+    glDeleteBuffers(1, &uniqueAncestorListSSBO);
+    glDeleteBuffers(1, &uniqueAncestorStartsSSBO);
+    glDeleteBuffers(1, &uniqueAncestorCountsSSBO);
     glDeleteBuffers(1, &accumDiffuseSSBO);
     glDeleteBuffers(1, &accumSpecularSSBO);
     glDeleteBuffers(1, &uniqueCountSSBO);
@@ -419,7 +463,6 @@ Renderer::~Renderer(){
     glDeleteTextures(1, &virtualGBufferTex);
     glDeleteTextures(1, &virtualDiffuseTex);
     glDeleteTextures(1, &virtualSpecularTex);
-    glDeleteTextures(1, &holeFillTex);
     // Each pass tears down its own program, and FinalRasterPass its quad and target.
     passes.destroyAll();
 }
@@ -462,6 +505,25 @@ void Renderer::allocVoxelLists() {
                               GL_UNSIGNED_INT, &zero);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, b.binding, b.id);
     }
+    // Ancestor segments, one per depth 0..depth-1. Level d can hold at most min(8^d, n): 8^d is
+    // every node that exists there, and n bounds it because distinct ancestors at one level own
+    // disjoint, non-empty sets of unique voxels. Exact bounds, so a segment never overflows
+    // (downscale still guards it). ~370k entries (6 MB) at 1080p / scale 5 / depth 10.
+    std::vector<GLuint>& starts = ancestorStarts;
+    starts.assign(volume->depth + 1u, 0u);
+    for (uint32_t d = 0; d < volume->depth; d++) {
+        const uint64_t nodesAtD = (d < 21u) ? (1ull << (3u * d)) : UINT64_MAX;   // 8^d
+        starts[d + 1] = starts[d] + (GLuint)std::min<uint64_t>(nodesAtD, (uint64_t)n);
+    }
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, uniqueAncestorStartsSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)(starts.size() * sizeof(GLuint)),
+                 starts.data(), GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, core::SSBO_UNIQUE_ANCESTOR_STARTS_BINDING, uniqueAncestorStartsSSBO);
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, uniqueAncestorListSSBO);   // fully rewritten each frame
+    glBufferData(GL_SHADER_STORAGE_BUFFER,
+                 (GLsizeiptr)starts.back() * 4 * (GLsizeiptr)sizeof(GLuint), NULL, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, core::SSBO_UNIQUE_ANCESTOR_LIST_BINDING, uniqueAncestorListSSBO);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 }
 
@@ -473,7 +535,6 @@ void Renderer::allocVirtualTextures() {
     allocTex2D(virtualGBufferTex, GL_RGBA32UI, GL_RGBA_INTEGER, GL_UNSIGNED_INT, virtualSize);
     allocTex2D(virtualDiffuseTex, GL_RGBA32F,  GL_RGBA,         GL_FLOAT, virtualSize);
     allocTex2D(virtualSpecularTex, GL_RGBA32F, GL_RGBA,         GL_FLOAT, virtualSize);
-    allocTex2D(holeFillTex, GL_RGBA32UI, GL_RGBA_INTEGER, GL_UNSIGNED_INT, virtualSize);
 }
 
 void Renderer::framebufferEvent() {

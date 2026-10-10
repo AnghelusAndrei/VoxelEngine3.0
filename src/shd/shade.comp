@@ -8,7 +8,7 @@ layout(local_size_x = 8, local_size_y = 8) in;   // 64 threads => matches intern
 //      kernel (voxelNormal)
 //   3. cast 1 cosine-weighted diffuse ray + 1 GGX-VNDF specular ray, each ONE bounce
 //      with irradiance-cache feedback — a bounce that hits a cached voxel reads its
-//      diffuse radiosity (albedo·diffuseChannel) ≈ all further bounces; sky + emissive
+//      diffuse radiosity (albedo*diffuseChannel) ≈ all further bounces; sky + emissive
 //      voxels are the only direct light. Uncached non-emissive hit contributes 0.
 //   4. write incident diffuse and specular outgoing radiance to the virtual
 //      images. accum.comp reduces them per-voxel; resolve composites albedo·diffuse+spec.
@@ -26,6 +26,7 @@ uniform uint  octreeDepth;
 uniform uint  primary_raystop;
 uniform uint  frameIndex;
 uniform ivec2 virtualSize;
+uniform uint  composeBudget;   // compose's sample budget: what the ancestor fallback borrows up to
 
 layout(std140, binding = 0) uniform CameraUniform {
     vec4 position;
@@ -45,11 +46,11 @@ uniform samplerCube skybox;
 #include "gbuffer.glsl"
 #include "internal.glsl"
 
-// ---- RNG (PCG hash) ----
+// ---- RNG ----
 uint pcg(inout uint s){ s = s*747796405u + 2891336453u; uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u; return (w >> 22u) ^ w; }
 float rnd(inout uint s){ return float(pcg(s)) * (1.0 / 4294967296.0); }
 
-// ---- GGX VNDF importance sampling (Heitz 2018) ----
+// ---- GGX VNDF importance sampling ----
 float smithG1GGX(float NdotX, float a){ float a2 = a*a; return 2.0*NdotX / (NdotX + sqrt(a2 + (1.0 - a2)*NdotX*NdotX)); }
 
 vec3 sampleGGXVNDF(vec3 N, vec3 V, float roughness, inout uint st){
@@ -72,7 +73,7 @@ vec3 sampleGGXVNDF(vec3 N, vec3 V, float roughness, inout uint st){
     return normalize(Hl.x*T + Hl.y*B + Hl.z*N);
 }
 
-// VNDF throughput = BRDF·NdotL / pdf(L) = F·G1(L) (D, G1(V), 4·NdotV·NdotL cancel).
+// VNDF throughput
 vec3 ggxThroughput(vec3 N, vec3 V, vec3 L, vec3 H, float roughness, vec3 F0){
     float NdotL = max(dot(N, L), 0.001);
     float VdotH = max(dot(V, H), 0.001);
@@ -137,6 +138,18 @@ vec3 traceRadiance(vec3 origin, vec3 dir, inout uint rng){
 
     if (slot != LB_NO_SLOT) {                              // cached => indirect feedback
         rad += (1.0 - m.metallic) * m.color.rgb * unpackRGB9E5(lbuf.data[linearSlotToBase(slot) + LB_FDIFFUSE]);
+    } else {
+        // Uncached: borrow from its ancestors as compose would for a voxel with n = 0 
+        uint  tid  = gl_LocalInvocationIndex;
+        float need = float(max(composeBudget, 1u)), took = 0.0, below = 0.0;
+        vec3  acc  = vec3(0.0);
+        for (uint a = wlev; a-- > 0u && took < need; ) {
+            uvec3 cell = h.position & ~uvec3((octreeLength >> a) - 1u);
+            uint  s    = lookupLBuffer(cell, a | LB_ANCESTOR_FLAG, 0u, gs_stack[a][tid].x);
+            if (s == LB_NO_SLOT) break;
+            ancBorrow(linearSlotToBase(s), -dir, true, need, took, below, acc);
+        }
+        if (took > 0.0) rad += (1.0 - m.metallic) * m.color.rgb * acc / took;
     }
     return rad;
 }
@@ -175,7 +188,7 @@ void main(){
     vec3 Ld      = cosineHemisphere(N, rng);
     vec3 diffuse = traceRadiance(origin, Ld, rng);
 
-    // specular: GGX-VNDF sample, throughput F·G1(L)·specular. Keeps emission (slab stays in reflections).
+    // specular
     vec3 specular = vec3(0.0);
     if (m.specular > 0.01){
         vec3 H  = sampleGGXVNDF(N, Vd, m.roughness, rng);

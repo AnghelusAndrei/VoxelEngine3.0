@@ -20,12 +20,13 @@ void Control::DrawShaderControl(){
     static const char* modes[] = {
         "OCTREE", "MATERIAL", "NORMAL", "VERSION", "CLAIM_AGE", "LRU_OCCUPANCY",
         "VIRTUAL", "SHADE", "SHADING", "SAMPLES", "HOLES", "LUMINANCE", "VARIANCE",
-        "FILTER", "UNFILTERED", "DIFFUSE", "SPECULAR"
+        "COMPOSE", "UNFILTERED", "DIFFUSE", "SPECULAR", "ANCESTOR"
     };
     int mode = (int)frameConfig->renderType;
     if(ImGui::Combo("render mode", &mode, modes, IM_ARRAYSIZE(modes)))
         frameConfig->renderType = (core::RenderType)mode;
 
+    ImGui::SliderInt("ancestor level", &frameConfig->ancestorLevel, 0, 15);
     ImGui::SliderInt("normal precision", &frameConfig->normalPrecision, 1, 10);
     ImGui::SliderInt("virtual scale", &frameConfig->virtualScale, 1, 12);
 
@@ -39,6 +40,10 @@ void Control::DrawLightingControl(){
     ImGui::SliderInt("specular window", &frameConfig->emaSpecular, 1, 64);
     ImGui::SliderInt  ("stale view independent", &frameConfig->staleViewIndep, 0, 1e8);
     ImGui::SliderInt  ("stale view dependent", &frameConfig->staleViewDep, 0, 64);
+
+    ImGui::SliderInt("compose budget (samples)", &frameConfig->composeBudget, 0, 1024);
+    if (ImGui::Button("Reset lighting cache"))
+        frameConfig->resetCache = true;
 }
 
 void Control::Draw(){

@@ -3,8 +3,8 @@
 
 // Node decode and POINT LOOKUP. Deliberately separate from internal.glsl: that file declares
 // `shared uvec2 gs_stack[MAXDEPTH][64]` for Raycast's descent, and shared memory is what caps
-// occupancy in the heavy passes. filter.comp and normal.comp need to resolve a position to a
-// leaf but never trace a ray, so they take this header and pay nothing.
+// occupancy in the heavy passes. normal.comp, downscale and ancestor_aggregate need node decode or
+// a point lookup but never trace a ray, so they take this header and pay nothing.
 //
 // The including shader must have declared the octree SSBO as `octree`.
 //
@@ -37,7 +37,7 @@ uint locate(uvec3 pos, uint p2) {
 //   .hit  — is this position SOLID? An internal node at maxLevel counts: something below it is
 //           filled, which is what an occupancy gradient (normal.comp, shade's fallback) asks.
 //   .leaf — is it a real leaf, so id/version/level address a cache slot? A cache tap
-//           (filter.comp) needs a key to hash, and an internal node has none.
+//           needs a key to hash, and an internal node has none (ancestors use PackAncestorKey).
 // Getting these two backwards silently changes every computed normal, so they are named rather
 // than inferred from `material != 0`.
 struct point_t {

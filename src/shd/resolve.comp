@@ -5,10 +5,9 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(binding = 0, rgba32ui) readonly  uniform uimage2D  gbufferTexture;
 layout(binding = 1, rgba32f)  writeonly uniform image2D   resolveTexture;
-layout(binding = 2, rgba32ui) readonly  uniform uimage2D  virtualGBuffer;    // downscaled (debug)
+layout(binding = 2, rgba32ui) readonly  uniform uimage2D  virtualGBuffer;    // specular hole fill + debug
 layout(binding = 3, rgba32f)  readonly  uniform image2D   virtualDiffuse;    // shade output (debug)
 layout(binding = 4, rgba32f)  readonly  uniform image2D   virtualSpecular;   // shade output (debug)
-layout(binding = 5, rgba32ui) readonly  uniform uimage2D  holeFill;          // holefill.comp: x=diffuse, y=specular
 
 uniform uint  octreeDepth;
 uniform ivec2 screenResolution;
@@ -18,6 +17,9 @@ uniform uint  virtualScale;
 uniform uint staleViewDep;    // specular window (frames); 0 = never stale
 uniform uint staleViewIndep;  // diffuse  window (frames); 0 = never stale
 uniform ivec2 virtualSize;    // virtual gbuffer dimensions (tap bounds)
+uniform uint  ancestorLevel;  // MODE_ANCESTOR: levels above the voxel (0 = the voxel itself)
+uniform uint  ancestorView;   // MODE_ANCESTOR: ANC_VIEW_*
+uniform uint  composeBudget;  // compose's sample budget: what a hole borrows up to
 
 layout(std430, binding = SSBO_OCTREE_BINDING) readonly buffer OctreeBuffer { uvec2 nodes[]; } octree;
 
@@ -41,35 +43,54 @@ uniform samplerCube skybox;
 #include "gbuffer.glsl"
 
 
-struct Fill { vec3 diffuse, specular; float dW, sW; };   // dW/sW == 0 => nothing usable
+vec3 primaryDir(ivec2 pix) {
+    vec2 ndc = vec2(
+        (float(pix.x) + 0.5) / float(screenResolution.x) * 2.0 - 1.0,
+        (float(pix.y) + 0.5) / float(screenResolution.y) * 2.0 - 1.0
+    );
+    return normalize(camera.cameraPlane.xyz
+                     + ndc.x * camera.cameraPlaneRight.xyz
+                     - ndc.y * camera.cameraPlaneUp.xyz);
+}
 
-Fill holeFillAt(ivec2 pix, GBuffer gb) {
-    Fill f = Fill(vec3(0.0), vec3(0.0), 0.0, 0.0);
+struct Fill { vec3 diffuse, specular; bool dOk, sOk; };
 
-    vec2  c    = (vec2(pix) + 0.5) / float(virtualScale) - 0.5;
-    ivec2 base = ivec2(floor(c));
-    vec2  t    = c - vec2(base);
-    vec2  wx   = vec2(1.0 - t.x, t.x), wy = vec2(1.0 - t.y, t.y);
-
-    for (int dy = 0; dy <= 1; dy++)
-    for (int dx = 0; dx <= 1; dx++) {
-        ivec2 tp = base + ivec2(dx, dy);
-        float w  = wx[dx] * wy[dy];
-        if (w <= 0.0 || any(lessThan(tp, ivec2(0))) || any(greaterThanEqual(tp, virtualSize)))
-            continue;
-
-        uvec4   hf = imageLoad(holeFill, tp);
-        GBuffer vg = UnpackGBuffer(uvec4(hf.zw, 0u, 0u));    // the tap's own voxel key
-        if (!vg.hit) continue;
-
-        w *= HFConfidence(hf);
-
-        if (hf.x != IRR_HOLE) { f.diffuse  += unpackRGB9E5(hf.x) * w; f.dW += w; }
-        if (hf.y != IRR_HOLE) { f.specular += unpackRGB9E5(hf.y) * w; f.sW += w; }
+Fill fillHole(ivec2 pix, GBuffer gb, bool needD, bool needS) {
+    Fill f = Fill(vec3(0.0), vec3(0.0), false, false);
+    ivec2   vp = min(pix / int(virtualScale), virtualSize - ivec2(1));
+    GBuffer vg = UnpackGBuffer(imageLoad(virtualGBuffer, vp));
+    if (needD) {
+        vec3  V    = -primaryDir(pix);
+        if (vg.hit && vg.level == gb.level) {
+            uint s = lookupLBuffer(vg.pos, vg.level, vg.version, octree.nodes[vg.vid].x);
+            if (s != LB_NO_SLOT) {
+                uint sb = linearSlotToBase(s);
+                V = UnpackNormal(lbuf.data[sb + LB_NORMAL]);
+            }
+        }
+        float need = float(max(composeBudget, 1u)), took = 0.0, below = 0.0;
+        vec3  acc  = vec3(0.0);
+        uint  Lng  = 1u << octreeDepth;
+        for (uint k = 1u; k <= gb.level && took < need; k++) {
+            uint a = gb.level - k;
+            uint s = probeLBuffer(gb.pos & ~uvec3((Lng >> a) - 1u), a | LB_ANCESTOR_FLAG, 0u);
+            if (s != LB_NO_SLOT) ancBorrow(linearSlotToBase(s), V, true, need, took, below, acc);
+        }
+        f.dOk = took > 0.0;
+        if (f.dOk) f.diffuse = acc / took;
     }
-
-    if (f.dW > 0.0) f.diffuse  /= f.dW;
-    if (f.sW > 0.0) f.specular /= f.sW;
+    if (needS) {
+        if (vg.hit && vg.level == gb.level) {
+            uint s = lookupLBuffer(vg.pos, vg.level, vg.version, octree.nodes[vg.vid].x);
+            if (s != LB_NO_SLOT) {
+                uint sb = linearSlotToBase(s);
+                if (fresh(frameStamp - lbuf.data[sb + LB_TIMESTAMP], staleViewDep)) {
+                    f.specular = unpackRGB9E5(lbuf.data[sb + LB_FSPECULAR]);
+                    f.sOk = true;
+                }
+            }
+        }
+    }
     return f;
 }
 
@@ -92,24 +113,14 @@ void main() {
     if (slot != LB_NO_SLOT) {
         uint sb  = linearSlotToBase(slot);
         uint age = frameStamp - lbuf.data[sb + LB_TIMESTAMP];   // same 64 B line as the channels
-        if (fresh(age, staleViewIndep)) diff = lbuf.data[sb + LB_FDIFFUSE];   // filter.comp output
+        if (fresh(age, staleViewIndep)) diff = lbuf.data[sb + LB_FDIFFUSE];   // compose.comp output
         if (fresh(age, staleViewDep))   spec = lbuf.data[sb + LB_FSPECULAR];
     }
 
 
     vec3 col;
     if (!gb.hit) {
-        // Miss => skybox (recompute the primary ray for this pixel).
-        vec2 ndc = vec2(
-            (float(pix.x) + 0.5) / float(screenResolution.x) * 2.0 - 1.0,
-            (float(pix.y) + 0.5) / float(screenResolution.y) * 2.0 - 1.0
-        );
-        vec3 dir = normalize(
-            camera.cameraPlane.xyz
-            + ndc.x * camera.cameraPlaneRight.xyz
-            - ndc.y * camera.cameraPlaneUp.xyz
-        );
-        col = texture(skybox, dir).rgb;
+        col = texture(skybox, primaryDir(pix)).rgb;   // miss => skybox
     } else if (renderMode == MODE_MATERIAL) {
         col = material[gb.material].color.rgb;
     } else if (renderMode == MODE_OCTREE) {
@@ -128,8 +139,8 @@ void main() {
             Material mm = material[gb.material];
             vec3 dch = (diff != IRR_HOLE) ? unpackRGB9E5(diff) : vec3(0.0);
             vec3 sch = (spec != IRR_HOLE) ? unpackRGB9E5(spec) : vec3(0.0);
-            if (diff == IRR_HOLE || spec == IRR_HOLE) {     // skip the taps when fully cached
-                Fill f = holeFillAt(pix, gb);
+            if (diff == IRR_HOLE || spec == IRR_HOLE) {     // skip the fill when fully cached
+                Fill f = fillHole(pix, gb, diff == IRR_HOLE, spec == IRR_HOLE);
                 if (diff == IRR_HOLE) dch = f.diffuse;      // still nothing => stays black
                 if (spec == IRR_HOLE) sch = f.specular;
             }
@@ -156,8 +167,8 @@ void main() {
         Material mm = material[gb.material];
         vec3 dch = (diff != IRR_HOLE) ? unpackRGB9E5(diff) : vec3(0.0);
         vec3 sch = (spec != IRR_HOLE) ? unpackRGB9E5(spec) : vec3(0.0);
-        if (diff == IRR_HOLE || spec == IRR_HOLE) {     // skip the taps when fully cached
-            Fill f = holeFillAt(pix, gb);
+        if (diff == IRR_HOLE || spec == IRR_HOLE) {     // skip the fill when fully cached
+            Fill f = fillHole(pix, gb, diff == IRR_HOLE, spec == IRR_HOLE);
             if (diff == IRR_HOLE) dch = f.diffuse;      // still nothing => stays black
             if (spec == IRR_HOLE) sch = f.specular;
         }
@@ -166,8 +177,8 @@ void main() {
 
     } else if (renderMode == MODE_HOLES) {
         Material mm = material[gb.material];
-        Fill f = holeFillAt(pix, gb);
-        if ((diff == IRR_HOLE && f.dW <= 0.0) || (spec == IRR_HOLE && f.sW <= 0.0))
+        Fill f = fillHole(pix, gb, diff == IRR_HOLE, spec == IRR_HOLE);
+        if ((diff == IRR_HOLE && !f.dOk) || (spec == IRR_HOLE && !f.sOk))
             col = vec3(1.0, 0.0, 0.0);
         else
             col = (1.0 - mm.metallic) * mm.color.rgb * ((diff == IRR_HOLE) ? f.diffuse : vec3(0.0))
@@ -186,7 +197,7 @@ void main() {
             float v = uintBitsToFloat(lbuf.data[linearSlotToBase(slot) + LB_VARIANCE]);
             col = vec3(sqrt(max(v, 0.0)) / VAR_DISPLAY_MAX);
         }
-    } else if (renderMode == MODE_FILTER) {
+    } else if (renderMode == MODE_COMPOSE) {     // what compose.comp changed
         if (slot == LB_NO_SLOT) col = vec3(1.0, 0.0, 1.0);
         else {
             uint sb2 = linearSlotToBase(slot);
@@ -196,14 +207,16 @@ void main() {
         }
     }else if (renderMode == MODE_UNFILTERED) {
         Material mm = material[gb.material];
-        uint sb  = linearSlotToBase(slot);
-        uint age = frameStamp - lbuf.data[sb + LB_TIMESTAMP];   // same 64 B line as the channels
-        if (fresh(age, staleViewIndep)) diff = lbuf.data[sb + LB_DIFFUSE];
-        if (fresh(age, staleViewDep))   spec = lbuf.data[sb + LB_SPECULAR];
+        if (slot != LB_NO_SLOT) {   // else diff/spec stay IRR_HOLE from above
+            uint sb  = linearSlotToBase(slot);
+            uint age = frameStamp - lbuf.data[sb + LB_TIMESTAMP];   // same 64 B line as the channels
+            if (fresh(age, staleViewIndep)) diff = lbuf.data[sb + LB_DIFFUSE];
+            if (fresh(age, staleViewDep))   spec = lbuf.data[sb + LB_SPECULAR];
+        }
         vec3 dch = (diff != IRR_HOLE) ? unpackRGB9E5(diff) : vec3(0.0);
         vec3 sch = (spec != IRR_HOLE) ? unpackRGB9E5(spec) : vec3(0.0);
-        if (diff == IRR_HOLE || spec == IRR_HOLE) {     // skip the taps when fully cached
-            Fill f = holeFillAt(pix, gb);
+        if (diff == IRR_HOLE || spec == IRR_HOLE) {     // skip the fill when fully cached
+            Fill f = fillHole(pix, gb, diff == IRR_HOLE, spec == IRR_HOLE);
             if (diff == IRR_HOLE) dch = f.diffuse;      // still nothing => stays black
             if (spec == IRR_HOLE) sch = f.specular;
         }
@@ -215,19 +228,32 @@ void main() {
     } else if (renderMode == MODE_DIFFUSE){
         Material mm = material[gb.material];
         vec3 dch = (diff != IRR_HOLE) ? unpackRGB9E5(diff) : vec3(0.0);
-        if (diff == IRR_HOLE) {     // skip the taps when fully cached
-            Fill f = holeFillAt(pix, gb);
-            if (diff == IRR_HOLE) dch = f.diffuse;
-        }
+        if (diff == IRR_HOLE) dch = fillHole(pix, gb, true, false).diffuse;
         col = dch;
+        if (mm.emissive) col += vec3(1.0) * mm.emissiveIntensity;   // self-emission
     } else if (renderMode == MODE_SPECULAR){
         Material mm = material[gb.material];
         vec3 sch = (spec != IRR_HOLE) ? unpackRGB9E5(spec) : vec3(0.0);
-        if (spec == IRR_HOLE) {     // skip the taps when fully cached
-            Fill f = holeFillAt(pix, gb);
-            if (spec == IRR_HOLE) sch = f.specular;
-        }
+        if (spec == IRR_HOLE) sch = fillHole(pix, gb, false, true).specular;
         col = sch;
+        if (mm.emissive) col += vec3(1.0) * mm.emissiveIntensity;   // self-emission
+    } else if (renderMode == MODE_ANCESTOR) {
+        vec3 N = vec3(0.0); bool hasN = false;
+        if (slot != LB_NO_SLOT) {
+            uint d3 = lbuf.data[linearSlotToBase(slot) + LB_NORMAL];
+            hasN = (d3 & NORMAL_UPDATE_BIT) == 0u;
+            if (hasN) N = normalize(UnpackNormal(d3));
+        }
+        uint k = min(ancestorLevel, gb.level);
+        uint  a     = gb.level - k;
+        uvec3 cell  = gb.pos & ~uvec3(((1u << octreeDepth) >> a) - 1u);
+        uint  aSlot = probeLBuffer(cell, a | LB_ANCESTOR_FLAG, 0u);
+        if (aSlot == LB_NO_SLOT){ col = vec3(1.0, 0.0, 1.0); }
+        else {
+            uint  asb = linearSlotToBase(aSlot);
+            float avail, cover = 1.0;
+            col = ancEval(asb, N, avail, cover);
+        }
     }else {   // MODE_NORMAL
         if (slot == LB_NO_SLOT) col = vec3(0.5);                 // not cached => neutral
         else {

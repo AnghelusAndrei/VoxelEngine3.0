@@ -21,6 +21,14 @@ uvec4 PackGBuffer(uvec3 pos, uint level, uint material, uint version, uint vid) 
     );
 }
 
+// Ancestor cache key: the same .xy layout, LB_ANCESTOR_FLAG in the level byte, version 0.
+// Internal-node versions are never maintained (only makeLeaf bumps one), so the key is a pure
+// function of (cell, level): anything holding a position can find the ancestor by hash, with no
+// descent. The flag also keeps D1 non-zero for the root (level 0).
+uvec2 PackAncestorKey(uvec3 cell, uint level) {
+    return PackGBuffer(cell, level | LB_ANCESTOR_FLAG, 0u, 0u, 0u).xy;
+}
+
 // ---- virtual gbuffer only ------------------------------------------------------------
 // `downscale` writes a plain copy of a full-res texel. `shade` then stamps this frame's
 // uniqueVoxelList index into .z's spare bits - material needs only 7 of 32 - once its own
@@ -38,18 +46,6 @@ uvec4 PackGBuffer(uvec3 pos, uint level, uint material, uint version, uint vid) 
 uint  VGListIdx(uvec4 g) { return g.z >> VG_LISTIDX_SHIFT; }
 uvec4 VGSetListIdx(uvec4 g, uint idx) {
     return uvec4(g.x, g.y, (g.z & MATERIAL_MASK) | (idx << VG_LISTIDX_SHIFT), g.w);
-}
-
-// ---- holeFill confidence (holefill.comp -> resolve.comp) ---------------------------
-#define HF_CONF_SHIFT 24u
-
-// 1..255, never 0: a valid channel must always be able to contribute something, or a
-// neighbourhood of noisy-but-valid taps would renormalize to nothing and go black.
-float HFConfidence(uvec4 hf) { return float((hf.w >> HF_CONF_SHIFT) & 0xFFu) * (1.0 / 255.0); }
-uvec4 HFSetConfidence(uvec4 hf, float c) {
-    uint q = uint(clamp(c, 0.0, 1.0) * 255.0 + 0.5);
-    return uvec4(hf.x, hf.y, hf.z,
-                 (hf.w & 0x00FFFFFFu) | (max(q, 1u) << HF_CONF_SHIFT));
 }
 
 GBuffer UnpackGBuffer(uvec4 g) {

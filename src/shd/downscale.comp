@@ -7,14 +7,23 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 // claim bitfield — 1 bit per octree slot (binding = SSBO_CLAIM_BINDING).
 layout(std430, binding = SSBO_CLAIM_BINDING) coherent buffer ClaimBuffer { uint bits[]; } claimbuf;
+// Read only to walk the ancestor chain of each newly-deduped voxel (octree.glsl needs `octree`).
+layout(std430, binding = SSBO_OCTREE_BINDING) readonly buffer OctreeBuffer { uvec2 nodes[]; } octree;
 // dedup output: uvec4 {key.xy, packed virtual texel, vid -> claimedSlot}.
-// .z is this voxel's virtual texel, baked here (we hold `vp` in a register anyway) and read by
-// filter.comp to centre its screen-space gather. Exactly ONE lane writes it: the atomicOr dedup
-// above gives a single `needsAppend` per vid, so there is one writer per entry and no race.
+// .z is this voxel's virtual texel, baked here (we hold `vp` in a register anyway). Nothing reads it
+// since filter.comp was replaced by compose.comp; it is free for a screen-space consumer. Exactly ONE
+// lane writes an entry: the atomicOr dedup gives a single `needsAppend` per vid, so no race.
 // .w is a PHASE field: it carries `vid` for lbuffer_claim, which consumes it to bake the slot
-// offset and then overwrites it with the claimed slot for normal/avg/filter. FILTER.md.
+// offset and then overwrites it with the claimed slot for normal/avg/compose.
 layout(std430, binding = SSBO_UNIQUE_LIST_BINDING) writeonly buffer UniqueList { uvec4 entries[]; } uniqueList;
 layout(std430, binding = SSBO_UNIQUE_COUNT_BINDING) coherent  buffer UniqueCnt  { uint uniqueCount; };
+// Ancestor discovery output: one segment per octree level, level d at [starts[d], starts[d+1]).
+// Entry {ancestor key.xy, LB_NO_SLOT -> claimedSlot, node id}. The node id is what aggregation
+// needs (childmask + next); the key is PackAncestorKey's, so claim hashes it like any other.
+// counts[d] is bumped before the capacity test, so it can exceed the segment: readers clamp it.
+layout(std430, binding = SSBO_UNIQUE_ANCESTOR_LIST_BINDING)   writeonly buffer UniqueAncestorList { uvec4 entries[]; } ancestorList;
+layout(std430, binding = SSBO_UNIQUE_ANCESTOR_STARTS_BINDING) readonly  buffer UniqueAncestorStarts { uint starts[]; } ancestorStarts;
+layout(std430, binding = SSBO_UNIQUE_ANCESTOR_COUNTS_BINDING) coherent  buffer UniqueAncestorCounts { uint counts[]; } ancestorCounts;
 
 
 layout(binding = 0, rgba32ui) readonly  uniform uimage2D gbufferTexture;
@@ -25,10 +34,48 @@ uniform ivec2 virtualSize;
 uniform uint  virtualScale;
 uniform uint  frameIndex;
 uniform uint  jitterStride;
+uniform uint  octreeDepth;
 
 #include "gbuffer.glsl"
+#include "octree.glsl"   // UnpackNode / locate only — no ray stack
 
 uint lb_hash(uint x){ x ^= x>>16; x *= 0x7feb352du; x ^= x>>15; x *= 0x846ca68bu; x ^= x>>16; return x; }
+
+// Ancestor node ids of this lane's voxel, by depth. Transposed like internal.glsl's gs_stack so
+// the 64 lanes of a group hit 64 different banks. Ancestors sit at depths [0, level).
+shared uint gs_anc[MAXDEPTH][64];
+
+// Append every not-yet-seen ancestor of `gb` to its level's segment. Called only by the lane that
+// won gb.vid's dedup bit, so each voxel walks its chain once per frame.
+void discoverAncestors(GBuffer gb) {
+    uint lid = gl_LocalInvocationIndex;
+    uint Lng = 1u << octreeDepth;
+
+    uint  top = gb.level;           // ancestors live at depths [0, top)
+    uvec2 raw = octree.nodes[0];
+    gs_anc[0][lid] = 0u;            // the root
+    for (uint d = 1u; d < gb.level; d++) {
+        Node n = UnpackNode(raw);   // depth d-1
+        if (!n.type) { top = d; break; }   // gbuffer disagrees with the tree: keep what is valid
+        uint id = n.next + locate(gb.pos, Lng >> d);
+        raw = octree.nodes[id];
+        gs_anc[d][lid] = id;
+    }
+
+    for (uint d = top; d-- > 0u; ) {
+        uint aid = gs_anc[d][lid];
+        uint w = aid >> 5u, b = 1u << (aid & 31u);
+        if ((atomicOr(claimbuf.bits[w], b) & b) != 0u) break;   // someone else carries the rest
+
+        // A full segment drops this entry but keeps climbing: its parent still belongs in the list.
+        uint i = atomicAdd(ancestorCounts.counts[d], 1u);
+        if (i < ancestorStarts.starts[d + 1u] - ancestorStarts.starts[d]) {
+            uvec3 cell = gb.pos & ~uvec3((Lng >> d) - 1u);
+            ancestorList.entries[ancestorStarts.starts[d] + i] =
+                uvec4(PackAncestorKey(cell, d), LB_NO_SLOT, aid);
+        }
+    }
+}
 
 void main() {
     ivec2 vp = ivec2(gl_GlobalInvocationID.xy);
@@ -56,6 +103,7 @@ void main() {
             vid = gb.vid;
             uint w = gb.vid >> 5u, b = 1u << (gb.vid & 31u);
             needsAppend = (atomicOr(claimbuf.bits[w], b) & b) == 0u;
+            if (needsAppend) discoverAncestors(gb);
         }
     }
 

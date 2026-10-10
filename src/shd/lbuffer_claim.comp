@@ -4,7 +4,8 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 // Lock-free open-addressing claim (single dispatch over the deduped uniqueVoxelList).
 // One thread = one visible voxel. Linear-probe from the key's home slot;
-// See architecture/CLAIM.md. Safety rests on two pipeline invariants:
+// The probe/CAS loop itself is lbClaim (lbuffer.glsl), shared with lbuffer_claimAnc.comp.
+// See architecture/LBUFFER.md. Safety rests on two pipeline invariants:
 //   1. uniqueVoxelList is deduplicated → one thread per key (no concurrent same-key insert)
 //   2. frameStamp ≥ 1, so D2==0 is an unambiguous pristine-empty sentinel.
 
@@ -35,64 +36,28 @@ void main(){
     uint  version = (key.y >> 24u) & 0xFFu;
     uint  h       = homeSlot(pos, level, version);
 
-    uint claimed = LB_NO_SLOT;
-    int  best    = -1;
-    uint bestTs  = 0xFFFFFFFFu;
+    bool inserted; uint prevStamp;
+    uint claimed = lbClaim(key, h, frameStamp, inserted, prevStamp);
 
-    for (uint i = 0u; i < LB_PROBE_LIMIT; i++){
-        uint s  = (h + i) & (LBUFFER_SLOTS_TOTAL - 1u);
-        uint sb = s * SLOT_DWORDS;
-        uint d2 = lbuf.data[sb + LB_TIMESTAMP];
-
-        if (lbuf.data[sb] == key.x && lbuf.data[sb + 1u] == key.y){          // MATCH
-            if (atomicCompSwap(lbuf.data[sb + LB_TIMESTAMP], d2, frameStamp) == d2){
-                // Stale re-visit: drop each channel's EMA count independently.
-                uint age = frameStamp - d2;
-                bool staleD = (staleViewIndep != 0u && age > staleViewIndep);   // diffuse
-                bool staleS = (staleViewDep   != 0u && age > staleViewDep);     // specular
-                if (staleD || staleS){
-                    uint sm = lbuf.data[sb + LB_SAMPLES];
-                    uint nD = sm & 0xFFFFu, nS = sm >> 16u;
-                    if (staleD) nD = 0u;
-                    if (staleS) nS = 0u;
-                    lbuf.data[sb + LB_SAMPLES] = nD | (nS << 16u);
-                }
-                claimed = s; break;
-            }
-            continue;
+    if (inserted) initSlot(linearSlotToBase(claimed));
+    else if (claimed != LB_NO_SLOT) {
+        // Stale re-visit: drop each channel's EMA count independently.
+        uint sb  = linearSlotToBase(claimed);
+        uint age = frameStamp - prevStamp;
+        bool staleD = (staleViewIndep != 0u && age > staleViewIndep);   // diffuse
+        bool staleS = (staleViewDep   != 0u && age > staleViewDep);     // specular
+        if (staleD || staleS){
+            uint sm = lbuf.data[sb + LB_SAMPLES];
+            uint nD = sm & 0xFFFFu, nS = sm >> 16u;
+            if (staleD) nD = 0u;
+            if (staleS) nS = 0u;
+            lbuf.data[sb + LB_SAMPLES] = nD | (nS << 16u);
         }
-        if (d2 == 0u){                                                        // EMPTY
-            if (atomicCompSwap(lbuf.data[sb + LB_TIMESTAMP], 0u, frameStamp) == 0u){
-                lbuf.data[sb]      = key.x;
-                lbuf.data[sb + 1u] = key.y;
-                initSlot(sb);
-                claimed = s; break;
-            }
-            continue;
-        }
-        if (d2 < frameStamp && d2 < bestTs){ bestTs = d2; best = int(s); }
     }
 
-    if (claimed == LB_NO_SLOT && best >= 0){                                  // EVICT stalest in the window
-        uint sb = uint(best) * SLOT_DWORDS;
-        if (atomicCompSwap(lbuf.data[sb + LB_TIMESTAMP], bestTs, frameStamp) == bestTs){
-            lbuf.data[sb]      = key.x;
-            lbuf.data[sb + 1u] = key.y;
-            initSlot(sb);
-            claimed = uint(best);
-        }
-        // lost the eviction race → NO_SLOT (rare, only near full load)
-    }
-
-    // .w, not .z: downscale baked this voxel's virtual texel into .z for filter.comp, and .w
-    // held `vid`, which is dead the moment the offset bake below has used it. `entry` is a
-    // local copy taken at the top of main, so writing it back here cannot disturb that read.
     uniqueList.entries[gid].w = claimed;
 
     if (claimed != LB_NO_SLOT) {
-        // One write for match / empty / evict alike. The evict path in particular MUST
-        // refresh it: the slot still holds the previous occupant's index, and accum would
-        // otherwise scatter this voxel's radiance into that voxel's accumulator.
         lbuf.data[linearSlotToBase(claimed) + LB_LISTID] = gid;
 
         // Bake this voxel's probe distance into its octree node so the per-pixel lookup

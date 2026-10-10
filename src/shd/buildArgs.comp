@@ -4,9 +4,21 @@ layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 
 layout(std430, binding = SSBO_UNIQUE_COUNT_BINDING)  readonly  buffer UniqueCount { uint uniqueCount; };
 layout(std430, binding = SSBO_INDIRECT_ARGS_BINDING) writeonly buffer IndirectArg { uvec4 args[]; };
+layout(std430, binding = SSBO_UNIQUE_ANCESTOR_STARTS_BINDING) readonly buffer AncestorStarts { uint starts[]; } ancestorStarts;
+layout(std430, binding = SSBO_UNIQUE_ANCESTOR_COUNTS_BINDING) readonly buffer AncestorCounts { uint counts[]; } ancestorCounts;
 
 uniform uint localSize;     // per-voxel pass local_size_x (64)
+uniform uint octreeDepth;   // ancestor levels are depths 0..octreeDepth-1
 
 void main(){
     args[0] = uvec4((uniqueCount + localSize - 1u) / localSize, 1u, 1u, 0u);
+
+    // Per ancestor level: claimAnc (one lane per ancestor) and aggregate (ANC_AGG_LANES each).
+    // A count can run past its segment (downscale bumps it before the capacity test): clamp.
+    for (uint d = 0u; d < octreeDepth; d++) {
+        uint cap = ancestorStarts.starts[d + 1u] - ancestorStarts.starts[d];
+        uint n   = min(ancestorCounts.counts[d], cap);
+        args[ANC_ARGS_BASE + d]               = uvec4((n + localSize - 1u) / localSize, 1u, 1u, 0u);
+        args[ANC_ARGS_BASE + octreeDepth + d] = uvec4((n * ANC_AGG_LANES + localSize - 1u) / localSize, 1u, 1u, 0u);
+    }
 }

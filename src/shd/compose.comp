@@ -1,0 +1,153 @@
+#version 460 core
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Per-voxel composition, sample budget: a voxel short of `composeBudget` samples borrows the
+// shortfall from its ancestors' cubes (ancestor_aggregate.comp), nearest first, each level giving
+// only what it adds over the levels below:
+//   take_k = min(still needed, avail_k - avail_{k-1})
+//   D11    = (n*x + sum take_k*E_k) / (n + sum take_k),     alpha = sum take / (n + sum take)
+// Once the chain can cover it, alpha = (budget - n)/budget: monotone in the voxel's own samples, 1
+// for fresh geometry, 0 from n >= budget on (measured on the Cornell box to within 0.001). The
+// budget is a genuine tradeoff — noise vs. blur and settling time — not a correctness knob.
+//
+// E_k is INTERPOLATED (interpolatedCube): a level-k cell is 2^k voxels wide, and its flat value made
+// young geometry blocky. Only voxels still borrowing pay for it, so a converged region costs nothing.
+//
+// Writes D11 (what resolve composites and shade's bounce reads back), D12 = D5 (ancestors are
+// diffuse-only) and D13 = (alpha, deepest level borrowed from) for the debug views. Runs over the
+// uniqueVoxelList, after aggregation. Reads D4 and ancestor cubes, never D11.
+
+#include "lbuffer.glsl"
+
+layout(std430, binding = SSBO_OCTREE_BINDING)       readonly buffer OctreeBuffer { uvec2 nodes[]; } octree;
+layout(std430, binding = SSBO_UNIQUE_LIST_BINDING)  readonly buffer UniqueList { uvec4 entries[]; } uniqueList;
+layout(std430, binding = SSBO_UNIQUE_COUNT_BINDING) readonly buffer UniqueCnt  { uint uniqueCount; };
+
+uniform uint octreeDepth;
+uniform uint composeBudget;   // baseline sample count; 0 = every voxel keeps its own value
+#include "octree.glsl"   // UnpackNode / locate
+
+// ---- this voxel's ancestor chain, probed lazily ------------------------------------------------
+// Discovery seated every ancestor of a listed voxel this frame, so these probes hit (~1-2 lines).
+#define SLOT_UNPROBED 0xFFFFFFFEu
+uvec3 g_pos;
+uint  g_Lng;
+uint  g_chain[MAXDEPTH];
+
+uint chainSlot(uint d) {
+    if (g_chain[d] == SLOT_UNPROBED)
+        g_chain[d] = probeLBuffer(g_pos & ~uvec3((g_Lng >> d) - 1u), d | LB_ANCESTOR_FLAG, 0u);
+    return g_chain[d];
+}
+
+// Slot of the depth-a ancestor cell at `cell`, a neighbour of the voxel's own depth-a cell `own`.
+// Walks down from the deepest ancestor the two share (an ancestor of this voxel, so its slot and,
+// through D3, its node are at hand), following `cell`'s octants by childmask. An absent cell is
+// known from the mask before any lookup, so this never probes for a missing key — in a warm table a
+// miss walks all LB_PROBE_LIMIT lines. The final slot is the O(1) baked-offset read.
+uint neighbourSlot(uvec3 own, uvec3 cell, uint a) {
+    // Deepest depth whose cell holds both: the highest differing coordinate bit decides. own != cell,
+    // and they differ by at least one depth-a cell, so cd <= a - 1.
+    uvec3 x  = own ^ cell;
+    uint  cd = octreeDepth - 1u - uint(findMSB(x.x | x.y | x.z));
+    uint  cs = chainSlot(cd);
+    if (cs == LB_NO_SLOT) return LB_NO_SLOT;
+    uint  id  = lbuf.data[linearSlotToBase(cs) + LB_ANC_NODE];
+    uvec2 raw = octree.nodes[id];
+    for (uint d = cd + 1u; d <= a; d++) {
+        Node n = UnpackNode(raw);
+        if (!n.type) return LB_NO_SLOT;          // a leaf above depth a: no ancestor cell down there
+        uint i = locate(cell, g_Lng >> d);
+        if ((n.childmask & (1u << i)) == 0u) return LB_NO_SLOT;
+        raw = octree.nodes[n.next + i];
+    }
+    if (!UnpackNode(raw).type) return LB_NO_SLOT; // the cell is a leaf, not an ancestor
+    return lookupLBuffer(cell, a | LB_ANCESTOR_FLAG, 0u, raw.x);
+}
+
+// The depth-a cube at N, bilinear over the 4 cells around the voxel in the plane of its dominant
+// normal axis: its own cell and the three toward the voxel's position inside it. In-plane rather
+// than trilinear: half the reads, and it cannot pull a parallel surface at another height (the bins
+// already keep facings apart). Each tap's bilinear weight is scaled by the share of `need` it can
+// cover, so a missing cell, an empty facing or a barely-sampled neighbour fades out and the rest
+// renormalize.
+vec3 interpolatedCube(uint a, vec3 N, float vsize, vec3 Eown, float availOwn, float need) {
+    float S   = float(g_Lng >> a);
+    uvec3 own = g_pos & ~uvec3((g_Lng >> a) - 1u);
+    vec3  aN  = abs(N);
+    uint  ax  = (aN.x >= aN.y && aN.x >= aN.z) ? 0u : (aN.y >= aN.z ? 1u : 2u);
+    uint  u   = (ax + 1u) % 3u, v = (ax + 2u) % 3u;
+
+    vec3  t  = (vec3(g_pos) + 0.5 * vsize - (vec3(own) + 0.5 * S)) / S;   // in (-0.5, 0.5) per axis
+    float fu = abs(t[u]), fv = abs(t[v]);
+    int   su = (t[u] < 0.0) ? -1 : 1, sv = (t[v] < 0.0) ? -1 : 1;
+
+    float w0 = (1.0 - fu) * (1.0 - fv) * min(availOwn / need, 1.0);
+    vec3  E  = Eown * w0;
+    float W  = w0;
+    for (uint i = 1u; i < 4u; i++) {
+        float bw = ((i & 1u) != 0u ? fu : 1.0 - fu) * ((i & 2u) != 0u ? fv : 1.0 - fv);
+        if (bw <= 0.0) continue;
+        ivec3 np = ivec3(own);
+        if ((i & 1u) != 0u) np[u] += su * int(S);
+        if ((i & 2u) != 0u) np[v] += sv * int(S);
+        if (any(lessThan(np, ivec3(0))) || any(greaterThanEqual(np, ivec3(g_Lng)))) continue;
+
+        uint s = neighbourSlot(own, uvec3(np), a);
+        if (s == LB_NO_SLOT) continue;
+        float avail, cover;
+        vec3  En = ancEval(linearSlotToBase(s), N, avail, cover);
+        float w  = bw * min(avail / need, 1.0);
+        E += En * w;
+        W += w;
+    }
+    return (W > 0.0) ? E / W : Eown;
+}
+
+void main(){
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= uniqueCount) return;
+
+    uvec4 entry = uniqueList.entries[gid];
+    uint  slot  = entry.w;                       // claim's writeback
+    if (slot == LB_NO_SLOT) return;
+    uint  sb    = linearSlotToBase(slot);
+
+    g_pos = uvec3(entry.x & 0xFFFFu, entry.x >> 16u, entry.y & 0xFFFFu);
+    g_Lng = 1u << octreeDepth;
+    uint level = (entry.y >> 16u) & 0xFFu;
+    for (uint d = 0u; d < MAXDEPTH; d++) g_chain[d] = SLOT_UNPROBED;
+
+    vec3  x    = unpackRGB9E5(lbuf.data[sb + LB_DIFFUSE]);
+    float n    = float(lbuf.data[sb + LB_SAMPLES] & 0xFFFFu);
+    uint  d3   = lbuf.data[sb + LB_NORMAL];
+    bool  hasN = (d3 & NORMAL_UPDATE_BIT) == 0u;
+    vec3  N    = hasN ? normalize(UnpackNormal(d3)) : vec3(0.0);
+    float vsize = float(g_Lng >> level);
+
+    float need  = max(float(composeBudget) - n, 0.0);
+    float took  = 0.0, below = n;
+    vec3  acc   = x * n;
+    uint  lastK = 0u;
+    for (uint k = 1u; k <= level && took < need; k++) {
+        uint a = level - k;
+        uint s = chainSlot(a);
+        if (s == LB_NO_SLOT) break;              // chain broken (segment overflow / maxSteps hit)
+        uint  asb = linearSlotToBase(s);
+        float avail, cover;
+        vec3  E = hasN ? ancEval(asb, N, avail, cover) : ancFlat(asb, avail);
+        float t = min(need - took, max(avail - below, 0.0));   // what this level adds (ancBorrow)
+        below = max(below, avail);
+        if (t <= 0.0) continue;
+        if (hasN) E = interpolatedCube(a, N, vsize, E, avail, need);
+        acc  += t * E;
+        took += t;
+        lastK = k;
+    }
+
+    float tot = n + took;
+    lbuf.data[sb + LB_FDIFFUSE]  = packRGB9E5((tot > 0.0) ? acc / tot : x);
+    lbuf.data[sb + LB_FSPECULAR] = lbuf.data[sb + LB_SPECULAR];
+    lbuf.data[sb + LB_COMPOSE]   = packHalf2x16(vec2((tot > 0.0) ? took / tot : 0.0, float(lastK)));
+}

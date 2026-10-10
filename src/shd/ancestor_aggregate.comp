@@ -1,0 +1,111 @@
+#version 460 core
+#extension GL_KHR_shader_subgroup_basic     : require
+#extension GL_KHR_shader_subgroup_clustered : require
+
+// 8 lanes per ancestor, one per octant: 8 ancestors per group. Each lane reads ONE child, and the
+// per-bin sums are clustered subgroup adds. One thread walking all 8 children serially left this
+// pass latency-bound (1.5 ms vs 0.5 ms measured) — a dependent node → slot chain per child, with
+// the small upper levels unable to hide it and a barrier after every level.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Bottom-up ancestor aggregation: one dispatch per octree level, deepest first, a storage barrier
+// between levels, so an internal child is always aggregated before its parent reads it.
+//
+// Every RESIDENT child is gathered — not only the ones visible this frame, which is what makes the
+// aggregate persistent. Each bin of the 6-bin cube is the SAMPLE-WEIGHTED mean of what lands in it,
+// with its sample count beside it — exactly what the sample-budget compose borrows:
+//   leaf child:      its raw EMA (D4), into the three bins its normal points into, n·N_a² samples
+//   internal child:  its own bins, with their counts
+// The bins are what keep the two faces of a thin wall, or the floor and wall of a corner, apart.
+
+#include "lbuffer.glsl"
+
+layout(std430, binding = SSBO_OCTREE_BINDING) readonly buffer OctreeBuffer { uvec2 nodes[]; } octree;
+layout(std430, binding = SSBO_UNIQUE_ANCESTOR_LIST_BINDING)   readonly buffer AncestorList { uvec4 entries[]; } ancestorList;
+layout(std430, binding = SSBO_UNIQUE_ANCESTOR_STARTS_BINDING) readonly buffer AncestorStarts { uint starts[]; } ancestorStarts;
+layout(std430, binding = SSBO_UNIQUE_ANCESTOR_COUNTS_BINDING) readonly buffer AncestorCounts { uint counts[]; } ancestorCounts;
+
+uniform uint octreeDepth;
+uniform uint ancLevel;         // depth of the ancestors this dispatch aggregates
+uniform uint frameStamp;
+uniform uint staleViewIndep;   // diffuse staleness window (frames); 0 = never stale
+
+#include "octree.glsl"   // UnpackNode
+
+#define LANES ANC_AGG_LANES
+
+void main(){
+    uint gid = gl_GlobalInvocationID.x;
+    uint anc = gid / LANES;
+    uint oct = gid % LANES;
+    // Every early return below is uniform across the 8 lanes of an ancestor, so the clustered
+    // adds always see a whole cluster.
+    uint cap = ancestorStarts.starts[ancLevel + 1u] - ancestorStarts.starts[ancLevel];
+    if (anc >= min(ancestorCounts.counts[ancLevel], cap)) return;
+
+    uvec4 entry = ancestorList.entries[ancestorStarts.starts[ancLevel] + anc];
+    uint  slot  = entry.z;                       // lbuffer_claimAnc's writeback
+    if (slot == LB_NO_SLOT) return;
+    Node node = UnpackNode(octree.nodes[entry.w]);
+    if (!node.type) return;                      // edited into a leaf since discovery
+
+    uint  sb    = linearSlotToBase(slot);
+    uvec3 cell  = uvec3(entry.x & 0xFFFFu, entry.x >> 16u, entry.y & 0xFFFFu);
+    uint  cl    = ancLevel + 1u;                 // children's depth
+    uint  csize = (1u << octreeDepth) >> cl;
+
+    // ---- this lane's child → per-bin (value, samples) ---------------------------------------
+    vec3  xb[6];
+    float cb[6];
+    for (uint b = 0u; b < 6u; b++) { xb[b] = vec3(0.0); cb[b] = 0.0; }
+
+    if ((node.childmask & (1u << oct)) != 0u) {
+        uvec2 craw = octree.nodes[node.next + oct];  // the 8 lanes share this one 64 B block
+        Node  c    = UnpackNode(craw);
+        // locate() packs the octant as x<<2 | y<<1 | z.
+        uvec3 cpos = cell + uvec3((oct >> 2u) & 1u, (oct >> 1u) & 1u, oct & 1u) * csize;
+        // lookupLBuffer, never findLBuffer: most children were never seated (a wall's interior
+        // voxels), and once the table is warm a miss probes all LB_PROBE_LIMIT lines before giving
+        // up. Cost of the O(1) path: a resident child whose baked offset an octree upload wiped
+        // is skipped until it is visible again.
+        uint s = LB_NO_SLOT;
+        if (c.type)                   s = lookupLBuffer(cpos, cl | LB_ANCESTOR_FLAG, 0u, craw.x);
+        else if (c.material != 0u)    s = lookupLBuffer(cpos, cl, c.version, craw.x);
+        uint csb = linearSlotToBase(s);
+        if (s != LB_NO_SLOT && fresh(frameStamp - lbuf.data[csb + LB_TIMESTAMP], staleViewIndep)) {
+            if (!c.type) {                                                // leaf: its raw EMA
+                uint  d3 = lbuf.data[csb + LB_NORMAL];
+                float n  = float(lbuf.data[csb + LB_SAMPLES] & 0xFFFFu);
+                if ((d3 & NORMAL_UPDATE_BIT) == 0u && n > 0.0) {          // no normal → no bin
+                    vec3 x = unpackRGB9E5(lbuf.data[csb + LB_DIFFUSE]);
+                    vec3 N = normalize(UnpackNormal(d3));
+                    for (uint b = 0u; b < 6u; b++) {
+                        uint a = b >> 1u;
+                        if (ancBin(a, N[a]) != b) continue;
+                        xb[b] = x;  cb[b] = n * N[a] * N[a];
+                    }
+                }
+            } else {                                                      // internal: its cube
+                for (uint b = 0u; b < 6u; b++) {
+                    xb[b] = unpackRGB9E5(lbuf.data[csb + LB_ANC_BINS + b]);
+                    cb[b] = ancCount(csb, b);
+                }
+            }
+        }
+    }
+
+    // ---- reduce over the 8 children ---------------------------------------------------------
+    vec3  mean[6];
+    float cnt[6];
+    for (uint b = 0u; b < 6u; b++) {
+        vec3 sumX = subgroupClusteredAdd(cb[b] * xb[b], LANES);
+        cnt[b]    = subgroupClusteredAdd(cb[b],         LANES);
+        mean[b]   = (cnt[b] > 0.0) ? sumX / cnt[b] : vec3(0.0);
+    }
+    if (oct != 0u) return;                       // one writer per ancestor
+
+    for (uint b = 0u; b < 6u; b++) lbuf.data[sb + LB_ANC_BINS + b] = packRGB9E5(mean[b]);
+    for (uint p = 0u; p < 3u; p++)
+        lbuf.data[sb + LB_ANC_COUNT + p] = packHalf2x16(min(vec2(cnt[2u * p], cnt[2u * p + 1u]),
+                                                            vec2(ANC_COUNT_MAX)));
+}

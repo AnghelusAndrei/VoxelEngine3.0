@@ -11,12 +11,19 @@
 #define SSBO_ACCUM_DIFFUSE_BINDING  6
 #define SSBO_ACCUM_SPECULAR_BINDING 7
 #define SSBO_MATERIAL_BINDING       8
+#define SSBO_UNIQUE_ANCESTOR_LIST_BINDING   9
+#define SSBO_UNIQUE_ANCESTOR_STARTS_BINDING 10
+#define SSBO_UNIQUE_ANCESTOR_COUNTS_BINDING 11
 
 // ---- lBuffer sizing (see LBUFFER.md) --------------------------------------------------
 #define LBUFFER_SLOTS_TOTAL 4194304u   // 2^22 slots × 64 B = 256 MB
 #define SLOT_DWORDS         16u
 #define LB_PROBE_LIMIT      32u        // max linear probe length
 #define LB_NO_SLOT          0xFFFFFFFFu
+// Ancestor (internal-node) entries set this bit in the key's level byte. Depth never exceeds 15,
+// so it cannot collide with a real level, and it keeps an ancestor apart from a maxSteps-fallback
+// hit, which caches that same internal node as an ordinary voxel under (pos, level, version).
+#define LB_ANCESTOR_FLAG    0x80u
 
 // Shared lBuffer addressing, voxel key, probe, and HDR helpers. Mirrors Renderer's
 // LBUFFER_* constants. Including shaders get the slot data at SSBO binding 2. The cache
@@ -37,9 +44,10 @@
 //   9 : EMA variance of log(luminance)  - float32 BIT PATTERN (floatBitsToUint)
 //  10 : EMA drift of log(luminance)     - float32 BIT PATTERN (floatBitsToUint)
 //       MUST be read with uintBitsToFloat and written with floatBitsToUint.
-//  11 : filtered diffuse  channel — RGB9E5 (filter.comp; read by holefill + resolve)
-//  12 : filtered specular channel — RGB9E5 (filter.comp; read by holefill + resolve)
-//   13->15 : spare (unused, reserved for future expansion)
+//  11 : composed diffuse  channel — RGB9E5 (compose.comp; read by resolve and shade's bounce)
+//  12 : published specular — RGB9E5, = D5 (compose.comp; ancestors are diffuse-only)
+//  13 : compose info — packHalf2x16(alpha, deepest ancestor level borrowed from); 0 = own value
+//   14->15 : spare (unused, reserved for future expansion)
 
 // Slot field offsets (DWORD index within a slot).
 #define LB_KEY0      0u
@@ -55,6 +63,26 @@
 #define LB_DRIFT     10u
 #define LB_FDIFFUSE  11u
 #define LB_FSPECULAR 12u
+#define LB_COMPOSE   13u
+
+// ---- ancestor slots: octree internal nodes (ancestor_aggregate.comp) -----------------------
+// Same table, same D0-D2 (key via PackAncestorKey, timestamp). Payload is a 6-bin ambient cube
+// of the children's diffuse irradiance, so the two faces of a thin wall land in opposite bins,
+// each bin with the number of samples behind it — all the sample-budget compose needs.
+//   3      : octree node id of this ancestor (lbuffer_claimAnc, every frame it is claimed) —
+//            compose walks from it to neighbouring cells by childmask, never probing a missing key
+//   4..9   : per-bin sample-weighted mean irradiance, RGB9E5, bins +X -X +Y -Y +Z -Z
+//   10..12 : per-bin sample count, packHalf2x16 pairs (0,1)(2,3)(4,5); 0 = no data.
+//            Saturates at ANC_COUNT_MAX (fp16 max) — far above any useful budget.
+//   13..15 : free
+#define LB_ANC_NODE    3u
+#define LB_ANC_BINS    4u
+#define LB_ANC_COUNT   10u
+#define ANC_COUNT_MAX  65504.0
+// indirectArgs layout: [0] per voxel, [ANC_ARGS_BASE + d] ancestor claim at depth d (1 lane each),
+// [ANC_ARGS_BASE + octreeDepth + d] aggregation at depth d (ANC_AGG_LANES lanes each).
+#define ANC_ARGS_BASE  2u
+#define ANC_AGG_LANES  8u
 
 
 // ---- octree node Lo word ---------------------------------------------------------------
@@ -83,22 +111,7 @@
 #define VAR_WINDOW_MIN 3u        // never smooth over fewer than this
 #define LB_COUNT_MAX   65535u // LB_SAMPLES packs two 16-bit counts, so a window past this wraps silently.
 #define VAR_DISPLAY_MAX 1.5 // Full-scale point of the VARIANCE debug ramp, in log-luminance standard deviations.
-#define IRR_HOLE 0xFFFFFFFFu   // stale or uncached => reconstruct from virtual neighbours
-
-// ---- filter.comp : per-voxel screen-space gather (see architecture/FILTER.md) ----------
-// FILTER_TAPS 0 degenerates to D11 = D4, D12 = D5 — the off switch, and the A/B baseline.
-#define GOLDEN           2.39996323
-#define FILTER_TAPS      3u
-#define FILTER_RADIUS    8.0    // spiral extent, virtual texels
-#define FILT_SIGMA_N     8.0    // normal-alignment exponent
-#define FILT_SIGMA_P     1.0    // plane distance, in voxel edges
-#define FILT_SIGMA_R_S   2.0
-#define FILT_VAR_EPS     0.01
-
-#define FILTER_WORLD_TAPS   3u
-#define FILTER_WORLD_RADIUS 3.0   // voxel edges
-
-
+#define IRR_HOLE 0xFFFFFFFFu   // stale or uncached => resolve's fillHole: own ancestors (diffuse), virtual texel (specular)
 
 // ---- render modes: must mirror core::RenderType (guarded by static_assert in core.hpp) ----
 #define MODE_OCTREE     0u
@@ -114,9 +127,17 @@
 #define MODE_HOLES      10u
 #define MODE_LUMINANCE  11u
 #define MODE_VARIANCE   12u
-#define MODE_FILTER     13u
+#define MODE_COMPOSE    13u
 #define MODE_UNFILTERED 14u
 #define MODE_DIFFUSE    15u
 #define MODE_SPECULAR   16u
+#define MODE_ANCESTOR   17u
+
+// MODE_ANCESTOR sub-views (`ancestorView`)
+#define ANC_VIEW_CUBE    0u   // irradiance, cube evaluated at the voxel's normal
+#define ANC_VIEW_FLAT    1u   // irradiance, all bins sample-weighted (what a scalar would leak)
+#define ANC_VIEW_SAMPLES 2u   // samples behind the cube at the voxel's normal, log2 heat
+#define ANC_VIEW_ALPHA   3u   // compose's alpha (D13): black = own value, white = all ancestor
+#define ANC_VIEW_K       4u   // compose's deepest borrowed level (D13), heat over 0..4
 
 #endif // CONSTANTS_GLSL

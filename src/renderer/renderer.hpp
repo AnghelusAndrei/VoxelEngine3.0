@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include <vector>
 #include "core.hpp"
 #include "shader.hpp"
 #include "octree.hpp"
@@ -36,6 +37,7 @@ private:
     // with it, so it is latched on entry rather than recomputed from frameIdx.
     bool     cacheFrozen  = false;
     uint32_t frozenStamp  = 1;
+    uint32_t resetFrame   = 0;   // frameIdx of the last lBuffer reset; stats.framesSinceReset counts from it
 
     // ------------------ full-sized framebuffer : gbuffer → resolve → final --------------------
     glm::ivec2 displaySize;
@@ -50,18 +52,19 @@ private:
     // ------------------ GPU passes --------------------
     shader::Library     passes;
     shader::Defines     shaderDefines() const;
-    shader::ComputePass primaryPass  {passes, "./shd/primary.comp",       shaderDefines(), shader::UBO_CAMERA};
-    shader::ComputePass downscalePass{passes, "./shd/downscale.comp",     shaderDefines()};
-    shader::ComputePass buildArgsPass{passes, "./shd/buildArgs.comp",     shaderDefines()};
-    shader::ComputePass claimPass    {passes, "./shd/lbuffer_claim.comp", shaderDefines()};
-    shader::ComputePass editMarkPass {passes, "./shd/edit_mark.comp",     shaderDefines()};
-    shader::ComputePass normalPass   {passes, "./shd/normal.comp",        shaderDefines()};
-    shader::ComputePass shadePass    {passes, "./shd/shade.comp",         shaderDefines(), shader::UBO_CAMERA};
-    shader::ComputePass accumPass    {passes, "./shd/accum.comp",         shaderDefines()};
-    shader::ComputePass avgPass      {passes, "./shd/avg.comp",           shaderDefines()};
-    shader::ComputePass filterPass   {passes, "./shd/filter.comp",        shaderDefines()};
-    shader::ComputePass holefillPass {passes, "./shd/holefill.comp",      shaderDefines()};
-    shader::ComputePass resolvePass  {passes, "./shd/resolve.comp",       shaderDefines(), shader::UBO_CAMERA};
+    shader::ComputePass primaryPass  {passes, "./shd/primary.comp",          shaderDefines(), shader::UBO_CAMERA};
+    shader::ComputePass downscalePass{passes, "./shd/downscale.comp",        shaderDefines()};
+    shader::ComputePass buildArgsPass{passes, "./shd/buildArgs.comp",        shaderDefines()};
+    shader::ComputePass claimPass    {passes, "./shd/lbuffer_claim.comp",    shaderDefines()};
+    shader::ComputePass claimAncPass {passes, "./shd/lbuffer_claimAnc.comp", shaderDefines()};
+    shader::ComputePass editMarkPass {passes, "./shd/edit_mark.comp",        shaderDefines()};
+    shader::ComputePass normalPass   {passes, "./shd/normal.comp",           shaderDefines()};
+    shader::ComputePass shadePass    {passes, "./shd/shade.comp",            shaderDefines(), shader::UBO_CAMERA};
+    shader::ComputePass accumPass    {passes, "./shd/accum.comp",            shaderDefines()};
+    shader::ComputePass avgPass      {passes, "./shd/avg.comp",              shaderDefines()};
+    shader::ComputePass aggregatePass{passes, "./shd/ancestor_aggregate.comp", shaderDefines()};
+    shader::ComputePass composePass  {passes, "./shd/compose.comp",          shaderDefines()};
+    shader::ComputePass resolvePass  {passes, "./shd/resolve.comp",          shaderDefines(), shader::UBO_CAMERA};
     shader::FinalRasterPass finalPass{passes, "./shd/final.vert", "./shd/final.frag"};
 
     // ------------------ dispatch shapes --------------------
@@ -69,12 +72,21 @@ private:
     shader::Dispatch virtualRes() const { return shader::Dispatch::direct(virtualSize); }
     shader::Dispatch perVoxel()   const { return shader::Dispatch::indirect(indirectArgsSSBO); }
     shader::Dispatch single()     const { return shader::Dispatch::direct(glm::ivec2(1), glm::ivec2(1)); }
+    // One ancestor level's segment, sized by buildArgs: the claim runs one lane per ancestor, the
+    // aggregation ANC_AGG_LANES (constants.glsl § indirectArgs layout).
+    shader::Dispatch perAncestorClaim(uint32_t depth) const {
+        return shader::Dispatch::indirect(indirectArgsSSBO,
+                                          (GLintptr)(ANC_ARGS_BASE + depth) * 4 * sizeof(GLuint));
+    }
+    shader::Dispatch perAncestorAggregate(uint32_t depth) const {
+        return shader::Dispatch::indirect(indirectArgsSSBO,
+                                          (GLintptr)(ANC_ARGS_BASE + volume->depth + depth) * 4 * sizeof(GLuint));
+    }
 
     // ------------------ virtual gbuffer : downscaled gbuffer --------------------
     GLuint     virtualGBufferTex   = 0; // RGBA32UI, virtual-res (downscaled gbuffer)
     GLuint     virtualDiffuseTex   = 0; // RGBA32F, virtual-res (incident diffuse E/π)
     GLuint     virtualSpecularTex  = 0; // RGBA32F, virtual-res (specular outgoing radiance)
-    GLuint     holeFillTex         = 0; // RGBA32UI, virtual-res (x=diffuse, y=specular; RGB9E5 or IRR_HOLE)
     glm::ivec2 virtualSize         = glm::ivec2(0);
     int        curVirtualScale     = 0; // scale the virtual textures are currently sized for
     GLuint     jitterPeriod        = 1;  // S = scale²
@@ -92,7 +104,11 @@ private:
     GLuint accumSpecularSSBO = 0;   // uvec4[] : per-list-entry specular accumulator (xyz = RGB, w spare)
     GLuint uniqueListSSBO   = 0;   // uvec4[] : {key.xy, packed virtual texel, vid -> claimedSlot}
     GLuint uniqueCountSSBO  = 0;   // uint
-    GLuint indirectArgsSSBO = 0;   // uvec4[2]
-    void allocVoxelLists();        // (re)size uniqueList + both accumulators to the virtual res
-
+    GLuint uniqueAncestorListSSBO   = 0;   // uvec4[] : {ancestor key.xy, claimedSlot, node id}, per-level segments
+    GLuint uniqueAncestorStartsSSBO = 0;   // uint[depth+1] : segment starts; [depth] = total capacity
+    GLuint uniqueAncestorCountsSSBO = 0;   // uint[depth]   : appends per level, cleared each frame
+    std::vector<GLuint> ancestorStarts;    // host copy of the segment starts (Info panel capacities)
+    static constexpr GLuint ANC_ARGS_BASE = 2;   // mirrors constants.glsl ANC_ARGS_BASE
+    GLuint indirectArgsSSBO = 0;   // uvec4[ANC_ARGS_BASE + 2·depth]: [0] per voxel, then ancestor claim / aggregate per depth
+    void allocVoxelLists();        // (re)size uniqueList, both accumulators and the ancestor segments to the virtual res
 };

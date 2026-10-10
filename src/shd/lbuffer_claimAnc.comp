@@ -1,0 +1,54 @@
+#version 460 core
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Seat one level's ancestors (downscale's discovery segments) in the lBuffer. Dispatched once per
+// level, indirect from indirectArgs[ANC_ARGS_BASE + ancLevel]; the levels need no barrier between
+// them, nor against lbuffer_claim: every key is distinct (ancestor keys carry LB_ANCESTOR_FLAG),
+// so lbClaim's one-thread-per-key invariant holds across all of them.
+
+#include "lbuffer.glsl"
+
+layout(std430, binding = SSBO_UNIQUE_ANCESTOR_LIST_BINDING)   buffer AncestorList { uvec4 entries[]; } ancestorList;
+layout(std430, binding = SSBO_UNIQUE_ANCESTOR_STARTS_BINDING) readonly buffer AncestorStarts { uint starts[]; } ancestorStarts;
+layout(std430, binding = SSBO_UNIQUE_ANCESTOR_COUNTS_BINDING) readonly buffer AncestorCounts { uint counts[]; } ancestorCounts;
+
+layout(std430, binding = SSBO_OCTREE_BINDING) coherent buffer OctreeBuffer { uvec2 nodes[]; } octree;
+
+uniform uint frameStamp;   // frameIdx+1, never 0
+uniform uint ancLevel;     // octree depth of the segment this dispatch seats
+
+// Nothing is known yet: every bin empty (count 0). Aggregation fills it the same frame.
+void initAncestorSlot(uint sb){
+    for (uint d = LB_TIMESTAMP + 1u; d < SLOT_DWORDS; d++) lbuf.data[sb + d] = 0u;
+}
+
+void main(){
+    uint gid = gl_GlobalInvocationID.x;
+    uint cap = ancestorStarts.starts[ancLevel + 1u] - ancestorStarts.starts[ancLevel];
+    if (gid >= min(ancestorCounts.counts[ancLevel], cap)) return;   // counts may run past cap
+
+    uint  e     = ancestorStarts.starts[ancLevel] + gid;
+    uvec4 entry = ancestorList.entries[e];
+    uvec2 key   = entry.xy;
+    uvec3 cell  = uvec3(key.x & 0xFFFFu, key.x >> 16u, key.y & 0xFFFFu);
+    uint  h     = homeSlot(cell, ancLevel | LB_ANCESTOR_FLAG, 0u);   // == PackAncestorKey's fields
+
+    bool inserted; uint prevStamp;
+    uint claimed = lbClaim(key, h, frameStamp, inserted, prevStamp);
+    if (inserted) initAncestorSlot(linearSlotToBase(claimed));
+
+    ancestorList.entries[e].z = claimed;   // .w keeps the node id: aggregation walks its children
+    // Node ids move when the tree is edited, so refresh it on every claim, not just on insert.
+    if (claimed != LB_NO_SLOT) lbuf.data[linearSlotToBase(claimed) + LB_ANC_NODE] = entry.w;
+
+    if (claimed != LB_NO_SLOT) {
+        uint off = (claimed - h) & (LBUFFER_SLOTS_TOTAL - 1u);
+        if (off <= NODE_SLOTOFF_MASK) {
+            uint lo    = octree.nodes[entry.w].x;
+            uint newLo = (lo & ~(NODE_SLOTOFF_MASK << NODE_SLOTOFF_SHIFT))
+                       | (off << NODE_SLOTOFF_SHIFT);
+            if (newLo != lo) octree.nodes[entry.w].x = newLo;
+        }
+    }
+}

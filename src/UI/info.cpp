@@ -208,6 +208,7 @@ void Info::DrawMemUsage(){
 void Info::DrawSceneData(){
     if (!stats_) { ImGui::TextDisabled("No stats available."); return; }
     ImGui::Text("num voxels: %u",         stats_->voxels_num);
+    ImGui::Text("frames since reset: %u", stats_->framesSinceReset);
     ImGui::Text("cam position:  \n     x:%f \n     y:%f \n     z:%f",
                 stats_->cam_position.x, stats_->cam_position.y, stats_->cam_position.z);
     ImGui::Text("cam direction: \n     x:%f \n     y:%f \n     z:%f",
